@@ -32,6 +32,7 @@ import com.repl.bubbledrawer.contactbar.FreeformTask
 import com.repl.bubbledrawer.xposed.RemotePrefs
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
+import java.lang.reflect.Method
 import java.lang.reflect.Proxy
 import java.util.concurrent.Executor
 import kotlin.math.abs
@@ -98,6 +99,13 @@ class FlymeFreeformController(
     /** The window whose bottom caption is being dragged (set on ACTION_DOWN, WMShell thread). */
     @Volatile private var gestureTaskId = 0
 
+    /**
+     * Bumped whenever the caption gesture moves on (a new ACTION_DOWN, a cancel, a reload): a 迷你小窗
+     * conversion the previous gesture scheduled must not land after the user has started something else.
+     * See [scheduleMiniFallback].
+     */
+    private var miniFallbackGeneration = 0
+
     val hoverRunnable = Runnable {
         hoverScheduled = false
         gestureHoverArmed = true
@@ -141,6 +149,7 @@ class FlymeFreeformController(
 
     fun dispose() {
         gestureReset()
+        cancelMiniFallback()
         hideDim()
         windows.clear()
         suspended.clear()
@@ -205,6 +214,8 @@ class FlymeFreeformController(
         suspended.remove(taskId)
         if (takeoverCancelledFor == taskId) takeoverCancelledFor = null
         if (maskTaskId == taskId) maskTaskId = null
+        // A pending 迷你小窗 conversion must not outlive its window.
+        if (miniSwipeTaskId == taskId) cancelMiniFallback()
         log("TASK_VANISHED taskId=$taskId remaining=${windows.keys}")
         refreshMask("VANISHED")
         if (windows.isEmpty()) backgroundDecoration?.release()
@@ -535,6 +546,9 @@ class FlymeFreeformController(
         gestureDownY = y
         gestureDownTime = SystemClock.uptimeMillis()
         gestureHoverArmed = false
+        // A new gesture supersedes whatever the previous one scheduled (see [scheduleMiniFallback]):
+        // if that conversion has not happened yet the user has moved on, so it must not land later.
+        cancelMiniFallback()
         if (hoverScheduled) {
             handler.removeCallbacks(hoverRunnable)
             hoverScheduled = false
@@ -575,10 +589,30 @@ class FlymeFreeformController(
         }
 
         if (dy < -50f && snap.flymeFreeformSwipeUpMini) {
-            log("ACTION_UP_SWIPE_MINI taskId=$activeTaskId dy=$dy")
+            val taskId = if (gestureTaskId > 0) gestureTaskId else (activeTaskId ?: 0)
+            log("ACTION_UP_SWIPE_MINI taskId=$taskId dy=$dy")
             return try {
+                miniSwipeTaskId = taskId
+                miniSwipeConvertedAt = 0L
                 sForceMiniTransition = true
                 proceed()
+                // HyperOS 4 and later decide this gesture inside `onBottomCaptionHandleMotionEvents`
+                // itself: with the velocity pinned to 0 and `getMiniBottomUpLimit()` inflated (see
+                // [hookVelocityMonitor] / [hookMiniBottomUpLimit]) its ACTION_UP branch turns the window
+                // into 迷你小窗 before the release animation is even built — and announces that through
+                // `onTaskModeChanged`, which is what [miniSwipeConvertedAt] records synchronously.
+                //
+                // HyperOS 3 has no such branch (its ACTION_UP can only close, fullscreen or spring
+                // back), so those two hooks change nothing there and the swipe-up simply did nothing.
+                // Its ROM still knows how to *do* the conversion — `MiuiFreeformModeController
+                // .fromFreeformToMini(int)` is the entry point its own 控制中心 uses — so that is driven
+                // here instead, once the gesture's release animation has let go of the window.
+                if (miniSwipeConvertedAt != 0L) {
+                    log("MINI_SWIPE_NATIVE taskId=$taskId")
+                } else {
+                    log("MINI_SWIPE_FALLBACK taskId=$taskId")
+                    scheduleMiniFallback(taskId)
+                }
             } finally {
                 sForceMiniTransition = false
                 // 迷你小窗 carries no mask: keep it away while the transition runs (the mode change
@@ -607,6 +641,102 @@ class FlymeFreeformController(
             hoverScheduled = false
         }
         gestureHoverArmed = false
+    }
+
+    // -------------------------------------------------------------------------
+    // 上滑小白条 → 迷你小窗 where the ROM cannot do it itself (HyperOS 3)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Drive the ROM's own 小窗 → 迷你小窗 conversion for the window whose 小白条 was just swiped up.
+     *
+     * Why this exists: the gesture used to work by *steering* the ROM — `getVelocity()` was pinned to 0
+     * and `getMiniBottomUpLimit()` inflated, which makes HyperOS 4's `onBottomCaptionHandleMotionEvents`
+     * take its 迷你 branch. HyperOS 3's ACTION_UP has no 迷你 branch at all (only close / fullscreen /
+     * spring back), so on that ROM the same steering left the window animating back to where it started
+     * — the reported bug. The conversion itself is not missing there, only this gesture's route to it:
+     * `MiuiFreeformModeController.fromFreeformToMini(int)` is what the ROM's own 控制中心 calls, and it
+     * does the whole job (mode 1, mini scale, side placement, shell transaction, 迷你动画, avoid pass).
+     *
+     * Two things make this a retry loop rather than one call:
+     *
+     *  - That method refuses to run while the window is animating (`isRunningContinuousAnimation()`, i.e.
+     *    any of animation types 1/2/3 still registered — the bottom-caption drag registers 2). The
+     *    release animation started by `proceed()` clears it when it finishes, and how long that takes is
+     *    not observable from here, so the call is simply repeated until it takes. A repeat *after* it
+     *    worked is harmless: `fromFreeformToMini` bails out as soon as the window is not in the normal
+     *    state any more, and the loop stops on [miniSwipeConvertedAt] anyway.
+     *  - If it still has not taken after [MINI_FALLBACK_UNBLOCK_AT] attempts, the release marker is the
+     *    only thing that can still be holding it (a release animation that never reports completion
+     *    leaves `isRunningContinuousAnimation()` true forever). Clearing that one marker is then the
+     *    difference between "the gesture does nothing" and "the gesture works": the ROM's own conversion
+     *    takes over the window from wherever it is, and its 迷你动画 supersedes the release animation.
+     */
+    private fun scheduleMiniFallback(taskId: Int) {
+        if (taskId <= 0) {
+            log("MINI_FALLBACK_NO_TASK")
+            return
+        }
+        val generation = ++miniFallbackGeneration
+        val startedAt = SystemClock.uptimeMillis()
+        var attempt = 0
+        var unblocked = false
+
+        val step = object : Runnable {
+            override fun run() {
+                if (generation != miniFallbackGeneration) return
+                if (miniSwipeConvertedAt != 0L) {
+                    log("MINI_FALLBACK_CONVERTED taskId=$taskId afterMs=${SystemClock.uptimeMillis() - startedAt}")
+                    return
+                }
+                attempt++
+                if (attempt == MINI_FALLBACK_UNBLOCK_AT && !unblocked) {
+                    unblocked = true
+                    log("MINI_FALLBACK_UNBLOCK taskId=$taskId animating=${animatingTypes(taskId)}")
+                    clearReleaseAnimationMarker(taskId)
+                }
+                if (attempt > MINI_FALLBACK_ATTEMPTS) {
+                    log(
+                        "MINI_FALLBACK_GAVE_UP taskId=$taskId attempts=$attempt " +
+                            "afterMs=${SystemClock.uptimeMillis() - startedAt} animating=${animatingTypes(taskId)}",
+                    )
+                    return
+                }
+                if (!fromFreeformToMini(taskId, verbose = false)) {
+                    log("MINI_FALLBACK_UNAVAILABLE taskId=$taskId")
+                    return
+                }
+                handler.postDelayed(this, MINI_FALLBACK_INTERVAL_MS)
+            }
+        }
+        handler.postDelayed(step, MINI_FALLBACK_INTERVAL_MS)
+    }
+
+    /** Forget whatever [scheduleMiniFallback] was doing — another gesture, a reload, a vanished window. */
+    private fun cancelMiniFallback() {
+        miniFallbackGeneration++
+    }
+
+    /**
+     * Drop the bottom-caption drag marker (`removeRunningAnimationType(2)`) so the ROM's conversion is
+     * no longer held back by [MINI_FALLBACK_UNBLOCK_AT]'s "the release animation never finished" case.
+     */
+    private fun clearReleaseAnimationMarker(taskId: Int): Boolean {
+        val info = windows[taskId] ?: return false
+        return runCatching {
+            info.javaClass
+                .getMethod("removeRunningAnimationType", Int::class.javaPrimitiveType)
+                .invoke(info, ANIMATION_TYPE_BOTTOM_CAPTION_DRAG)
+            true
+        }.getOrDefault(false)
+    }
+
+    /** `MiuiFreeformModeTaskInfo.mAnimatingTypes` — diagnosis only, so the unblock is explainable. */
+    private fun animatingTypes(taskId: Int): Any? {
+        val info = windows[taskId] ?: return null
+        return runCatching {
+            info.javaClass.getDeclaredField("mAnimatingTypes").apply { isAccessible = true }.get(info)
+        }.getOrNull()
     }
 
     // -------------------------------------------------------------------------
@@ -691,45 +821,86 @@ class FlymeFreeformController(
         }
     }
 
-    fun fromFreeformToMini(taskId: Int) {
+    /**
+     * `MiuiFreeformModeController.fromFreeformToMini(int)` — the ROM's own 小窗 → 迷你小窗 conversion
+     * (mode 1, mini scale, side placement, shell transaction, 迷你动画, avoid pass). It is what the
+     * ROM's own 控制中心 uses, and on HyperOS 3 it is the *only* route into 迷你小窗 that exists — the
+     * 小白条 gesture has no branch for it there (see [scheduleMiniFallback]).
+     *
+     * Fire-and-forget by design: the invocation has to happen on the WMShell thread, and the ROM refuses
+     * it while the window is still animating, so callers retry instead of reading a result. What this
+     * returns is therefore only "keep retrying" — false means this ROM has no such entry point at all.
+     *
+     * @param verbose log the dispatch; the retry loop passes false and logs its own progress.
+     */
+    fun fromFreeformToMini(taskId: Int, verbose: Boolean = true): Boolean {
+        val target = miniConversionTarget()
+        if (target == null) {
+            // Two different "no": the controller is not built yet (retry — a 小窗 cannot exist before it
+            // is, but nothing is lost by waiting) versus this ROM having no such entry point at all.
+            if (verbose) log("MINI_CONVERSION_UNAVAILABLE taskId=$taskId")
+            return !miniConversionUnavailable
+        }
+        val (method, receiver) = target
         executeOnShell {
-            val controller = getMiuiFreeformModeController()
-            var transitioned = false
-            if (controller != null) {
-                transitioned = runCatching {
-                    val m = (controller.javaClass.declaredMethods + controller.javaClass.methods).firstOrNull {
-                        it.name == "fromFreeformToMini" && it.parameterCount == 1
-                    }
-                    if (m != null) {
-                        m.isAccessible = true
-                        m.invoke(controller, taskId)
-                        log("MINI_VIA_CONTROLLER taskId=$taskId")
-                        true
-                    } else {
-                        val implCls = classLoader.loadClass("com.android.wm.shell.multitasking.miuifreeform.MiuiFreeformModeController\$MiuiFreeformModeControlImpl")
-                        val ctor = implCls.getDeclaredConstructor(controller.javaClass, Int::class.javaPrimitiveType)
-                        ctor.isAccessible = true
-                        val controlInstance = ctor.newInstance(controller, 0)
-                        val m2 = (controlInstance.javaClass.declaredMethods + controlInstance.javaClass.methods).firstOrNull {
-                            it.name == "fromFreeformToMini" && it.parameterCount == 1
-                        }
-                        if (m2 != null) {
-                            m2.isAccessible = true
-                            m2.invoke(controlInstance, taskId)
-                            log("MINI_VIA_CONTROL_IMPL taskId=$taskId")
-                            true
-                        } else false
-                    }
-                }.onFailure {
-                    log("MINI_VIA_CONTROLLER_FAILED taskId=$taskId", it)
-                }.getOrDefault(false)
-            }
-
-            if (!transitioned) {
-                log("MINI_TRANSITION_FAILED controller=$controller taskId=$taskId")
+            runCatching { method.invoke(receiver, taskId) }.onFailure {
+                log("MINI_CONVERSION_FAILED taskId=$taskId via=${method.declaringClass.simpleName}", it)
             }
         }
+        if (verbose) log("MINI_CONVERSION_DISPATCHED taskId=$taskId via=${method.declaringClass.simpleName}")
+        return true
     }
+
+    /**
+     * The ROM's conversion entry point: the controller's own `fromFreeformToMini(int)` when it has one
+     * (HyperOS 3/4: private, hence `declaredMethods`), else the same method on the control facade the
+     * ROM exposes to its own SystemUI. Resolved once and cached; a ROM with neither is remembered as
+     * such so the retry loop stops immediately instead of hammering reflection.
+     */
+    private fun miniConversionTarget(): Pair<Method, Any>? {
+        miniConversionMethod?.let { method -> miniConversionReceiver?.let { return method to it } }
+        if (miniConversionUnavailable) return null
+
+        val controller = getMiuiFreeformModeController() ?: return null
+        val direct = declaredOneArg(controller.javaClass, "fromFreeformToMini")
+        if (direct != null) {
+            direct.isAccessible = true
+            miniConversionMethod = direct
+            miniConversionReceiver = controller
+            return direct to controller
+        }
+
+        val impl = runCatching {
+            val implCls = classLoader.loadClass(
+                "com.android.wm.shell.multitasking.miuifreeform.MiuiFreeformModeController\$MiuiFreeformModeControlImpl",
+            )
+            val ctor = implCls.getDeclaredConstructor(controller.javaClass, Int::class.javaPrimitiveType)
+            ctor.isAccessible = true
+            ctor.newInstance(controller, 0)
+        }.getOrNull()
+        val viaImpl = impl?.let { declaredOneArg(it.javaClass, "fromFreeformToMini") }
+        if (viaImpl != null && impl != null) {
+            viaImpl.isAccessible = true
+            miniConversionMethod = viaImpl
+            miniConversionReceiver = impl
+            return viaImpl to impl
+        }
+
+        miniConversionUnavailable = true
+        log("MINI_CONVERSION_NOT_ON_THIS_ROM controller=${controller.javaClass.simpleName}")
+        return null
+    }
+
+    /** `name(int)` on [cls] or any of its supertypes — the ROM keeps these private, so `declared` too. */
+    private fun declaredOneArg(cls: Class<*>, name: String): Method? =
+        (cls.declaredMethods.toList() + cls.methods.toList()).firstOrNull {
+            it.name == name && it.parameterCount == 1 && it.parameterTypes[0] == Int::class.javaPrimitiveType
+        }
+
+    /** Cached answer of [miniConversionTarget]; volatile because the retry loop runs on the main thread. */
+    @Volatile private var miniConversionMethod: Method? = null
+    @Volatile private var miniConversionReceiver: Any? = null
+    @Volatile private var miniConversionUnavailable = false
 
     fun fullscreenFreeformTask(taskId: Int) {
         executeOnShell {
@@ -1193,6 +1364,45 @@ class FlymeFreeformController(
         @Volatile var sForceMiniTransition = false
         @Volatile var sForceFullscreenTransition = false
         @Volatile var sForceRebound = false
+
+        /** `MiuiFreeformModeTaskInfo`'s bottom-caption drag marker — see [clearReleaseAnimationMarker]. */
+        private const val ANIMATION_TYPE_BOTTOM_CAPTION_DRAG = 2
+
+        /** Callback interval while waiting for the ROM to be able to convert 小窗 → 迷你小窗. */
+        private const val MINI_FALLBACK_INTERVAL_MS = 60L
+
+        /** Give up after this many attempts — far longer than any release animation (≈1.5 s). */
+        private const val MINI_FALLBACK_ATTEMPTS = 25
+
+        /** Attempt at which the release marker is cleared in case the release animation never ends. */
+        private const val MINI_FALLBACK_UNBLOCK_AT = 10
+
+        /**
+         * The window whose 小白条 up-swipe is being turned into 迷你小窗 right now, and when the ROM
+         * announced that conversion (`onTaskModeChanged` to a non-normal mode), 0 while it has not.
+         *
+         * Both are written from the WMShell thread and read from the main thread, and the timestamp in
+         * particular has to be visible the instant the gesture's `proceed()` returns: on HyperOS 4 the
+         * ROM performs the conversion *inside* that call, and that is exactly how the module knows the
+         * steering worked and no fallback is needed.
+         */
+        @Volatile var miniSwipeTaskId = 0
+        @Volatile var miniSwipeConvertedAt = 0L
+
+        /**
+         * `MiuiFreeformModeTaskRepository.onTaskModeChanged` — on the WMShell thread, before the main
+         * thread hears about it (see [miniSwipeConvertedAt]).
+         */
+        fun noteMiniSwipeConversion(taskInfo: Any, oldMode: Int, newMode: Int) {
+            // Only the 迷你 states are evidence that the gesture did what it was asked to do: the same
+            // repository call announces 贴边/全屏 conversions too, and those must not stop the fallback.
+            if (newMode != FreeformTask.MODE_MINI && newMode != FreeformTask.MODE_MINI_PINNED) return
+            val taskId = getTaskId(taskInfo)
+            if (taskId <= 0 || taskId != miniSwipeTaskId) return
+            if (miniSwipeConvertedAt != 0L) return
+            miniSwipeConvertedAt = SystemClock.uptimeMillis()
+            log("MINI_SWIPE_CONVERTED_BY_ROM taskId=$taskId old=$oldMode new=$newMode")
+        }
 
         /**
          * The zero value for a proxy's declared return type — so an unhandled interface method can
@@ -1830,6 +2040,8 @@ class FlymeFreeformController(
                 classLoader.loadClass("android.util.MiuiMultiWindowUtils")
             }.getOrNull()
 
+            var rectHooks = 0
+            var rectFailed = 0
             utilsClass?.declaredMethods?.filter {
                 it.name == "getFreeformRect" || it.name == "getCustomFreeformRect"
             }?.forEach { m ->
@@ -1841,10 +2053,23 @@ class FlymeFreeformController(
                             val result = chain.proceed()
                             val snap = RemotePrefs.read(prefs)
                             if (snap.flymeFreeformEnabled && snap.flymeFreeformCenter && result is Rect && !result.isEmpty) {
-                                centerRectOnScreen(result, snap)
+                                // The package this rect is being computed for is a plain String argument in
+                                // every overload (`getCustomFreeformRect(ctx, …, pkg, …)`), and it is what
+                                // tells the avoid pass whether it is looking at the very window it is placing.
+                                centerRectOnScreen(
+                                    result,
+                                    snap,
+                                    selfPackage = chain.args.filterIsInstance<String>().lastOrNull(),
+                                )
+                            } else {
+                                logCenterSkip("${m.name}/${m.parameterCount}", snap)
                             }
                             result
                         }
+                    rectHooks++
+                }.onFailure {
+                    rectFailed++
+                    log("BOUNDS_CENTER_HOOK_FAILED src=${m.name}/${m.parameterCount}", it)
                 }
             }
 
@@ -1852,6 +2077,8 @@ class FlymeFreeformController(
                 classLoader.loadClass("com.android.wm.shell.multitasking.miuimultiwinswitch.MulWinSwitchInteractUtil")
             }.getOrNull()
 
+            var interactHooks = 0
+            var interactFailed = 0
             utilClass?.declaredMethods?.filter {
                 it.name == "getFreeformDefaultLaunchBounds" ||
                 it.name == "getSwitchedFreeformTargetBounds" ||
@@ -1866,9 +2093,15 @@ class FlymeFreeformController(
                             val snap = RemotePrefs.read(prefs)
                             if (snap.flymeFreeformEnabled && snap.flymeFreeformCenter && result is Rect && !result.isEmpty) {
                                 centerRectOnScreen(result, snap)
+                            } else {
+                                logCenterSkip("MulWinSwitch.${m.name}", snap)
                             }
                             result
                         }
+                    interactHooks++
+                }.onFailure {
+                    interactFailed++
+                    log("BOUNDS_CENTER_HOOK_FAILED src=${m.name}/${m.parameterCount}", it)
                 }
             }
 
@@ -1876,6 +2109,8 @@ class FlymeFreeformController(
                 classLoader.loadClass("com.android.wm.shell.multitasking.miuifreeform.MiuiFreeformModeMiniStateHandler")
             }.getOrNull()
 
+            var miniHooks = 0
+            var miniFailed = 0
             miniHandlerClass?.declaredMethods?.filter {
                 it.name == "getRestoredBounds" && it.parameterCount == 2
             }?.forEach { m ->
@@ -1889,15 +2124,69 @@ class FlymeFreeformController(
                             if (snap.flymeFreeformEnabled && snap.flymeFreeformCenter) {
                                 val rect = chain.args[1] as? Rect
                                 if (rect != null && !rect.isEmpty) {
-                                    centerRectOnScreen(rect, snap)
+                                    // 迷你 → 普通小窗 (点击还原): the window being placed is the one the
+                                    // first argument describes, so the avoid pass must not run against it.
+                                    centerRectOnScreen(
+                                        rect,
+                                        snap,
+                                        selfTaskId = chain.args.getOrNull(0)?.let { getTaskId(it) } ?: 0,
+                                    )
+                                } else {
+                                    logCenterSkipArgs("mini.getRestoredBounds", chain.args)
                                 }
+                            } else {
+                                logCenterSkip("mini.getRestoredBounds", snap)
                             }
                             result
                         }
+                    miniHooks++
+                }.onFailure {
+                    miniFailed++
+                    log("BOUNDS_CENTER_HOOK_FAILED src=${m.name}/${m.parameterCount}", it)
                 }
             }
-            log("HOOK_INSTALLED_BoundsCentering")
+            log("HOOK_INSTALLED_BoundsCentering rect=$rectHooks rectFailed=$rectFailed interact=$interactHooks interactFailed=$interactFailed mini=$miniHooks miniFailed=$miniFailed")
+            // A zero is the interesting case: it means the ROM's own class/method shape moved and the
+            // centering switch can no longer do anything at all. Name what IS there instead of leaving
+            // "no CENTERED_BOUNDS in the log" to be guessed at.
+            if (rectHooks == 0) {
+                log("BOUNDS_CENTER_NO_MATCH MiuiMultiWindowUtils cls=${utilsClass != null} methods=${utilsClass?.declaredMethods?.filter { it.name.contains("Rect", true) || it.name.contains("reeform", true) }?.joinToString { "${it.name}/${it.parameterCount}" }}")
+            }
+            if (miniHooks == 0) {
+                log("BOUNDS_CENTER_NO_MATCH MiniStateHandler cls=${miniHandlerClass != null} methods=${miniHandlerClass?.declaredMethods?.joinToString { "${it.name}/${it.parameterCount}" }}")
+            }
         }
+
+        /**
+         * Why a centering hook decided not to centre.
+         *
+         * The gate is two settings, and when it is closed the whole feature is invisible — no
+         * `CENTERED_BOUNDS`, nothing to look at, which is indistinguishable from "the hook never ran".
+         * This is that distinction, logged once per source and answer (the same gate is asked on every
+         * launch, so the line must not repeat).
+         */
+        private fun logCenterSkip(source: String, snap: RemotePrefs.Snapshot) {
+            val message = "CENTER_SKIPPED src=$source enabled=${snap.flymeFreeformEnabled} " +
+                "center=${snap.flymeFreeformCenter} scale=${snap.flymeFreeformScale} " +
+                "noOffset=${snap.flymeFreeformNoOffset}"
+            if (message == lastCenterSkip) return
+            lastCenterSkip = message
+            log(message)
+        }
+
+        /**
+         * Same idea for the other way a centering hook can end up doing nothing: the rect it is supposed
+         * to rewrite is not where the signature said it would be (a ROM that moved the out-parameter).
+         * Silent in the old code, and indistinguishable from "the hook never ran".
+         */
+        private fun logCenterSkipArgs(source: String, args: List<Any?>) {
+            val message = "CENTER_SKIP_ARGS src=$source args=${args.joinToString { argText(it) }}"
+            if (message == lastCenterSkip) return
+            lastCenterSkip = message
+            log(message)
+        }
+
+        @Volatile private var lastCenterSkip: String? = null
 
         /**
          * Center the launch rect on the screen (设置项「小窗居中」), for **both** orientations.
@@ -1910,7 +2199,12 @@ class FlymeFreeformController(
          * at all: the ROM centers such a window horizontally (`getLeftMargin`) but pins it to the top
          * of the screen (`getTopMargin` returns 0 whenever the display itself is portrait).
          */
-        private fun centerRectOnScreen(rect: Rect, snap: RemotePrefs.Snapshot) {
+        private fun centerRectOnScreen(
+            rect: Rect,
+            snap: RemotePrefs.Snapshot,
+            selfPackage: String? = null,
+            selfTaskId: Int = 0,
+        ) {
             val dm = android.content.res.Resources.getSystem().displayMetrics
             val targetScale = (snap.flymeFreeformScale.coerceIn(50, 95)) / 100f
             val fitted = launchScale(rect, targetScale)
@@ -1929,7 +2223,9 @@ class FlymeFreeformController(
             rect.offsetTo(targetLeft, targetTop)
             // 禁止小窗偏移 = 关: 把已经居中好的窗口再交给 ROM 的避让逻辑一次，第二个小窗因此落在
             // 「第一个的位置 + 右 78dp / 下 44dp」（方向选择与屏幕内夹取都由 ROM 自己决定）。
-            if (!snap.flymeFreeformNoOffset) applyRomAvoidOffset(rect, visualW, visualH)
+            if (!snap.flymeFreeformNoOffset) {
+                applyRomAvoidOffset(rect, visualW, visualH, selfPackage, selfTaskId)
+            }
             log(
                 "CENTERED_BOUNDS rect=$rect scale=$scale targetScale=$targetScale " +
                     "visual=(${visualW.toInt()}x${visualH.toInt()}) screen=(${dm.widthPixels}x${dm.heightPixels})",
@@ -1948,14 +2244,30 @@ class FlymeFreeformController(
          * 78dp/44dp 的常量、以及"挪出去会出屏"时的夹取，全部沿用它的 if-else，不复刻一套。
          * 拿不到"另一个小窗"（没有小窗、或遮罩没跟踪到它）时什么都不做 —— 与"只有一个窗口"时的
          * 原生行为一致。
+         *
+         * **正在摆放的那个窗口不算"另一个小窗"**：单窗口场景下模块跟踪的窗口往往就是目标本身
+         * （迷你小窗点击还原、同一应用再次以小窗打开），拿它去避让等于躲自己，窗口会被推离居中位置
+         * 一个 78dp/44dp —— 用户看到的「还原后不居中」。调用方给出 selfPackage/selfTaskId 时按此跳过。
          */
-        private fun applyRomAvoidOffset(rect: Rect, visualW: Float, visualH: Float) {
+        private fun applyRomAvoidOffset(
+            rect: Rect,
+            visualW: Float,
+            visualH: Float,
+            selfPackage: String?,
+            selfTaskId: Int,
+        ) {
             // `activeTaskInfo` is the mask's window (the volatile mirror, readable from any thread);
             // it is the "other 小窗" for a launch that is happening right now.
-            val other = instance?.activeTaskInfo?.takeIf { FreeformTask.isPlain(it) }
-                ?.let { FreeformTask.visualBounds(it) }
-                ?.takeIf { !it.isEmpty }
-                ?: return
+            val otherInfo = instance?.activeTaskInfo?.takeIf { FreeformTask.isPlain(it) } ?: return
+            if (selfTaskId > 0 && selfTaskId == FreeformTask.taskId(otherInfo)) {
+                log("CENTERED_BOUNDS_AVOID_SKIPPED reason=SELF taskId=$selfTaskId")
+                return
+            }
+            if (selfPackage != null && selfPackage == FreeformTask.packageName(otherInfo)) {
+                log("CENTERED_BOUNDS_AVOID_SKIPPED reason=SAME_PACKAGE pkg=$selfPackage")
+                return
+            }
+            val other = FreeformTask.visualBounds(otherInfo)?.takeIf { !it.isEmpty } ?: return
             val area = freeformAccessibleArea() ?: return
             val mobile = Rect(rect.left, rect.top, rect.left + visualW.toInt(), rect.top + visualH.toInt())
             val applied = runCatching {
@@ -2077,6 +2389,11 @@ class FlymeFreeformController(
                             val oldMode = (chain.args[1] as? Number)?.toInt() ?: -1
                             val newMode = (chain.args[2] as? Number)?.toInt() ?: -1
                             if (taskInfo != null) {
+                                // Synchronous (WMShell thread) record of a 迷你小窗 conversion: the ROM
+                                // performs it inside the gesture's own `proceed()`, so the 上滑小白条 hook
+                                // has to be able to see it the moment that call returns — the main-thread
+                                // dispatch below is too late for that decision.
+                                noteMiniSwipeConversion(taskInfo, oldMode, newMode)
                                 instance?.onTaskModeChanged(taskInfo, oldMode, newMode)
                                 freeformObserver?.onFreeformTaskModeChanged(taskInfo, oldMode, newMode)
                             }
@@ -2122,6 +2439,7 @@ class FlymeFreeformController(
                 classLoader.loadClass("com.android.wm.shell.multitasking.common.taskmanager.MiuiFreeformModeTaskInfo")
             }.getOrNull() ?: return
 
+            var installed = 0
             taskInfoClass.declaredMethods.filter { it.name == "getMiniBottomUpLimit" && it.parameterCount == 0 }.forEach { m ->
                 runCatching {
                     module.hook(m)
@@ -2136,9 +2454,17 @@ class FlymeFreeformController(
                                 chain.proceed()
                             }
                         }
+                    installed++
                 }
             }
-            log("HOOK_INSTALLED_MiuiFreeformModeTaskInfo.getMiniBottomUpLimit")
+            if (installed == 0) {
+                // HyperOS 3: the window object has no such limit because its 小白条 release path has no
+                // 迷你 branch at all. Nothing to steer there — [FlymeFreeformController
+                // .scheduleMiniFallback] drives the ROM's own conversion instead.
+                log("HOOK_SKIPPED_MiuiFreeformModeTaskInfo.getMiniBottomUpLimit")
+            } else {
+                log("HOOK_INSTALLED_MiuiFreeformModeTaskInfo.getMiniBottomUpLimit count=$installed")
+            }
         }
 
         private fun hookTopCaptionMove(
@@ -2251,7 +2577,17 @@ class FlymeFreeformController(
                         .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                         .setId("bubbledrawer.freeform.gesture_anim")
                         .intercept { chain ->
-                            if (sForceMiniTransition) {
+                            // 迷你小窗 as the ROM's own 迷你动画 (type 11). This only makes sense once the
+                            // ROM has *already* turned the window into 迷你小窗 — its animation target is
+                            // then the mini rect and its scale the mini scale, both of which this keeps.
+                            // [miniSwipeConvertedAt] is the proof of that: the ROM's own 迷你 branch
+                            // announces the mode change inside `onBottomCaptionHandleMotionEvents`, i.e.
+                            // before it builds this animation. On a ROM whose gesture has no such branch
+                            // (HyperOS 3) the target is still the plain 小窗's rect, and rewriting it with
+                            // the line below would fly the window to the top of the screen at full size —
+                            // there the conversion is driven after the release instead, see
+                            // [scheduleMiniFallback].
+                            if (sForceMiniTransition && miniSwipeConvertedAt != 0L) {
                                 val taskInfo = chain.args[1]
                                 val animTarget = chain.args[2]
                                 log("INTERCEPT_GESTURE_ANIM_TO_MINI taskInfo=$taskInfo animTarget=$animTarget")

@@ -212,8 +212,58 @@ HyperOS 的「错开」在 `MiuiMultiWindowUtils.avoidIfNeeded:1807`（手机走
 - [ ] **关掉 Flyme 样式小窗总开关**后重复前两项：打开=重合、关闭=往右下错开
       （本开关**不依赖**总开关：它压的是 HyperOS 自己的避让，原生小窗模式同样生效）
 - [ ] 迷你小窗恢复成普通小窗时同样按开关处理（关=错开，开=重合）
+- [ ] **迷你小窗点击还原**（`TASK_RESTORED_TO_FREEFORM`）落在屏幕中央：日志有
+      `CENTERED_BOUNDS rect=…`；**只有一个窗口时不应出现 `CENTERED_BOUNDS_AVOIDED`** ——
+      那意味着模块把「正在摆放的这个窗口」当成了「另一个小窗」去避让，窗口会偏 78dp/44dp
+      （修复后这种自避让会记成 `CENTERED_BOUNDS_AVOID_SKIPPED reason=SELF|SAME_PACKAGE`）
 - [ ] 迷你小窗自己的排布（同侧迷你自动排队）、贴边/侧边栏避让不受影响
 - [ ] 全屏 → 小窗切换（小白条上滑悬停等）与直接打开的表现一致
+
+## A13 小白条上滑 → 迷你小窗（HyperOS 3 与 4 走的不是同一套代码）
+> 先看一条**通用**前提：`adb install -r` 会触发 LSPosed 热重载（`autoHotReload`）。热重载会把上一代的
+> **所有** hook 摘掉，而模块过去只在那条路径里重建「角落手势监视器」，**没有重装方法 hook** —— 于是
+> 每次装完新包，Flyme 样式小窗的整套 hook（黑色遮罩 / 小窗居中 / 小白条手势 / 联系人条 / IME）都会
+> 静默失效，直到系统界面重启。已修（`SystemUiHookInstaller.reinstall` 现在会重跑
+> `FlymeFreeformController.installHooks`），判断依据是安装后立刻能在日志里看到
+> `HOOK_INSTALLED_BoundsCentering rect=… mini=…`：**没有这行就说明当前进程里 hook 是死的**。
+
+这个手势在 ROM 里两边不一样，模块因此有两条路径：
+
+- **HyperOS 4**：`MiuiFreeformModeMoveHandler.onBottomCaptionHandleMotionEvents` 的 ACTION_UP 里有
+  **迷你分支**，条件是 `|velocity| < 1000 && getDestinationScaleX() <= getMiniBottomUpLimit() + miniScale
+  && !isLastTargetIsFullscreen() && deltaY < 0`。模块的做法是**操纵输入**：把 `getVelocity()` 归零、
+  把 `getMiniBottomUpLimit()` 抬到 999（`hookVelocityMonitor` / `hookMiniBottomUpLimit`），让 ROM 自己
+  走那条分支；状态转换（mode=1、迷你系数、shell transaction）全是 ROM 干的，模块只把 release 动画的
+  类型从 2 改成 11（官方迷你动画）并把目标摆到迷你位置。
+- **HyperOS 3**：ACTION_UP **只有**三条出口 —— 关闭（`deltaY < -80 && velocity < -1000` 或系数 < 0.35）、
+  全屏（`deltaY > 80` 或超过阈值）、**回弹**，**没有迷你分支**（整个 dex 里也搜不到
+  `triggerMiniThreshold` / `getMiniBottomUpLimit`）。所以上面那套"操纵输入"在 OS3 上等于没做任何事：
+  用户看到的就是"上滑一下，窗口弹回原位"。
+
+OS3 上模块改为调用 ROM 自己的转换入口 `MiuiFreeformModeController.fromFreeformToMini(int)`
+（ROM 的「控制中心」进迷你小窗走的就是它：mode=1 + 迷你系数 + 侧边落位 + WCT + 类型 11 动画 + 避让）。
+它有两道门槛，所以实现是**重试**而不是调用一次：
+
+1. 窗口在做连续动画时它直接 return（`isRunningContinuousAnimation()` = 动画类型 1/2/3 还在表里，
+   而底部小白条拖拽登记的正是 2）。这个标记由 `proceed()` 启动的 release 动画结束时清掉，何时清掉
+   从外面看不到 —— 于是每 60ms 试一次，直到 `onTaskModeChanged` 报出 mode=1 为止。
+   （`executeOnShell` 是异步派发，所以"试一次"= 派发一次调用，成没成由那个回调判定。）
+2. 万一 release 动画永远不上报完成（标记一直挂着），第 10 次（≈600ms）时模块**只清这一个标记**
+   （`removeRunningAnimationType(2)`），让 ROM 的转换接手 —— 这一步在日志里是 `MINI_FALLBACK_UNBLOCK`。
+
+- [ ] OS3：小窗上滑小白条 → **变成侧边迷你小窗**（窗口收缩并落到左上/右上角）- [ ] OS3 日志判据：`ACTION_UP_SWIPE_MINI taskId=… dy=…` → `MINI_SWIPE_FALLBACK taskId=…` →
+      `MINI_SWIPE_CONVERTED_BY_ROM taskId=… old=0 new=1` → `MINI_FALLBACK_CONVERTED taskId=… afterMs=…`
+      （`afterMs` = 等 release 动画花了多久；若 `afterMs` 很小，说明窗口是直接滑过去的，
+      若接近 300~600ms，说明它先弹回原位再贴边 —— 想消掉这段回弹再做一版）
+- [ ] OS4 回归：同一手势必须是 `ACTION_UP_SWIPE_MINI` → `MINI_SWIPE_CONVERTED_BY_ROM` →
+      `MINI_SWIPE_NATIVE`，**不应**出现 `MINI_SWIPE_FALLBACK` / `MINI_FALLBACK_*`
+- [ ] 启动时一眼看出 ROM 走哪条：`HOOK_INSTALLED_MiuiFreeformModeTaskInfo.getMiniBottomUpLimit count=1`
+      = OS4（有原生迷你分支）；`HOOK_SKIPPED_MiuiFreeformModeTaskInfo.getMiniBottomUpLimit` = OS3
+      （没有，由模块驱动）。两样都不该出现的是 `MINI_CONVERSION_NOT_ON_THIS_ROM`／
+      `MINI_FALLBACK_UNAVAILABLE`（这台 ROM 连转换入口都没有 —— 请把日志发我）
+- [ ] 迷你小窗恢复成普通小窗后，黑色遮罩与联系人条照常回来（A8/A9 的判据）
+- [ ] OS3 上「上滑悬停 → 交还原生小窗」与「下滑 → 全屏」不受影响
+- [ ] 快捷判据：`adb logcat -s BubbleDrawer | findstr /R "MINI_"`
 
 ## 贴边模式（可选，root）
 - [ ] 设置页"贴边模式"：无 su → toast 需要 root；有 su → inset=0，正上滑角落也能出扇
