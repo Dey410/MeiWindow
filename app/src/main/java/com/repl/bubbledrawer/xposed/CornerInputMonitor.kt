@@ -240,7 +240,7 @@ class CornerInputMonitor(
         // Enumeration ground truth for the fan's data source (this process's uid) — install
         // time is exactly the state a reboot leaves behind, which is what the panel bug needs
         // compared against a later DEBUG_PROBE run. See AppEnumProbe.
-        Thread { runCatching { AppEnumProbe.run(context, logger, deep = false) } }.start()
+        Thread { runCatching { AppEnumProbe.run(context, logger, deep = false, prefs = prefs) } }.start()
         logger(Log.INFO, "MONITOR_INSTANCE_STARTED id=${System.identityHashCode(this)}", null)
     }
 
@@ -262,7 +262,7 @@ class CornerInputMonitor(
                 if (disposed) return
                 when (i?.action) {
                     ACTION_DEBUG_MORE -> mainHandler.post { ensureFan().toggleMorePanelForDebug() }
-                    AppEnumProbe.ACTION -> Thread { runCatching { AppEnumProbe.run(context, logger) } }.start()
+                    AppEnumProbe.ACTION -> Thread { runCatching { AppEnumProbe.run(context, logger, prefs = prefs) } }.start()
                 }
             }
         }
@@ -345,7 +345,16 @@ class CornerInputMonitor(
             "PREFS_APPLIED enabled=" + settings.enabled + " left=" + settings.left +
                 " right=" + settings.right + " range=" + settings.rangeDp +
                 " transport=" + if (monitorActive) "monitor" else "spy-view" +
-                " " + boundsForLog(),
+                " " + boundsForLog() +
+                // The freeform half of the same snapshot: this process acts on THESE values, so a
+                // settings page that shows something else is a lost push, not a UI bug (see
+                // RemoteBridge.syncLocal).
+                " freeform[enabled=" + settings.flymeFreeformEnabled +
+                " center=" + settings.flymeFreeformCenter +
+                " scale=" + settings.flymeFreeformScale +
+                " mini=" + settings.flymeFreeformSwipeUpMini +
+                " noOffset=" + settings.flymeFreeformNoOffset +
+                " dim=" + settings.flymeFreeformDimBg + "]",
             null,
         )
     }

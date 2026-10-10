@@ -114,6 +114,21 @@ class SystemUiHookInstaller(
         } else {
             module.log(Log.WARN, TAG, "SYSTEMUI_CORNER_REINSTALL_ALREADY_BOUND")
         }
+        // The METHOD hooks have to be re-registered too, not just the runtime. A hot reload (what
+        // `adb install -r` triggers with autoHotReload) drops every hook of the old generation and
+        // `install()` — the only other place that installs them — never runs again in this process, so
+        // after any install every Flyme-style freeform hook (遮罩 / 居中 / 手势 / 联系人条) silently
+        // stopped working until the next SystemUI restart. That is indistinguishable from "the feature
+        // is broken" while looking at the phone, which is exactly how it was reported.
+        runCatching {
+            com.repl.bubbledrawer.launch.FlymeFreeformController.installHooks(
+                module,
+                prefs,
+                appClassLoader ?: context.classLoader,
+            )
+        }.onFailure {
+            module.log(Log.WARN, TAG, "FLYME_FREEFORM_HOOKS_REINSTALL_FAILED", it)
+        }
     }
 
     /** The Application Context captured at first start — handed to the next generation. */

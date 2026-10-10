@@ -30,7 +30,12 @@ object AppEnumProbe {
     const val TAG = "MeiWindow_Probe"
     const val ACTION = "com.repl.bubbledrawer.action.DEBUG_PROBE"
 
-    fun run(context: Context, log: (Int, String, Throwable?) -> Unit, deep: Boolean = true) {
+    fun run(
+        context: Context,
+        log: (Int, String, Throwable?) -> Unit,
+        deep: Boolean = true,
+        prefs: android.content.SharedPreferences? = null,
+    ) {
         val pm = runCatching { context.packageManager }
         log(
             Log.INFO,
@@ -76,6 +81,16 @@ object AppEnumProbe {
             null,
         )
 
+        // The settings the LIVE process is actually acting on (the LSPosed remote group). The settings
+        // page mirrors its own "cfg" file into this group; when a push is lost (a toggle made while the
+        // bridge was down) the two disagree, and every freeform behaviour behind those keys silently does
+        // nothing here while the UI shows the opposite. This line is how that is seen instead of guessed:
+        //   adb shell am broadcast -a com.repl.bubbledrawer.action.DEBUG_PROBE
+        if (prefs != null) {
+            val snap = runCatching { RemotePrefs.read(prefs) }.getOrNull()
+            log(Log.INFO, "PROBE prefs[${flymePrefs(snap)}]", null)
+        }
+
         // The full repository load is the expensive part (one enumeration over every user);
         // at module install FanHost already loads the same list right now, so only the
         // on-demand broadcast asks for this second opinion.
@@ -99,4 +114,13 @@ object AppEnumProbe {
             .getMethod("getProcessName")
             .invoke(null) as? String
     }.getOrNull()
+
+    /** The freeform keys the live SystemUI branches on — the ones a lost push makes lie. */
+    private fun flymePrefs(snap: RemotePrefs.Snapshot?): String {
+        if (snap == null) return "UNREADABLE"
+        return "enabled=${snap.flymeFreeformEnabled} center=${snap.flymeFreeformCenter} " +
+            "scale=${snap.flymeFreeformScale} mini=${snap.flymeFreeformSwipeUpMini} " +
+            "dim=${snap.flymeFreeformDimBg} outside=${snap.flymeFreeformOutsideDismiss} " +
+            "noOffset=${snap.flymeFreeformNoOffset}"
+    }
 }
