@@ -45,6 +45,9 @@ interface SettingsActions {
     fun setContactBar(enabled: Boolean)
     fun setContactBarMinWidthPct(pct: Int)
     fun openManage(context: Context)
+
+    /** 重启系统界面：模块的 hook 都在那个进程里，热重载只重建模块自己的运行时（见 [SystemUiRestart]）。 */
+    fun restartSystemUi()
 }
 
 /** The one implementation; created once in [MainActivity] and remembered there. */
@@ -88,4 +91,6 @@ class StoreSettingsActions(private val context: Context) : SettingsActions {
             android.content.Intent(context, com.repl.bubbledrawer.pin.PinManageActivity::class.java),
         )
     }
+
+    override fun restartSystemUi() = SystemUiRestart.restart(context)
 }

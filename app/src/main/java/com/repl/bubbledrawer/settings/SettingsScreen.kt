@@ -30,6 +30,7 @@ import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
+import top.yukonga.miuix.kmp.icon.extended.Refresh
 
 /**
  * Main settings screen with categorized feature navigation entries and redesigned status card.
@@ -56,6 +57,16 @@ fun MainSettingsScreen(
                     title = stringResource(R.string.settings_title),
                     color = barColor(backdrop != null),
                     scrollBehavior = scrollBehavior,
+                    // 重启系统界面：模块的 hook 全在 SystemUI 进程里，热重载只重建模块自己的运行时，
+                    // 想从干净进程复现问题/让改动生效，按这个比重启手机快（需要 root，见 SystemUiRestart）。
+                    actions = {
+                        IconButton(onClick = actions::restartSystemUi) {
+                            Icon(
+                                imageVector = MiuixIcons.Refresh,
+                                contentDescription = stringResource(R.string.restart_systemui),
+                            )
+                        }
+                    },
                 )
             }
         },

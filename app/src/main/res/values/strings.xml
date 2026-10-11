@@ -30,6 +30,11 @@
     <string name="freeform_hint">应用以小窗打开；系统不支持自由窗口时回退全屏</string>
     <string name="open_manage">打开固定管理</string>
 
+    <!-- 顶部「重启系统界面」按钮 -->
+    <string name="restart_systemui">重启系统界面</string>
+    <string name="restart_systemui_toast">正在重启系统界面…</string>
+    <string name="restart_systemui_failed">重启失败：需要 root 权限</string>
+
     <!-- miuix Compose UI -->
     <string name="settings_title">魅窗</string>
     <string name="dp_value">%1$d dp</string>
