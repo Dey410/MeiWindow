@@ -2573,6 +2573,11 @@ class FlymeFreeformController(
          * The window being placed ([selfTaskId]/[selfPackage]) is never "another" one: the module
          * reuses an app's existing 小窗 task on purpose (A4b), and a 迷你小窗 restore is the same task
          * coming back — dodging it moved the window off the centre by 78dp/44dp.
+         *
+         * Only windows that are *positively* recognised as 普通小窗 are candidates ([FreeformTask
+         * .isDodgeable], i.e. the ROM's own `isNormalState()` rule). Everything the module cannot
+         * identify that way — a mode it could not read, a 迷你/贴边 one, a window that is on its way
+         * out, one whose leash is gone — is simply not worth pushing the new window off the centre for.
          */
         private fun findOtherWindow(selfTaskId: Int, selfPackage: String?): OtherWindow {
             val repo = instance?.getMultiTaskingTaskRepository()
@@ -2594,7 +2599,7 @@ class FlymeFreeformController(
                         selfMatches++
                         continue
                     }
-                    if (!FreeformTask.isPlain(info)) continue
+                    if (!FreeformTask.isDodgeable(info)) continue
                     val leash = FreeformTask.leash(info)
                     if (leash != null && !leash.isValid) continue
                     val bounds = FreeformTask.visualBounds(info)
@@ -2604,7 +2609,7 @@ class FlymeFreeformController(
             }
             // Fallback: no repository answer (a ROM that reshaped the class, or a moment where it is
             // not built yet). Only a live, plain, non-self window counts here either.
-            val tracked = instance?.activeTaskInfo?.takeIf { FreeformTask.isPlain(it) }?.also { info ->
+            val tracked = instance?.activeTaskInfo?.takeIf { FreeformTask.isDodgeable(it) }?.also { info ->
                 if (selfTaskId > 0 && selfTaskId == FreeformTask.taskId(info)) return OtherWindow(null, 1, "tracked")
                 if (selfPackage != null && selfPackage == FreeformTask.packageName(info)) {
                     return OtherWindow(null, 1, "tracked")

@@ -180,6 +180,25 @@ object FreeformTask {
         }
     }
 
+    /**
+     * May this window be *dodged* — i.e. may it push a window the module is placing out of the middle
+     * (「禁止小窗偏移」= 关)?
+     *
+     * Deliberately stricter than [isPlain]: only a window whose mode is **positively read as 普通小窗**
+     * counts. [isPlain]'s [MODE_NONE] fallback exists for the 黑色遮罩, where missing a window is worse
+     * than covering one too many; here the failure is the opposite — a window whose mode cannot be read
+     * (a `getMode()` that threw, an object the repository handed out in a state it cannot describe) used
+     * to qualify through `windowingMode == FREEFORM`, and every such window the user cannot even see
+     * pushed the new 小窗 78dp/44dp away from the centre it was just placed in. Declining to dodge is
+     * also what the ROM itself does: its own pass requires `isNormalState()` on the same objects
+     * (`MiuiFreeformModeAvoidAlgorithm.findOtherFreeformTask`).
+     */
+    fun isDodgeable(info: Any?): Boolean {
+        if (info == null) return false
+        if (isExiting(info) || !isVisible(info)) return false
+        return mode(info) == MODE_NORMAL
+    }
+
     fun packageName(info: Any?): String? =
         (read(info) { it.packageName } as? String)
             ?: runCatching {
