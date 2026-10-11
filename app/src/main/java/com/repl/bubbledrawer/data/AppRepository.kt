@@ -22,6 +22,7 @@ import android.util.Log
 import android.util.LruCache
 import com.repl.bubbledrawer.pinyin.AppSortKey
 import com.repl.bubbledrawer.pinyin.BubbleApp
+import com.repl.bubbledrawer.xposed.RemotePrefs
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import kotlinx.collections.immutable.ImmutableList
@@ -305,7 +306,15 @@ object MultiUserHelper {
  * Hence [cacheNeedsRefresh]: a list enumerated while locked is PROVISIONAL, and every
  * reader asks this before trusting it. FanHost additionally reloads on ACTION_USER_UNLOCKED.
  */
-class AppRepository(private val context: Context) {
+class AppRepository(
+    private val context: Context,
+    /**
+     * 分身角标开关（[RemotePrefs.KEY_CLONE_BADGE]）的取值入口。两个宿主各有自己的设置来源
+     * （SystemUI 读 LSPosed 远程组，应用进程读本地镜像），所以由宿主传进来；只用于把图标
+     * 预热到正确的缓存键上 —— 真正渲染时每个调用点还会再传一次当次的开关值。
+     */
+    private val cloneBadge: () -> Boolean = { RemotePrefs.DEFAULT_CLONE_BADGE },
+) {
 
     @Volatile
     private var cache: ImmutableList<BubbleApp> = kotlinx.collections.immutable.persistentListOf()
@@ -456,16 +465,20 @@ class AppRepository(private val context: Context) {
 
         // Pre-warm top 50 icons in background to eliminate scroll hitching
         CoroutineScope(Dispatchers.IO).launch {
+            val badge = cloneBadge()
             val previewPx = (45 * context.resources.displayMetrics.density).toInt().coerceAtLeast(64)
             for (app in sorted.take(50)) {
-                AppIconCache.loadOrGet(context, app, previewPx)
+                AppIconCache.loadOrGet(context, app, previewPx, badge)
             }
         }
 
         sorted
     }
 
-    fun icon(app: BubbleApp): Drawable? = getIcon(context, app)
+    fun icon(
+        app: BubbleApp,
+        cloneBadge: Boolean = RemotePrefs.DEFAULT_CLONE_BADGE,
+    ): Drawable? = getIcon(context, app, cloneBadge)
 
     fun launchIntent(pkg: String): Intent? =
         context.packageManager.getLaunchIntentForPackage(pkg)
@@ -488,84 +501,98 @@ class AppRepository(private val context: Context) {
         }.getOrDefault(true)
 
         /**
-         * Resolves the app icon with badging for multi-user / cloned apps.
+         * The icon of [app] as the launcher draws it, with the 分身 badge only when
+         * [cloneBadge] is on.
+         *
+         * 分身 (MIUI 应用双开 = user 999, plus any other secondary profile) must not look like a
+         * different app: the ARTWORK always comes from the main space ([mainSpaceIcon]) and only
+         * the corner mark is added on top. Until 1.1.9 the clone's icon came from the clone
+         * user's own resource chain (`LauncherActivityInfo.getBadgedIcon` first, MIUI's
+         * `XSpaceUserHandle.getXSpaceIcon` never reached), and what MIUI pre-bakes there is its
+         * own idea of a dual-app icon — different artwork at a different size, i.e. the same app
+         * looking like two apps inside one fan.
          */
-        fun getIcon(context: Context, app: BubbleApp): Drawable? {
-            val key = "${app.packageName}#${app.userId}"
+        fun getIcon(
+            context: Context,
+            app: BubbleApp,
+            cloneBadge: Boolean = RemotePrefs.DEFAULT_CLONE_BADGE,
+        ): Drawable? {
+            // The switch is part of the key: the same app#user renders two different images
+            // depending on it, and both hosts (app process, SystemUI) cache per process.
+            val key = "${app.packageName}#${app.userId}#badge=$cloneBadge"
             iconCache.get(key)?.let { return it }
 
-            val d = loadIconWithBadge(context, app) ?: return null
+            val d = loadIcon(context, app, cloneBadge) ?: return null
             iconCache.put(key, d)
             return d
         }
 
-        private fun loadIconWithBadge(context: Context, app: BubbleApp): Drawable? {
-            val pm = context.packageManager
-            val userId = app.userId
-            val userHandle = MultiUserHelper.getUserHandle(userId)
-            val launcherApps = context.getSystemService(Context.LAUNCHER_APPS_SERVICE) as? LauncherApps
-
-            // 1. If user is main (0), return standard icon directly
-            if (userId == 0) {
-                return runCatching { pm.getApplicationIcon(app.packageName) }.getOrNull()
-            }
-
-            // 2. Try LauncherApps.getBadgedIcon
-            if (launcherApps != null && userHandle != null) {
-                val act = runCatching { launcherApps.getActivityList(app.packageName, userHandle).firstOrNull() }.getOrNull()
-                if (act != null) {
-                    val badged = runCatching {
-                        act.getBadgedIcon(context.resources.displayMetrics.densityDpi)
-                    }.getOrNull()
-                    if (badged != null) return badged
+        private fun loadIcon(context: Context, app: BubbleApp, cloneBadge: Boolean): Drawable? {
+            val base = mainSpaceIcon(context, app.packageName) ?: return null
+            if (app.userId == 0 || !cloneBadge) {
+                // Only the clone path is worth a line (it is the one that used to come from the
+                // clone user's own resources); a plain user-0 icon is loaded once per process.
+                if (app.userId != 0) {
+                    Log.i(TAG, "CLONE_ICON pkg=${app.packageName} user=${app.userId} badge=false src=main-space")
                 }
+                return base
             }
+            val badged = badgedIcon(context, app, base)
+            Log.i(
+                TAG,
+                "CLONE_ICON pkg=${app.packageName} user=${app.userId} badge=true " +
+                    "src=${if (badged === base) "main-space" else "main-space+badge"}",
+            )
+            return badged
+        }
 
-            // 3. Fallback: retrieve base icon
-            var baseIcon = runCatching { pm.getApplicationIcon(app.packageName) }.getOrNull()
-            if (baseIcon == null) {
-                baseIcon = runCatching {
-                    for (m in pm.javaClass.methods) {
-                        if (m.name == "getApplicationInfoAsUser") {
-                            val ptypes = m.parameterTypes
-                            if (ptypes.size == 3 && ptypes[0] == String::class.java && ptypes[2] == Int::class.javaPrimitiveType) {
-                                val flagArg: Any = if (ptypes[1] == Long::class.javaPrimitiveType) 0L else 0
-                                val ai = m.invoke(pm, app.packageName, flagArg, userId) as? ApplicationInfo
-                                if (ai != null) return@runCatching ai.loadIcon(pm)
-                            }
-                        }
-                    }
-                    null
+        /**
+         * The artwork the MAIN space (user 0) shows for [pkg] — the reference every user gets.
+         *
+         * `PackageManager.getApplicationIcon` comes FIRST on purpose: it is exactly what this
+         * list already draws for user 0 (see the `userId == 0` branch below), so a clone is
+         * pixel-identical to the entry it sits next to instead of merely "also an icon of that
+         * app". `LauncherApps` (the launcher activity's own drawable) is the fallback for the
+         * cases `getApplicationIcon` cannot answer, and is deliberately NOT preferred: on
+         * HyperOS it can hand back a themed/adaptive variant, which would make main and clone
+         * differ again — the very bug this method exists to end.
+         */
+        fun mainSpaceIcon(context: Context, pkg: String): Drawable? {
+            runCatching { context.packageManager.getApplicationIcon(pkg) }.getOrNull()?.let { return it }
+
+            val launcherApps = context.getSystemService(Context.LAUNCHER_APPS_SERVICE) as? LauncherApps
+            val handle = MultiUserHelper.getUserHandle(0)
+            if (launcherApps != null && handle != null) {
+                return runCatching {
+                    launcherApps.getActivityList(pkg, handle).firstOrNull()
+                        ?.getIcon(context.resources.displayMetrics.densityDpi)
                 }.getOrNull()
             }
-            if (baseIcon == null) return null
+            return null
+        }
 
-            // 4. Attach badge based on user type
-            if (userId == 999) {
-                // HyperOS / MIUI XSpace specific badge
+        /** The corner mark for a secondary user, drawn OVER the main-space artwork. */
+        private fun badgedIcon(context: Context, app: BubbleApp, base: Drawable): Drawable {
+            val userHandle = MultiUserHelper.getUserHandle(app.userId)
+            if (app.userId == 999) {
+                // HyperOS / MIUI XSpace: its API takes OUR drawable and only decorates it, which
+                // is exactly what keeps the artwork identical.
                 val xspaceIcon = runCatching {
                     val cls = Class.forName("miui.securityspace.XSpaceUserHandle")
                     val m = cls.getMethod("getXSpaceIcon", Context::class.java, Drawable::class.java)
-                    m.invoke(null, context, baseIcon) as? Drawable
+                    m.invoke(null, context, base) as? Drawable
                 }.getOrNull()
                 if (xspaceIcon != null) return xspaceIcon
-
-                // Standard system badged icon
-                if (userHandle != null) {
-                    val badged = runCatching { pm.getUserBadgedIcon(baseIcon, userHandle) }.getOrNull()
-                    if (badged != null && badged !== baseIcon) return badged
-                }
-
-                // Custom badge drawing fallback (HyperOS orange double ring)
-                return drawXSpaceBadge(context, baseIcon)
-            } else {
-                // Other profiles (e.g. Work Profile)
-                if (userHandle != null) {
-                    val badged = runCatching { pm.getUserBadgedIcon(baseIcon, userHandle) }.getOrNull()
-                    if (badged != null) return badged
-                }
-                return baseIcon
+                return drawXSpaceBadge(context, base)
             }
+
+            // Other profiles (work profile, …): the system badge is an overlay on the SAME
+            // artwork by construction, so it is preferred when the ROM actually adds one.
+            if (userHandle != null) {
+                val badged = runCatching { context.packageManager.getUserBadgedIcon(base, userHandle) }.getOrNull()
+                if (badged != null && badged !== base) return badged
+            }
+            return drawXSpaceBadge(context, base)
         }
 
         /**
@@ -631,25 +658,27 @@ object LaunchCountStore {
 object AppIconCache {
     private val memoryCache = LruCache<String, ImageBitmap>(300)
 
-    fun get(packageName: String, userId: Int, px: Int): ImageBitmap? {
-        val key = "$packageName#$userId@$px"
-        return memoryCache.get(key)
-    }
+    /** [cloneBadge] is part of the key: the same app#user renders two different images. */
+    private fun key(packageName: String, userId: Int, px: Int, cloneBadge: Boolean) =
+        "$packageName#$userId@$px#badge=$cloneBadge"
 
-    fun put(packageName: String, userId: Int, px: Int, bitmap: ImageBitmap) {
-        val key = "$packageName#$userId@$px"
-        memoryCache.put(key, bitmap)
+    fun get(packageName: String, userId: Int, px: Int, cloneBadge: Boolean): ImageBitmap? =
+        memoryCache.get(key(packageName, userId, px, cloneBadge))
+
+    fun put(packageName: String, userId: Int, px: Int, cloneBadge: Boolean, bitmap: ImageBitmap) {
+        memoryCache.put(key(packageName, userId, px, cloneBadge), bitmap)
     }
 
     suspend fun loadOrGet(
         context: Context,
         app: BubbleApp,
         px: Int,
+        cloneBadge: Boolean = RemotePrefs.DEFAULT_CLONE_BADGE,
     ): ImageBitmap? = withContext(Dispatchers.IO) {
-        get(app.packageName, app.userId, px)?.let { return@withContext it }
+        get(app.packageName, app.userId, px, cloneBadge)?.let { return@withContext it }
 
-        val drawable = AppRepository.getIcon(context, app)
-            ?: runCatching { context.packageManager.getApplicationIcon(app.packageName) }.getOrNull()
+        val drawable = AppRepository.getIcon(context, app, cloneBadge)
+            ?: AppRepository.mainSpaceIcon(context, app.packageName)
             ?: return@withContext null
 
         val imageBitmap = runCatching {
@@ -661,7 +690,7 @@ object AppIconCache {
         }.getOrNull()
 
         if (imageBitmap != null) {
-            put(app.packageName, app.userId, px, imageBitmap)
+            put(app.packageName, app.userId, px, cloneBadge, imageBitmap)
         }
         imageBitmap
     }

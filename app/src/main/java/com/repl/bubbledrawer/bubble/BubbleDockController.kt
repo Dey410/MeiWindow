@@ -258,7 +258,7 @@ class BubbleDockController(
             icon.layoutParams = android.widget.FrameLayout.LayoutParams(px, px)
             icon.shape = snap.fanIconShape
             when (item) {
-                is GestureAppLauncher.AdapterItem.AppItem -> icon.setImageDrawable(repo.icon(item.app))
+                is GestureAppLauncher.AdapterItem.AppItem -> icon.setImageDrawable(repo.icon(item.app, snap.cloneBadge))
                 GestureAppLauncher.AdapterItem.More -> icon.setImageResource(R.drawable.icon_gesture_more_app)
             }
         }

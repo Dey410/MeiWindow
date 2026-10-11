@@ -59,6 +59,8 @@
     <string name="fan_icon_shape_circle">圆形</string>
     <string name="fan_icon_shape_rounded">系统样式圆角矩形</string>
     <string name="fan_icon_shape_summary">圆形为 Flyme 原样；圆角矩形与桌面图标一致</string>
+    <string name="fan_clone_badge">分身角标</string>
+    <string name="fan_clone_badge_summary">分身应用的图标一律取主空间那张；开启时在右下角叠一个分身角标，关闭后与主应用完全一致</string>
     <string name="fan_auto_fill_recommend">自动填满推荐应用</string>
     <string name="fan_auto_fill_recommend_summary">收藏不足一页时用预测的常用应用补齐</string>
     <string name="fan_pressure_page_turn">气压重按翻页</string>

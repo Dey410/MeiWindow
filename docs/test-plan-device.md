@@ -155,8 +155,8 @@ E:\Android\Sdk\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app
       —— 正常情况下每 700ms 会重新压一次遮罩（自愈），日志只在状态变化时出现
       （`SHOW_DIM_SURFACE` / `DIM_HIDDEN` / `DIM_TARGET`），不会刷屏
 
-## A10 扇形外观与时长（滑出振动 / 自动收起 / 图标大小 / 形状）
-入口：设置页「扇形面板外观」（图标数量 / 半径 / 滑出振动 / 不操作自动收起 / 图标大小 / 图标形状）。
+## A10 扇形外观与时长（滑出振动 / 自动收起 / 图标大小 / 形状 / 分身角标）
+入口：设置页「扇形面板外观」（图标数量 / 半径 / 滑出振动 / 不操作自动收起 / 图标大小 / 图标形状 / 分身角标）。
 - [ ] **滑出时振动**（默认开）：从下角滑出、扇形**开始展开的那一帧**振一下（轻 tick，不是重按那种重 click）；
       关掉后同一动作完全无振动，图标悬停的轻 tick 仍在
 - [ ] **不操作自动收起**（默认 10 秒，范围 0–30 秒）：滑出后手不点任何图标 → 到点自动收回
@@ -168,7 +168,10 @@ E:\Android\Sdk\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app
 - [ ] **图标形状**：圆形（默认，Flyme 原样）↔ 系统样式圆角矩形；后者图标与选中光环都变成圆角方形
       （圆角半径 = 图标边长 × 0.225，与桌面图标观感一致）
 - [ ] 切换形状后点选/悬停/翻页都正常（光环跟手、无残影）
-- [ ] 快捷判据：`adb logcat -s BubbleDrawer | findstr FAN_`（`FAN_RETRACT_*`、`FAN_PRESSURE_PAGE_TURN`）
+- [ ] **分身角标**（默认开，见 A17）：双开应用的图标**图本身**与主空间那个应用完全一样，
+      只在右下角多一个分身角标；关掉后两者像素级一致（扇子、更多面板、管理页三处都变）
+- [ ] 快捷判据：`adb logcat -s BubbleDrawer | findstr FAN_`（`FAN_RETRACT_*`、`FAN_PRESSURE_PAGE_TURN`）；
+      分身图标来源：`adb logcat -s MeiWindow_AppRepo | findstr CLONE_ICON`
 
 ## A11 小窗内横屏（窗口必须落在屏幕内）
 Flyme 样式下小窗的大小 = 一个缩放系数 × ROM 自己的**未缩放**任务 bounds（`MiuiMultiWindowUtils.getPossibleBounds`）。
@@ -376,6 +379,27 @@ OS3 上模块改为调用 ROM 自己的转换入口 `MiuiFreeformModeController.
 - [ ] `MON_WARMUP rounds=24 ms=… cur=… max=…` 在启动时就出现（几何缓存已就绪）
 - [ ] 重启后若探针窗口没建起来会有一条 `MON_IME_PROBE_MISSING`（那时键盘上的角落按下会被抢下，
       属于已知降级）
+
+## A17 分身应用（双开）的图标与角标
+做法：分身应用的**图本身永远取主空间那张** —— `AppRepository.mainSpaceIcon(pkg)`：先问
+`LauncherApps.getActivityList(pkg, user 0)`（桌面上画的那张，含自适应/主题图标），拿不到再退
+`PackageManager.getApplicationIcon`。分身用户只决定要不要在这张图上**叠角标**
+（`RemotePrefs.KEY_CLONE_BADGE`，设置页「扇形面板外观 → 分身角标」，默认开）：
+
+- XSpace（user 999）：先交给 MIUI 自己的 `XSpaceUserHandle.getXSpaceIcon(context, base)` ——
+  它的入参就是上面这张主空间图（MIUI 的双开角标是叠上去的），拿不到才用模块自己画的橙色双环；
+- 其它用户配置（工作资料等）：`PackageManager.getUserBadgedIcon(base, handle)`（系统角标同样是叠图）；
+- 关掉开关：直接返回主空间那张，和主应用像素级一致。
+
+1.1.8 及以前不是这样：分身图标先走 `LauncherActivityInfo.getBadgedIcon(dpi)`，那是**分身用户自己那份
+资源** —— MIUI 预烤的双开图标（另一套美术/尺寸），于是同一个应用在扇子里看着像两个应用。
+
+- [ ] 开双开后：主应用与分身应用在扇子里**图一样**，只有右下角多一个角标
+- [ ] 设置页关掉「分身角标」→ 两者完全一致（扇子、更多面板、管理页三处都要看）
+- [ ] 开关来回切两次都生效（缓存键里带开关，切换后重新解码，不必重启界面）
+- [ ] 主空间那个应用的图标不受影响（`CLONE_ICON` 只对 user≠0 打）
+- [ ] 日志：`adb logcat -s MeiWindow_AppRepo | findstr CLONE_ICON` → `badge=true src=main-space+badge`；
+      SystemUI 侧另有 `PREFS_APPLIED … icon[cloneBadge=true]`
 
 ## 贴边模式（可选，root）
 - [ ] 设置页"贴边模式"：无 su → toast 需要 root；有 su → inset=0，正上滑角落也能出扇

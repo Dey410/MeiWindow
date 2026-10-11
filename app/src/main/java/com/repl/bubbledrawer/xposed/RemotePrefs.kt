@@ -120,6 +120,15 @@ object RemotePrefs {
     const val FAN_ICON_SHAPE_ROUNDED = 1
     const val DEFAULT_FAN_ICON_SHAPE = FAN_ICON_SHAPE_CIRCLE
 
+    /**
+     * 分身应用（MIUI 应用双开 / user 999，以及其它用户配置）图标右下角的分身角标。
+     *
+     * 无论开关如何，**图本身永远取主空间那张**（见 `AppRepository.mainSpaceIcon`）—— 这一项只管
+     * 要不要在它上面叠一个角标：开启时一眼能分出「主」和「分身」，关掉时分身图标与主空间完全一致。
+     */
+    const val KEY_CLONE_BADGE = "clone_badge_enabled"
+    const val DEFAULT_CLONE_BADGE = true
+
     /** 扇形应用未摆满时用推荐应用填满（默认关闭） */
     const val KEY_FAN_AUTO_FILL_RECOMMEND = "fan_auto_fill_recommend"
     const val DEFAULT_FAN_AUTO_FILL_RECOMMEND = false
@@ -228,6 +237,8 @@ object RemotePrefs {
         val fanIconDp: Int = DEFAULT_FAN_ICON_DP,
         /** 扇形图标形状：0 = 圆形，1 = 系统样式圆角矩形 */
         val fanIconShape: Int = DEFAULT_FAN_ICON_SHAPE,
+        /** 分身应用图标上的角标（图始终取主空间那张，这一项只管角标） */
+        val cloneBadge: Boolean = DEFAULT_CLONE_BADGE,
         /** 扇形未摆满时用推荐应用填满 */
         val fanAutoFillRecommend: Boolean = DEFAULT_FAN_AUTO_FILL_RECOMMEND,
         /** 扇形重按翻页开关与灵敏度 */
@@ -292,6 +303,7 @@ object RemotePrefs {
                 .coerceIn(FAN_AUTO_RETRACT_MIN, FAN_AUTO_RETRACT_MAX),
             fanIconDp = sp.getInt(KEY_FAN_ICON_DP, DEFAULT_FAN_ICON_DP).let { if (it <= 0) DEFAULT_FAN_ICON_DP else it.coerceIn(FAN_ICON_MIN, FAN_ICON_MAX) },
             fanIconShape = sp.getInt(KEY_FAN_ICON_SHAPE, DEFAULT_FAN_ICON_SHAPE).coerceIn(0, 1),
+            cloneBadge = sp.getBoolean(KEY_CLONE_BADGE, DEFAULT_CLONE_BADGE),
             fanAutoFillRecommend = sp.getBoolean(KEY_FAN_AUTO_FILL_RECOMMEND, DEFAULT_FAN_AUTO_FILL_RECOMMEND),
             fanPressurePageTurn = sp.getBoolean(KEY_FAN_PRESSURE_PAGE_TURN, DEFAULT_FAN_PRESSURE_PAGE_TURN),
             fanPressureSensitivity = sp.getInt(KEY_FAN_PRESSURE_SENSITIVITY, DEFAULT_FAN_PRESSURE_SENSITIVITY).coerceIn(0, 2),

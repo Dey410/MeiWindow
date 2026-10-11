@@ -51,7 +51,12 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  */
 class PinManageActivity : ComponentActivity() {
 
-    private val repo by lazy { AppGraph.repo ?: AppRepository(this).also { AppGraph.repo = it } }
+    private val repo by lazy {
+        AppGraph.repo ?: AppRepository(
+            this,
+            cloneBadge = { SettingsStore.snapshot(this).cloneBadge },
+        ).also { AppGraph.repo = it }
+    }
     private val pinStore by lazy {
         AppGraph.pinStore ?: PinStore(
             SettingsStore.pinBackend(this),
@@ -84,6 +89,8 @@ class PinManageActivity : ComponentActivity() {
                     this@PinManageActivity, all, pinned, count,
                 )
             },
+            // 分身角标：图标本身取主空间那张，这一项只决定要不要叠角标（与面板同源设置）。
+            cloneBadge = SettingsStore.snapshot(this@PinManageActivity).cloneBadge,
         )
         model.reload()
         // Pins can also be edited in the fan's 更多 panel (SystemUI), which hands them over as a

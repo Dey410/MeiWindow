@@ -32,6 +32,12 @@ class PinManageModel(
     private val onOrderChange: (List<PinnedRef>) -> Unit,
     private val recommendConfig: () -> Pair<Boolean, Int> = { true to 8 },
     private val loadRecommendations: (suspend (List<BubbleApp>, Set<String>, Int) -> List<BubbleApp>)? = null,
+    /**
+     * 分身角标开关（[com.repl.bubbledrawer.xposed.RemotePrefs.KEY_CLONE_BADGE]）—— 由宿主读设置后传进来：
+     * 面板跑在 SystemUI 里（LSPosed 远程组），管理页跑在应用进程（本地镜像）。图标本身永远取主空间
+     * 那张，这一项只管要不要叠角标。
+     */
+    val cloneBadge: Boolean = com.repl.bubbledrawer.xposed.RemotePrefs.DEFAULT_CLONE_BADGE,
 ) {
     /** false = view mode (tap launches); true = edit mode (tap pins, long-press drags). */
     var manageMode: Boolean by mutableStateOf(false)

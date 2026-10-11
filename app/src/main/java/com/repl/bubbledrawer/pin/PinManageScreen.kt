@@ -182,6 +182,7 @@ fun PinManageScreen(
                         pinned = model.isPinned(cell.app),
                         iconDp = iconDp,
                         textSp = textSp,
+                        cloneBadge = model.cloneBadge,
                         onTap = { if (model.manageMode) model.togglePin(cell.app) else onLaunch(cell.app) },
                         modifier = cellModifier,
                     )
@@ -475,6 +476,7 @@ private fun PinCell(
             pinned = true,
             iconDp = iconDp,
             textSp = textSp,
+            cloneBadge = model.cloneBadge,
             onTap = onTap,
         )
     }
@@ -488,6 +490,7 @@ private fun AppCell(
     pinned: Boolean = false,
     iconDp: Int,
     textSp: Int,
+    cloneBadge: Boolean,
     onTap: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -498,6 +501,7 @@ private fun AppCell(
             pinned = pinned,
             iconDp = iconDp,
             textSp = textSp,
+            cloneBadge = cloneBadge,
             onTap = onTap,
         )
     }
@@ -516,6 +520,7 @@ private fun AppTile(
     pinned: Boolean,
     iconDp: Int,
     textSp: Int,
+    cloneBadge: Boolean,
     onTap: () -> Unit,
 ) {
     val iconSize = (if (iconDp > 0) iconDp else 50).dp
@@ -533,7 +538,7 @@ private fun AppTile(
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Box {
-            AppIcon(app = app, size = iconSize)
+            AppIcon(app = app, size = iconSize, cloneBadge = cloneBadge)
             if (manageMode) {
                 // ORIGINAL badge assets (app_launcher_item_add/remove_icon.png, decompiled
                 // res) — the miuix vector detour read wrong at 24dp; the tile is a replica,
@@ -567,21 +572,25 @@ private fun AppTile(
 /**
  * Drawable → ImageBitmap for a launcher icon. `remember(app.packageName)` keeps the
  * decode per cell; a recomposition re-uses it, a rebind decodes once.
+ *
+ * [cloneBadge] is part of the key: for a 分身 the same app#user renders as the main-space
+ * artwork either with or without the corner mark, and the switch can change between two
+ * visits to this page.
  */
 @Composable
-private fun AppIcon(app: BubbleApp, size: androidx.compose.ui.unit.Dp) {
+private fun AppIcon(app: BubbleApp, size: androidx.compose.ui.unit.Dp, cloneBadge: Boolean) {
     val context = LocalContext.current
     val density = LocalDensity.current
     val px = with(density) { size.roundToPx() }
 
     // Instant memory-cache hit (0 latency, 0 main-thread I/O)
-    var imageBitmap by remember(app.packageName, app.userId, px) {
-        mutableStateOf(AppIconCache.get(app.packageName, app.userId, px))
+    var imageBitmap by remember(app.packageName, app.userId, px, cloneBadge) {
+        mutableStateOf(AppIconCache.get(app.packageName, app.userId, px, cloneBadge))
     }
 
     if (imageBitmap == null) {
-        LaunchedEffect(app.packageName, app.userId, px) {
-            val loaded = AppIconCache.loadOrGet(context, app, px)
+        LaunchedEffect(app.packageName, app.userId, px, cloneBadge) {
+            val loaded = AppIconCache.loadOrGet(context, app, px, cloneBadge)
             if (loaded != null) {
                 imageBitmap = loaded
             }

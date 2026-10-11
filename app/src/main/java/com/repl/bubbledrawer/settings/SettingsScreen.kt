@@ -399,6 +399,14 @@ fun FanSettingsScreen(
                             onSelect = actions::setFanIconShape,
                         )
                     })
+                    add(CardItem("clone_badge") {
+                        SwitchRow(
+                            title = stringResource(R.string.fan_clone_badge),
+                            summary = stringResource(R.string.fan_clone_badge_summary),
+                            checked = snap.cloneBadge,
+                            onCheckedChange = actions::setCloneBadge,
+                        )
+                    })
                     add(CardItem("auto_fill") {
                         SwitchRow(
                             title = stringResource(R.string.fan_auto_fill_recommend),

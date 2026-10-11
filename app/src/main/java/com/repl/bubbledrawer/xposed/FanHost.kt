@@ -77,7 +77,7 @@ class FanHost(
     private val moduleContext: Context? = ModuleResources.packageContext(host)
     private val context: Context = moduleContext?.let { ModuleResources.FanContext(host, it) } ?: host
 
-    private val repo = AppRepository(context)
+    private val repo = AppRepository(context, cloneBadge = { RemotePrefs.read(prefs).cloneBadge })
 
     /**
      * Pin persistence inside SystemUI (方案 B panel writes).
@@ -628,7 +628,7 @@ class FanHost(
             layoutParams = FrameLayout.LayoutParams(iconPx, iconPx)
         }
         when (item) {
-            is GestureAppLauncher.AdapterItem.AppItem -> icon.setImageDrawable(repo.icon(item.app))
+            is GestureAppLauncher.AdapterItem.AppItem -> icon.setImageDrawable(repo.icon(item.app, snap.cloneBadge))
             GestureAppLauncher.AdapterItem.More ->
                 runCatching { icon.setImageResource(R.drawable.icon_gesture_more_app) }
         }
@@ -786,6 +786,8 @@ class FanHost(
                     context, all, pinned, count,
                 )
             },
+            // 分身角标：面板里的图标与扇子同源（都按这次快照决定要不要叠角标）。
+            cloneBadge = RemotePrefs.read(prefs).cloneBadge,
         )
         // Panel window root FIRST, then the Compose content inside it: the view-tree
         // owners must be tagged on the window root too (see PanelContentFactory.create

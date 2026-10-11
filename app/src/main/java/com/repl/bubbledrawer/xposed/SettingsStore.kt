@@ -125,6 +125,13 @@ object SettingsStore {
     fun setFanIconShape(context: Context, shape: Int) =
         putInt(context, RemotePrefs.KEY_FAN_ICON_SHAPE, shape.coerceIn(0, 1))
 
+    /**
+     * 分身应用图标上的角标。图标本身永远取主空间那张，这里只决定要不要叠角标 —— 所以这个开关
+     * 不影响图标来源，只影响 `AppRepository` 的缓存键与绘制。
+     */
+    fun setCloneBadge(context: Context, enabled: Boolean) =
+        putBoolean(context, RemotePrefs.KEY_CLONE_BADGE, enabled)
+
     /** 扇形未摆满时用推荐应用填满开关。 */
     fun setFanAutoFillRecommend(context: Context, enabled: Boolean) {
         RemoteBridge.local(context).edit().putBoolean(RemotePrefs.KEY_FAN_AUTO_FILL_RECOMMEND, enabled).apply()
