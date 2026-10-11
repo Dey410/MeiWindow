@@ -33,9 +33,9 @@ E:\Android\Sdk\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app
 ### A2 日志判据（LSPosed 模块日志，tag `BubbleDrawer`）
 - [ ] 启动即 `PREFS_APPLIED … transport=gesture-monitor`（写 `spy-view` 说明监视器没建起来，
       日志里 `MON_INPUT_UNAVAILABLE_FALLBACK_SPY_VIEW` 带原因）
-- [ ] 一次成功手势：`MON_DOWN side=… x=… y=…` → `MON_PILFER_OK=true` → `MON_ACTIVATE …`
-- [ ] 应用内**不再**出现 `MON_DOWN` 紧跟 `MON_SYSTEM_CANCEL`（旧症状：
-      `SPY_*_DOWN` +6~22ms `SPY_*_SYSTEM_CANCEL`）
+- [ ] 一次成功手势：`MON_DOWN side=… x=… y=… mode=pre-own lat=N` → `MON_ACTIVATE …`
+- [ ] 应用内**不再**出现 `MON_DOWN` 紧跟 `MON_SYSTEM_CANCEL … owned=true`（旧症状：
+      `SPY_*_DOWN` +6~22ms `SPY_*_SYSTEM_CANCEL`；`owned=true` 表示这一笔被系统抢了回去）
 - [ ] `dumpsys input` 的 `Gesture Monitors (implemented as spy windows)` 里有
       `[Gesture Monitor] BubbleDrawer-corner`
 
@@ -333,6 +333,45 @@ OS3 上模块改为调用 ROM 自己的转换入口 `MiuiFreeformModeController.
       可直接粘贴发人
 - [ ] 界面里改了开关后，结论里"系统界面读到的设置"应能反映出来（不一致会直接报出来：
       设置没同步 = 功能静默失效）
+- [ ] 多了 **【边角手势】** 一组：采集通道（手势监听 / 降级 SPY 窗口）、最近一次角落按下
+      有没有抢下指针流（`mode=pre-own` + 用时 ms）、抢下后有没有被系统夺回（见 A16）
+
+## A16 角落屏蔽手势（回桌面不再和扇面一起出现）
+现象（用户报告）：重启系统界面之后，或者很久没划角落再划时，`全面屏手势（回桌面）`会和扇形面板
+**一起**弹出。
+
+成因（设备实测）：角落那一笔必须在 **MiuiHome 的原生识别器之前**把指针流抢过来
+（`InputManagerService: pilferPointers` 落在触摸后约 2ms；晚一点 launcher 就
+`app requestRedirect` 接管了，而它的 HOME 是"看最初几个向上采样"就决定的，事后收不回来）。
+所以 DOWN 这条路线上任何会阻塞的东西都在赌这一笔：
+
+- `WindowManager.addView`（键盘高度探针窗口）曾在第一个角落 DOWN 里现场创建 —— 每次 SystemUI
+  启动后**第一笔**角落手势必然输掉这场竞赛，表现就是"重启系统界面后第一下会回桌面"；
+- 主线程队列（SystemUI 启动、扇面/联系人条/面板的窗口工作）曾排在 DOWN 回调前面；
+- `PowerManager` / `KeyguardManager` 的 binder 调用、`WindowManager` 指标读取都在抢之前。
+
+现在的实现：探针窗口在 `start()` 建好（insets 监听维护缓存）、几何与电源/锁屏状态都是缓存字段
+（配置变化 / 亮灭屏 / 锁屏事件 + 输入线程上 250ms 看门狗刷新）、DOWN 回调跑在
+`bubbledrawer-corner-input` 专用线程（`THREAD_PRIORITY_URGENT_DISPLAY`），启动时 `MON_WARMUP`
+预热一遍，抢占的判定区也改成 `max(28dp, 触发区自身的纵向半径)`（此前触发区高于 28dp 的那部分
+按下只是"观察"，同样会被 launcher 抢走 HOME）。
+
+- [ ] **重启系统界面**（A14 的按钮，或 `adb shell su -c "killall com.android.systemui"`）→
+      等界面回来 → **第一笔**右下角内滑：只出扇面，**不回桌面**；左上/左下角同理
+- [ ] 很久不用（或熄屏一段时间后）再划角落：同样只出扇面
+- [ ] 角落轻点（不滑动）仍然是被点的那个应用收到点击（键盘弹着的时候更要试：
+      左下角按键只输入一次）
+- [ ] 角落**外**的底部上滑（屏幕中间、离角 100dp 以上）依旧正常回桌面 —— 屏蔽只发生在触发区内
+
+### A16 日志判据
+- [ ] 每一笔 `MON_DOWN … band=true ime=0px mode=pre-own lat=N`：`lat` 是个位到十几毫秒
+      （真机实测正常 2ms；`lat` 超过 8ms 诊断页会开始提示"偏慢"）
+- [ ] 这一笔之后**没有** `MON_SYSTEM_CANCEL … owned=true`（有就是"被 launcher 抢回去了"，
+      扇面和桌面会一起出现）
+- [ ] `MON_INPUT_READY … thread=bubbledrawer-corner-input`（不再是主线程）
+- [ ] `MON_WARMUP rounds=24 ms=… cur=… max=…` 在启动时就出现（几何缓存已就绪）
+- [ ] 重启后若探针窗口没建起来会有一条 `MON_IME_PROBE_MISSING`（那时键盘上的角落按下会被抢下，
+      属于已知降级）
 
 ## 贴边模式（可选，root）
 - [ ] 设置页"贴边模式"：无 su → toast 需要 root；有 su → inset=0，正上滑角落也能出扇

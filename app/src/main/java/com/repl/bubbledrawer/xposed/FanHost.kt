@@ -141,12 +141,7 @@ class FanHost(
                 }
                 PinsSync.Source.NONE -> Unit
             }
-            logger(
-                Log.INFO,
-                "PIN_READ src=${decision.source} localRev=${localBackend.readRev()} " +
-                    "remoteRev=$remoteRev pins=${PinCodec.decode(decision.value).size}",
-                null,
-            )
+            logPinRead(decision.source, localBackend.readRev(), remoteRev, decision.value)
             return decision.value
         }
 
@@ -165,6 +160,41 @@ class FanHost(
             local.writeRev(rev)
         }
     })
+
+    /**
+     * The pin store's read trace, THROTTLED.
+     *
+     * `pinsOf()` is asked once per app while a panel page is built (`PinManageModel` asks "is
+     * this one pinned?" for every entry), so a single 更多/管理页 build produced hundreds of
+     * `PIN_READ` lines — each one a synchronous write into LSPosed's log file, on the main
+     * thread, mid-gesture. Besides the cost, it buried the events the log exists for: the
+     * diagnostics page shows the last 25 lines, and they were all this. So a read is logged
+     * when its OUTCOME changes, and otherwise at most once per [PIN_READ_LOG_INTERVAL_MS] with
+     * the number of reads that were folded into it.
+     */
+    private fun logPinRead(source: PinsSync.Source, localRev: Long, remoteRev: Long, value: String) {
+        val line = "PIN_READ src=$source localRev=$localRev remoteRev=$remoteRev " +
+            "pins=${PinCodec.decode(value).size}"
+        val now = android.os.SystemClock.uptimeMillis()
+        val changed = line != lastPinReadLine
+        if (!changed && now - lastPinReadLogUptime < PIN_READ_LOG_INTERVAL_MS) {
+            pinReadsSuppressed++
+            return
+        }
+        val suppressed = pinReadsSuppressed
+        pinReadsSuppressed = 0
+        lastPinReadLogUptime = now
+        lastPinReadLine = line
+        logger(
+            Log.INFO,
+            if (suppressed == 0) line else "$line (+$suppressed identical reads)",
+            null,
+        )
+    }
+
+    private var lastPinReadLine: String? = null
+    private var lastPinReadLogUptime = 0L
+    private var pinReadsSuppressed = 0
 
     /**
      * Hand the pin order to the module's app process: explicit broadcast first (works even
@@ -1006,5 +1036,8 @@ class FanHost(
         /** 默认面板占地（屏幕百分比），两个轴都用它 —— 与启动小窗的默认尺寸对齐。 */
         const val DEFAULT_PANEL_PCT = 62
         const val FADE = 130L
+
+        /** 见 [logPinRead]：同一个读结果最多这么久记一行。 */
+        const val PIN_READ_LOG_INTERVAL_MS = 1000L
     }
 }

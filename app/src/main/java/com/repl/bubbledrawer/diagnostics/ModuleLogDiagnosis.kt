@@ -30,6 +30,7 @@ enum class CheckGroup(val title: String) {
     SETTINGS("设置与同步"),
     PLACEMENT("居中与尺寸"),
     BEHAVIOUR("避让与迷你小窗"),
+    GESTURE("边角手势"),
 }
 
 /**
@@ -103,6 +104,10 @@ object ModuleLogDiagnosis {
         "FREEFORM_SCALE", "FREEFORM_OFFSET_SKIPPED", "RESTORE_AVOID_SKIPPED",
         "PROBE prefs", "PREFS_APPLIED", "HOT_RELOADED", "SYSTEMUI_RESTART",
         "MINI_SWIPE", "SYSTEMUI_CORNER_SPY", "FLYME_FREEFORM_HOOKS_REINSTALL_FAILED",
+        // 边角手势（见 CornerInputMonitor）：MON_DOWN/MON_STROKE_END 是每一笔的结局，
+        // MON_SYSTEM_CANCEL 是"这一笔被系统抢走"的唯一证据。
+        "MON_DOWN", "MON_STROKE_END", "MON_ACTIVATE", "MON_SYSTEM_CANCEL", "MON_INPUT_READY",
+        "MON_PILFER", "MON_WARMUP", "SYSTEMUI_CORNER_READY", "MON_IME_PROBE",
     )
 
     fun moduleLines(lines: List<String>): List<String> =
@@ -120,6 +125,7 @@ object ModuleLogDiagnosis {
             addAll(settingsChecks(relevant, expected))
             addAll(placementChecks(relevant))
             addAll(behaviourChecks(relevant))
+            addAll(cornerChecks(relevant))
         }
         return Diagnosis(
             checks = checks,
@@ -673,6 +679,133 @@ object ModuleLogDiagnosis {
     }
 
     private fun count(lines: List<String>, marker: String): Int = lines.count { it.contains(marker) }
+
+    // -----------------------------------------------------------------------------------------
+    // 边角手势 —— 「扇形弹出来的时候，桌面是不是也跟着回了」
+    // -----------------------------------------------------------------------------------------
+
+    /**
+     * 这一组回答用户报的那个现象：**全面屏手势（回桌面）和扇形面板一起弹出**。
+     *
+     * 机理（设备实测）：角落的 DOWN 必须在 MiuiHome 的原生识别器之前把指针流抢过来
+     * （`InputManagerService: pilferPointers` 落在触摸后约 2 ms，晚一点 launcher 就已经
+     * `app requestRedirect` 接管了，它的 HOME 是"看最初几个向上采样"就决定的）。日志里能
+     * 证明这件事的只有三行：
+     *  - `MON_DOWN … mode=pre-own|observe … lat=N`：这一笔有没有抢、抢得多快；
+     *  - `MON_SYSTEM_CANCEL … owned=true`：抢了之后又被别人拿走（就是"一起弹出"的那一刻）；
+     *  - `SYSTEMUI_CORNER_READY transport=…`：走的是手势监听（能抢）还是降级的 SPY 窗口（抢不了）。
+     */
+    private fun cornerChecks(lines: List<String>): List<DiagnosisCheck> = buildList {
+        val transport = lines.lastOrNull { it.contains("SYSTEMUI_CORNER_READY") }
+        val inputReady = lines.lastOrNull { it.contains("MON_INPUT_READY") }
+        val fallback = transport?.contains("spy-view-fallback") == true
+        if (transport != null || inputReady != null) {
+            add(
+                DiagnosisCheck(
+                    id = "gesture.transport",
+                    group = CheckGroup.GESTURE,
+                    title = "角落手势的采集通道",
+                    status = if (fallback) CheckStatus.FAIL else CheckStatus.PASS,
+                    detail = if (fallback) {
+                        "降级成了 SPY 窗口：这条通道抢不下指针流，角落滑动时系统会同时执行回桌面"
+                    } else {
+                        "手势监听（DO_NOT_PILFER）：可以在 DOWN 时抢下指针流"
+                    },
+                    evidence = trimPrefix((transport ?: inputReady)!!),
+                ),
+            )
+        }
+
+        val down = lines.lastOrNull { it.contains("MON_DOWN ") }
+        if (down != null) {
+            val mode = Regex("mode=(\\S+)").find(down)?.groupValues?.get(1)
+            val lat = Regex("lat=(-?\\d+)").find(down)?.groupValues?.get(1)?.toIntOrNull()
+            val ime = Regex("ime=(\\d+)px").find(down)?.groupValues?.get(1)?.toIntOrNull()
+            val observe = mode != null && mode != "pre-own"
+            val slow = lat != null && lat > SLOW_PREOWN_MS
+            add(
+                DiagnosisCheck(
+                    id = "gesture.preown",
+                    group = CheckGroup.GESTURE,
+                    title = "最近一次角落按下有没有抢下指针流",
+                    status = when {
+                        mode == null -> CheckStatus.INFO
+                        observe -> CheckStatus.FAIL
+                        slow -> CheckStatus.WARN
+                        else -> CheckStatus.PASS
+                    },
+                    detail = when {
+                        mode == null ->
+                            "这一版还没有记录抢占方式（日志行：${trimPrefix(down)}）"
+                        observe && ime != null && ime > 0 ->
+                            "只观察（键盘弹着，按设计不抢）：这一笔系统仍可能同时回桌面"
+                        observe ->
+                            "只观察、没有抢：这一笔系统可以同时执行回桌面（扇面和桌面会一起出现）"
+                        slow ->
+                            "抢下了，但触摸到抢占用时 ${lat}ms，偏慢（超过 ${SLOW_PREOWN_MS}ms 就有被 launcher 抢先的风险）"
+                        lat == null ->
+                            "抢下了指针流（这一版还没记录用时）"
+                        else ->
+                            "按下的 ${lat}ms 内抢下了指针流，够快"
+                    },
+                    evidence = trimPrefix(down),
+                ),
+            )
+        } else {
+            add(
+                DiagnosisCheck(
+                    id = "gesture.preown",
+                    group = CheckGroup.GESTURE,
+                    title = "最近一次角落按下有没有抢下指针流",
+                    status = CheckStatus.INFO,
+                    detail = "日志里还没有角落手势的记录（先划一次左右下角再看）",
+                ),
+            )
+        }
+
+        val stolen = lines.lastOrNull { it.contains("MON_SYSTEM_CANCEL") }
+        if (stolen != null) {
+            val owned = stolen.contains("owned=true")
+            val tracking = stolen.contains("tracking=true")
+            val claimed = stolen.contains("claimed=true")
+            add(
+                DiagnosisCheck(
+                    id = "gesture.stolen",
+                    group = CheckGroup.GESTURE,
+                    title = "抢下的指针流有没有被系统夺回",
+                    status = if (owned || tracking || claimed) CheckStatus.FAIL else CheckStatus.PASS,
+                    detail = if (owned || tracking || claimed) {
+                        "有：模块拿着这一笔的时候系统又把它接管了 —— 这正是「面板和回桌面一起出现」"
+                    } else {
+                        "没有：这一笔系统接管时模块已经放手（正常，比如手势半途被系统取消）"
+                    },
+                    evidence = trimPrefix(stolen),
+                ),
+            )
+        }
+
+        val probeMissing = lines.lastOrNull { it.contains("MON_IME_PROBE_MISSING") }
+        if (probeMissing != null) {
+            add(
+                DiagnosisCheck(
+                    id = "gesture.ime_probe",
+                    group = CheckGroup.GESTURE,
+                    title = "键盘高度探针",
+                    status = CheckStatus.WARN,
+                    detail = "探针窗口没建起来：键盘弹着的时候角落也会被抢下，键盘上的角落点击要靠补发",
+                    evidence = trimPrefix(probeMissing),
+                ),
+            )
+        }
+    }
+
+    /**
+     * 触摸到抢占用时超过这个毫秒数就不再算"稳"。
+     *
+     * 设备实测：正常一笔是 2ms 左右（dispatcher 发布 DOWN 到我们的 pilferPointers），
+     * 而 MiuiHome 的接管发生在同一毫秒级 —— 8ms 已经意味着这一笔是靠运气赢的。
+     */
+    private const val SLOW_PREOWN_MS = 8
 
     /**
      * 裁掉 LSPosed / logcat 的前缀，只留模块自己写的那句话 —— 复制出去给人看时，前缀是噪声。

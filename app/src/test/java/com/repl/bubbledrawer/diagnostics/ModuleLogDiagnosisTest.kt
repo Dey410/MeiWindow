@@ -38,6 +38,12 @@ class ModuleLogDiagnosisTest {
                 "applied=0.8 assumed=0.8 targetScale=0.8 avoided=false visual=(976x1561) screen=(1220 x 2656)",
             "${LOGCAT_PREFIX}FREEFORM_SCALE getFreeFormScale(FanContext,true,false,1,true,false,mark.via,1220,2656) " +
                 "target=0.8 rom=0.8 used=0.8 clamped=false",
+            // 边角手势：走手势监听（能抢），且最近一笔是「按下的 2ms 内抢下」（真机实测的正常值）。
+            "${LOGCAT_PREFIX}SYSTEMUI_CORNER_READY transport=gesture-monitor",
+            LSPD_PREFIX + "MON_DOWN side=RIGHT x=1139.0 y=2582.0 box=163.0 band=true ime=0px " +
+                "mode=pre-own lat=2 cur=1220x2656 max=1220x2656",
+            LSPD_PREFIX + "MON_SYSTEM_CANCEL tracking=false claimed=false kept=false owned=false " +
+                "x=1207.0 y=2304.0 inSector=false foreignInjections=0",
         )
 
         /** 期望设置 = 应用里读到的值。 */
@@ -212,6 +218,76 @@ class ModuleLogDiagnosisTest {
         assertTrue(text.contains("CENTERED_BOUNDS rect=Rect(122, 547"))
         // 前缀是噪声，复制出去的是模块自己写的那句话。
         assertFalse(text.contains("LSPosedFramework"))
+    }
+
+    @Test
+    fun aCornerStrokeThatOnlyObservedIsTheHomeAndFanBug() {
+        // 角落按下没抢指针流 = MiuiHome 的识别器说了算 = 面板和回桌面一起出现。
+        val lines = HEALTHY.map {
+            if (it.contains("MON_DOWN ")) it.replace("mode=pre-own", "mode=observe") else it
+        }
+        val check = checksOf(lines).first { it.id == "gesture.preown" }
+
+        fail(check, "只观察", "系统可以同时执行回桌面")
+    }
+
+    @Test
+    fun aPreOwnThatTookTooLongIsWorthAWarning() {
+        // 抢是抢了，但用了 52ms —— 这一笔是靠运气赢的（正常值 ~2ms）。
+        val lines = HEALTHY.map {
+            if (it.contains("MON_DOWN ")) it.replace("lat=2", "lat=52") else it
+        }
+        val check = checksOf(lines).first { it.id == "gesture.preown" }
+
+        assertEquals(CheckStatus.WARN, check.status)
+        assertTrue(check.detail.contains("52ms"), )
+        assertTrue(check.detail.contains("抢先"))
+    }
+
+    @Test
+    fun aStreamThatWasTakenBackIsReportedAsTheReportedBug() {
+        // owned=true 的那次 CANCEL：模块拿着这一笔，系统又接管了 —— 用户报的现象。
+        val lines = HEALTHY.map {
+            if (it.contains("MON_SYSTEM_CANCEL")) it.replace("owned=false", "owned=true") else it
+        }
+        val check = checksOf(lines).first { it.id == "gesture.stolen" }
+
+        fail(check, "又把它接管了", "一起出现")
+    }
+
+    @Test
+    fun theFallbackTransportIsReportedAsUnableToShield() {
+        val lines = HEALTHY.map {
+            if (it.contains("SYSTEMUI_CORNER_READY")) {
+                it.replace("transport=gesture-monitor", "transport=spy-view-fallback")
+            } else {
+                it
+            }
+        }
+        val check = checksOf(lines).first { it.id == "gesture.transport" }
+
+        fail(check, "降级", "回桌面")
+    }
+
+    @Test
+    fun anOlderLogWithoutTheLatencyFieldStillParses() {
+        // 1.1.8 及以前的 MON_DOWN 没有 lat= —— 老日志不许因此报错。
+        val lines = HEALTHY.map {
+            if (it.contains("MON_DOWN ")) it.replace(" lat=2", "") else it
+        }
+        val check = checksOf(lines).first { it.id == "gesture.preown" }
+
+        assertEquals(CheckStatus.PASS, check.status)
+        assertTrue(check.detail.contains("还没记录用时"))
+    }
+
+    @Test
+    fun aLogWithoutAnyCornerStrokeSaysSoInsteadOfFailing() {
+        val lines = HEALTHY.filterNot { it.contains("MON_DOWN ") }
+        val check = checksOf(lines).first { it.id == "gesture.preown" }
+
+        assertEquals(CheckStatus.INFO, check.status)
+        assertTrue(check.detail.contains("先划一次"))
     }
 
     @Test

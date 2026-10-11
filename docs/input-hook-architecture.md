@@ -63,9 +63,42 @@ if (name != null && (name.endsWith("MultiTaskSwitch") || name.endsWith("pip-resi
 
 ### 3.2 我们怎么办：**在它判定之前拿走整笔**
 
-`CornerInputMonitor.beginMonitorStroke()` 里，DOWN 落在"冲突带"（底边上方 28dp）时当场
-`pilferPointers()`：桌面那边有协作逻辑——`on_pilfered_at_down: passthrough_eligible = true`、
-`"skip DOWN pilfer"`，**别人在 DOWN 抢走了，它就不抢了**。这是唯一确定的做法。
+`CornerInputMonitor.beginMonitorStroke()` 里，DOWN 落在"冲突带"时当场 `pilferPointers()`：桌面那边有
+协作逻辑——`on_pilfered_at_down: passthrough_eligible = true`、`"skip DOWN pilfer"`，**别人在 DOWN
+抢走了，它就不抢了**。这是唯一确定的做法。
+
+#### 3.2.1 这是一场 ~2ms 的竞赛（2026-10-11 实测）
+
+真机 logcat 里能量出这场竞赛的全部过程（同一笔手势）：
+
+```
+21:29:47.974  MIUIInput: [MotionEvent] publisher action=0x0 … channel 'a0bf123 com.miui.home/…Launcher'
+21:29:47.974  MIUIInput: [MotionEvent] publisher action=0x0 … channel '[Gesture Monitor] BubbleDrawer-corner-…'
+21:29:47.976  InputManagerService: pilferPointers            ← 我们（DOWN 后 ~2ms）
+21:29:47.977  MIUIInput: [MotionEvent] publisher action=0x3 … channel 'a0bf123 com.miui.home/…'  ← CANCEL
+```
+
+**2ms 就是全部余量**：桌面在同一毫秒就会 `MiuiInputManagerService: app requestRedirect` 接管，
+而它的 HOME 是"看最初几个向上采样"决定的（§3.3 第一条），事后夺不回来。所以 DOWN 这条路线上
+**任何会阻塞的东西都在赌这一笔**，历史上踩过的三个坑（都已修，别退回去）：
+
+1. **在 DOWN 回调里建窗口**：键盘高度探针（IME inset 探针窗口）原本是第一个角落 DOWN 时现场
+   `WindowManager.addView` —— 窗口添加是两次 binder 往返 + relayout + insets 分发，于是**每次
+   SystemUI 启动后的第一笔角落手势必然输掉**，表现就是"重启系统界面后第一下会回桌面"。现在探针在
+   `start()` 建好，insets 变化由监听器写进 `imeHeightCache`，DOWN 只读一个字段。
+2. **在主线程处理输入**：DOWN 回调原本跑在 SystemUI 的主 looper 上，正好排在启动、扇面/联系人条/
+   面板的窗口工作后面。现在收在 `bubbledrawer-corner-input` 专用 `HandlerThread`
+   （`THREAD_PRIORITY_URGENT_DISPLAY`），只有"要动窗口"的动作才 `post` 回主线程。
+3. **抢之前先做 binder 调用**：`PowerManager.isInteractive` / `KeyguardManager.isKeyguardLocked`、
+   `WindowManager` 指标读取都曾在抢占之前。现在几何（`refreshGeometry`，主线程）、电源/锁屏
+   （`refreshState`，输入线程上 250ms 看门狗 + 亮灭屏/锁屏事件）全是缓存字段，DOWN 路径只剩
+   **读字段 + 一次 `pilferPointers()`**。启动时 `MON_WARMUP` 还会把这条路径跑 24 遍（类加载/JIT）。
+
+判定区也从"底边上方 28dp"改成 `max(28dp, 触发区自身的纵向半径)`：触发区的纵向轴是用户设置
+（最多 160dp），此前高于 28dp 的那部分按下只是"观察"，同样会被 launcher 抢走 HOME。
+
+`MON_DOWN … lat=N` 就是这个余量的现场读数（触摸到抢占用时 ms，正常 ~2ms）；`MON_SYSTEM_CANCEL …
+owned=true` 则是"抢下来又被夺回"的签名。
 
 代价与补偿（都已有实现，别退回去）：
 
@@ -73,6 +106,8 @@ if (name != null && (name.endsWith("MultiTaskSwitch") || name.endsWith("pip-resi
   300ms x=`、`passthrough timeout fired, injecting tap x=`）。我们**等 700 ms 并检查自己的监视器流里
   从 DOWN 起有没有出现过外部注入事件**（`deviceId < 0`），它补了我们就记
   `MON_TAP_PASSTHROUGH_DELEGATED` 并放弃，只有它没补才注入（`_INJECTED`）。这样点击**只会触发一次**。
+  键盘弹着时不抢 DOWN（否则键盘的按键会被"真实 DOWN + 补发 tap"打成两次），代价是那时角落手势
+  仍有被 HOME 抢走的风险。
 - **上滑回桌面**：角落扇区内已改为面板手势（见 §4），系统 HOME 从底边其它位置照常可用。
 
 ### 3.3 试过但被真机否掉的方案（**别重复踩**）
@@ -150,12 +185,15 @@ MON_INPUT_READY name=BubbleDrawer-corner-MultiTaskSwitch …
 
 | 前缀 | 含义 |
 |---|---|
-| `MON_DOWN` / `MON_DOWN_REJECTED` | DOWN 是否落在触发区（含 `box=`、`band=`、`mode=pre-own\|observe`、`arbiter=`） |
+| `MON_INPUT_READY` | 手势监听建好（`thread=bubbledrawer-corner-input` = 事件不在主线程处理） |
+| `MON_WARMUP` | 启动时预热 DOWN 路径（几何缓存就绪的证据） |
+| `MON_DOWN` / `MON_DOWN_REJECTED` | DOWN 是否落在触发区（`box=`、`band=`、`mode=pre-own\|observe`、`lat=` 触摸到抢占用时 ms） |
 | `MON_ACTIVATE` | 已认领并展开扇子 |
-| `MON_PILFER_OK` / `MON_PILFER_FAILED` | pilfer 结果 |
+| `MON_PILFER_OK` / `MON_PILFER_FAILED` / `MON_PILFER_RETRY` | pilfer 结果（`_RETRY` = 中途再抢一次，用于把被 launcher 先接管的流拉回来） |
 | `MON_SWALLOWED` | 被我们吃掉但既不是扇子也不是轻点（真拖动） |
 | `MON_TAP_PASSTHROUGH_DELEGATED` / `_INJECTED` | 轻点交还：桌面补了 / 我们补了 |
-| `MON_SYSTEM_CANCEL` / `MON_SHADOW_*` | 被外力取消 / 事后夺回（少见） |
+| `MON_SYSTEM_CANCEL` | 外力取消；**带 `owned=true` 就是"抢下的笔被系统夺回"**（扇面+回桌面同时发生的签名） |
+| `MON_IME_PROBE_MISSING` | 键盘高度探针窗口没建起来（降级：键盘上的角落按下也会被抢下） |
 | `ARBITER_*` | system_server 侧（当前禁用） |
 | `HOT_RELOAD*` / `MON_DISPOSED_FOR_HOT_RELOAD` | 热重载生命周期 |
 

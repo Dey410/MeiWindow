@@ -9,6 +9,7 @@ import android.graphics.Rect
 import android.hardware.input.InputManager
 import android.hardware.input.InputManagerGlobal
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
@@ -109,12 +110,74 @@ class CornerInputMonitor(
     private val density = context.resources.displayMetrics.density
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
 
+    // ---------------------------------------------------- cached state for the input path
+
+    /**
+     * EVERYTHING the DOWN path needs is cached here, because that path is a RACE and the
+     * whole budget is ~2 ms (see [beginMonitorStroke]).
+     *
+     * Measured on device (`MIUIInput: [MotionEvent] publisher`, the dispatcher publishing the
+     * DOWN to the launcher's window at 21:29:47.974; our `InputManagerService: pilferPointers`
+     * at .976): our DOWN-time pilfer lands ~2 ms after the touch and MiuiHome's window gets
+     * the CANCEL 1 ms later. That 2 ms is what stands between a corner swipe and
+     * HOME-plus-fan — MiuiHome commits HOME "from the first upward sample" (see
+     * RemotePrefs.KEY_ARBITER_REGION), so a pilfer that arrives late is a pilfer that did
+     * nothing. Anything on this path that can block — a window add, a binder round-trip to
+     * PowerManager/KeyguardManager, a WindowManager metrics read, the main looper's queue —
+     * can therefore cost the gesture, which is exactly what "first swipe after a SystemUI
+     * restart goes home" was.
+     *
+     * Refreshed by [refreshState] (power/keyguard, any thread) and [refreshGeometry]
+     * (WindowManager metrics, main thread only), on configuration/display changes, on
+     * screen on/off, and by a watchdog on the input thread; never read from the DOWN path
+     * as a call.
+     */
+    @Volatile
+    private var deviceInteractive = true
+
+    @Volatile
+    private var keyguardLocked = false
+
+    /** physical display bounds (union of current/maximum metrics) — see [displayBounds] */
+    @Volatile
+    private var displayBoundsCache = Rect(0, 0, 0, 0)
+
+    @Volatile
+    private var currentBoundsCache = Rect(0, 0, 0, 0)
+
+    @Volatile
+    private var maximumBoundsCache = Rect(0, 0, 0, 0)
+
+    /** IME height in px, maintained by the probe window's insets listener (main thread). */
+    @Volatile
+    private var imeHeightCache = 0
+
     /** Returns true only if the display is interactive and the keyguard is NOT locked. */
-    private fun isUnlockedAndInteractive(): Boolean {
-        val interactive = runCatching { powerManager?.isInteractive != false }.getOrDefault(true)
-        if (!interactive) return false
-        val locked = runCatching { keyguardManager?.isKeyguardLocked == true }.getOrDefault(false)
-        return !locked
+    private fun isUnlockedAndInteractive(): Boolean = deviceInteractive && !keyguardLocked
+
+    /** Power/keyguard snapshot — binder calls, so it runs on the watchdog, never on a DOWN. */
+    private fun refreshState() {
+        deviceInteractive = runCatching { powerManager?.isInteractive != false }.getOrDefault(true)
+        keyguardLocked = runCatching { keyguardManager?.isKeyguardLocked == true }.getOrDefault(false)
+    }
+
+    /**
+     * WindowManager metrics are the one part of the cache that must stay on the main thread;
+     * everything else in the DOWN path only reads the fields it fills.
+     */
+    private fun refreshGeometry() {
+        runCatching {
+            val max = wm.maximumWindowMetrics.bounds
+            val cur = wm.currentWindowMetrics.bounds
+            maximumBoundsCache = Rect(max)
+            currentBoundsCache = Rect(cur)
+            displayBoundsCache = Rect(
+                minOf(max.left, cur.left),
+                minOf(max.top, cur.top),
+                maxOf(max.right, cur.right),
+                maxOf(max.bottom, cur.bottom),
+            )
+        }.onFailure { logger(Log.WARN, "MON_GEOMETRY_REFRESH_FAILED", it) }
     }
 
     /** a stroke that moved no further than this counts as a tap at release */
@@ -140,10 +203,23 @@ class CornerInputMonitor(
 
     /**
      * Invisible, non-touchable full-screen window used ONLY to read the IME inset (see
-     * [imeVisibleHeightPx]). Created lazily on the first corner DOWN and removed in [dispose]
-     * so a hot reload cannot leave a stale window behind.
+     * [imeVisibleHeightPx]), removed in [dispose] so a hot reload cannot leave a stale window
+     * behind.
+     *
+     * CREATED UP FRONT (start), NEVER FROM AN INPUT CALLBACK. It used to be built lazily on
+     * the first corner DOWN, and `WindowManager.addView` is a window add: two binder
+     * round-trips to system_server, a relayout and an insets dispatch, on the thread that was
+     * supposed to pilfer the pointer stream a few milliseconds after the touch. Every
+     * SystemUI start therefore had exactly one corner gesture that could not win that race —
+     * the first one — and it went HOME with the fan, which is the "重启系统界面后第一次角落手势"
+     * report. The insets listener installed here keeps [imeHeightCache] current afterwards, so
+     * the DOWN path only reads a field.
      */
     private var insetProbe: View? = null
+
+    /** true once [ensureInsetProbe] has been attempted; a second failure is not logged again */
+    @Volatile
+    private var insetProbeAttempted = false
 
     /** uptime of our own injected passthrough tap, so we do not read it back as foreign */
     @Volatile
@@ -166,6 +242,8 @@ class CornerInputMonitor(
         )
     }.getOrNull()
 
+    /** read on the input thread, written on the main thread by [applySettings] */
+    @Volatile
     private var settings = RemotePrefs.read(prefs)
     private var fan: FanHost? = null
 
@@ -173,38 +251,63 @@ class CornerInputMonitor(
 
     private var monitor: InputMonitor? = null
     private var receiver: InputEventReceiver? = null
+
+    /**
+     * The thread the gesture monitor's events are handled on — NOT the main looper.
+     *
+     * The DOWN path is a race against MiuiHome's native gesture code (see the cached-state
+     * block above), and the main looper is the one thread guaranteed to be busy exactly when
+     * it matters: SystemUI's startup right after a restart, the fan's window work, the
+     * contact bar, a panel rebuild. Queuing a 2 ms-critical callback behind that work is what
+     * "the shield fails after a while" looks like. Everything that touches windows still hops
+     * to [mainHandler]; this thread only decides, pilfers and forwards.
+     */
+    private var inputThread: HandlerThread? = null
+    private var inputHandler: Handler? = null
+
+    /** set once the gesture-monitor transport has failed to come up for good (see [startMonitorTransport]) */
+    @Volatile
+    private var monitorTransportDisabled = false
+
+    private var receiverCreateFailures = 0
+
+    @Volatile
     private var stroke: Stroke? = null
 
     /**
-     * OBSERVE-FIRST, CLAIM-ON-TRAVEL — the design the device forced on us.
+     * OBSERVE-FIRST, CLAIM-ON-TRAVEL — WITH ONE DELIBERATE EXCEPTION AT DOWN.
      *
-     * A stroke inside the corner sector is NEVER taken at DOWN any more. Reasons, in order of
-     * how much they cost us:
+     * The stroke itself is never taken for a tap's sake: this monitor carries the
+     * DO_NOT_PILFER bit, so it keeps receiving the whole gesture even while another window
+     * takes the pointers, and the drawer is claimed only in [Stroke.move] on
+     * `SpyAction.Activate` — after the finger has travelled far enough to be a drawer
+     * gesture. A tap therefore stays the app's own and we inject nothing. (Two earlier
+     * designs that took the DOWN unconditionally were removed for exactly that: the app was
+     * left holding DOWN…CANCEL, and rebuilding its click with a synthetic tap typed the
+     * bottom-left keyboard key twice.)
      *
-     *  1. A spy monitor cannot stop the dispatcher from publishing the real DOWN to the app, so
-     *     a DOWN-time pilfer leaves the app holding an unfinished gesture (DOWN … CANCEL). The
-     *     only way to give that app a click afterwards is a SECOND, synthetic tap — and for a
-     *     target that acts on DOWN (a keyboard: tapping the bottom-left key typed the character
-     *     twice, confirmed on device) that is a double input, not a repair.
-     *  2. MiuiHome answers a DOWN-time pilfer with its own delayed passthrough, so two
-     *     independent injectors were racing over the same tap.
+     * THE EXCEPTION is the bottom strip MiuiHome owns: there the DOWN IS pilfered, because a
+     * corner swipe that lets the launcher keep its stream goes HOME *and* opens the fan —
+     * MiuiHome's recogniser "decides from the first upward sample" (see
+     * RemotePrefs.KEY_ARBITER_REGION), so nothing we do later in the stroke can take that
+     * back. That pilfer is the ONLY reason the corner shield works, and it is a race:
+     * measured 2 ms from the dispatcher publishing the DOWN to our `pilferPointers`, against
+     * a launcher that answers with `MiuiInputManagerService: app requestRedirect` or its own
+     * DOWN pilfer inside the same millisecond. [beginMonitorStroke] therefore keeps its work
+     * to cached field reads plus that one binder call, and runs on [inputThread].
      *
-     * Observing instead costs nothing we cannot pay: this monitor carries the DO_NOT_PILFER
-     * bit, so even after MiuiHome pilfers the stream (~9 ms after DOWN, inside its bottom
-     * band) the dispatcher keeps publishing the rest of the gesture to us. The stroke therefore
-     * stays alive across that CANCEL, and we pilfer once — in [Stroke.move], on
-     * `SpyAction.Activate`, i.e. only after the finger has travelled far enough to be a drawer
-     * gesture. Taps are then never ours: the app serves them itself, and we inject nothing.
-     *
-     * The launcher's HOME commit needs MORE upward travel than our activation threshold
-     * (`down_y - current_y > record_area_height_px`, measured take-over range 21-24 dp versus
-     * our ~14 dp), so claiming on travel still beats it to the punch.
+     * Taps inside the strip are rebuilt (see [injectTap]) — the price of owning those DOWNs —
+     * and are NOT rebuilt while the keyboard is up, where the app must serve its own taps.
      */
 
     /** True while the gesture-monitor transport owns corner capture. */
     var monitorActive: Boolean = false
         private set
 
+    /**
+     * Freeform-side tap interception, offered every monitor event BEFORE the corner gate.
+     * CALLED ON [inputThread] (any thread-safe implementation is fine; window work is not).
+     */
     var outsideTapHandler: ((MotionEvent) -> Boolean)? = null
 
     fun pilfer(): Boolean = monitor?.let {
@@ -226,7 +329,20 @@ class CornerInputMonitor(
     // ------------------------------------------------------------ lifecycle
 
     fun start() {
-        if (Looper.myLooper() == mainHandler.looper) applySettings() else mainHandler.post(::applySettings)
+        // The cached geometry has to be in place BEFORE the transport starts: the input
+        // thread's warm-up and the very first DOWN both read it, and it may only be computed
+        // here (WindowManager), never there.
+        if (Looper.myLooper() == mainHandler.looper) {
+            refreshGeometry()
+            refreshState()
+            applySettings()
+        } else {
+            mainHandler.post {
+                refreshGeometry()
+                refreshState()
+                applySettings()
+            }
+        }
         // Kept as a field so dispose() can take it back off: a lambda registered inline is
         // unreachable afterwards, and every hot reload left another live listener behind.
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
@@ -235,6 +351,10 @@ class CornerInputMonitor(
         prefsListener = listener
         prefs.registerOnSharedPreferenceChangeListener(listener)
         registerDebugReceiver()
+        // The IME probe is a WINDOW (see [insetProbe]) and therefore belongs to a moment with
+        // no deadline — never to the first corner DOWN, where it used to cost the gesture.
+        mainHandler.post { ensureInsetProbe() }
+        registerEnvironmentListeners()
         // Pre-warm FanHost and cached apps in background so the very first swipe has apps ready
         mainHandler.post { runCatching { ensureFan() } }
         // Enumeration ground truth for the fan's data source (this process's uid) — install
@@ -242,6 +362,64 @@ class CornerInputMonitor(
         // compared against a later DEBUG_PROBE run. See AppEnumProbe.
         Thread { runCatching { AppEnumProbe.run(context, logger, deep = false, prefs = prefs) } }.start()
         logger(Log.INFO, "MONITOR_INSTANCE_STARTED id=${System.identityHashCode(this)}", null)
+    }
+
+    /**
+     * Keep the cached environment fresh without ever asking for it on the DOWN path:
+     *  • screen on/off + user present — the two moments the gate's answer changes;
+     *  • configuration changes — rotation moves the display metrics and the bottom edge;
+     *  • keyguard state — event-driven, so "locked" cannot be a 250 ms stale guess.
+     * All of them are registered in [start] and released in [dispose]; a hot reload that left
+     * one behind would keep a dead instance's cache alive (same failure the prefs listener
+     * and the debug receiver had, see [dispose]).
+     */
+    private fun registerEnvironmentListeners() {
+        if (environmentReceiver == null) {
+            val receiver = object : android.content.BroadcastReceiver() {
+                override fun onReceive(c: android.content.Context?, i: android.content.Intent?) {
+                    if (disposed) return
+                    mainHandler.post {
+                        refreshGeometry()
+                        refreshState()
+                    }
+                }
+            }
+            runCatching {
+                context.registerReceiver(
+                    receiver,
+                    android.content.IntentFilter().apply {
+                        addAction(android.content.Intent.ACTION_SCREEN_ON)
+                        addAction(android.content.Intent.ACTION_SCREEN_OFF)
+                        addAction(android.content.Intent.ACTION_USER_PRESENT)
+                    },
+                    android.content.Context.RECEIVER_NOT_EXPORTED,
+                )
+            }.onSuccess { environmentReceiver = receiver }
+                .onFailure { logger(Log.WARN, "MON_ENV_RECEIVER_FAILED", it) }
+        }
+        if (componentCallbacks == null) {
+            val callbacks = object : android.content.ComponentCallbacks {
+                override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+                    refreshGeometry()
+                }
+
+                override fun onLowMemory() = Unit
+            }
+            runCatching { context.registerComponentCallbacks(callbacks) }
+                .onSuccess { componentCallbacks = callbacks }
+                .onFailure { logger(Log.WARN, "MON_CONFIG_CALLBACK_FAILED", it) }
+        }
+        if (keyguardListener == null) {
+            // API 33+: the locked state arrives as an event instead of a binder call we would
+            // have to make on the input path.
+            val listener = KeyguardManager.KeyguardLockedStateListener { locked ->
+                keyguardLocked = locked
+            }
+            runCatching {
+                keyguardManager?.addKeyguardLockedStateListener(context.mainExecutor, listener)
+            }.onSuccess { keyguardListener = listener }
+                .onFailure { logger(Log.WARN, "MON_KEYGUARD_LISTENER_FAILED", it) }
+        }
     }
 
     /**
@@ -289,6 +467,11 @@ class CornerInputMonitor(
     private var debugReceiver: android.content.BroadcastReceiver? = null
     private var prefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
 
+    /** environment refreshers registered in [registerEnvironmentListeners], released in [dispose] */
+    private var environmentReceiver: android.content.BroadcastReceiver? = null
+    private var componentCallbacks: android.content.ComponentCallbacks? = null
+    private var keyguardListener: KeyguardManager.KeyguardLockedStateListener? = null
+
     /** set by [dispose]; every receiver entry point checks it before touching the runtime */
     @Volatile
     private var disposed = false
@@ -323,6 +506,12 @@ class CornerInputMonitor(
         fan = null
         debugReceiver?.let { runCatching { context.unregisterReceiver(it) } }
         debugReceiver = null
+        environmentReceiver?.let { runCatching { context.unregisterReceiver(it) } }
+        environmentReceiver = null
+        componentCallbacks?.let { runCatching { context.unregisterComponentCallbacks(it) } }
+        componentCallbacks = null
+        keyguardListener?.let { runCatching { keyguardManager?.removeKeyguardLockedStateListener(it) } }
+        keyguardListener = null
         prefsListener?.let { runCatching { prefs.unregisterOnSharedPreferenceChangeListener(it) } }
         prefsListener = null
         insetProbe?.let { probe -> runCatching { wm.removeViewImmediate(probe) } }
@@ -362,42 +551,142 @@ class CornerInputMonitor(
     // ------------------------------------------------------------ transport A
 
     private fun startMonitorTransport() {
-        if (monitorActive) return
+        if (monitorActive || monitorTransportDisabled) return
         try {
             // Assign before anything else can throw: a monitor we created but failed to
             // wire must still be disposed, or its input channel leaks in system_server.
             val created = createMonitor()
             monitor = created
             val channel = created.inputChannel
-            receiver = object : InputEventReceiver(channel, Looper.getMainLooper()) {
-                override fun onInputEvent(event: InputEvent) {
-                    var handled = false
-                    try {
-                        handled = onMonitorEvent(event)
-                    } catch (t: Throwable) {
-                        logger(Log.WARN, "MON_EVENT_FAILED", t)
-                        stroke?.cancel()
-                    } finally {
-                        // A monitor observes: it must never swallow what it did not claim.
-                        finishInputEvent(event, handled)
-                    }
-                }
-            }
+            // The receiver belongs on its OWN thread (see [inputThread]).
+            // THREAD_PRIORITY_URGENT_DISPLAY is the priority the input dispatcher itself uses
+            // for gesture handling: this callback is a deadline, not housekeeping — it has
+            // milliseconds to pilfer the stream before MiuiHome's native recogniser owns the
+            // gesture.
+            val thread = HandlerThread(
+                "bubbledrawer-corner-input",
+                android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY,
+            )
+            thread.start()
+            val handler = Handler(thread.looper)
+            inputThread = thread
+            inputHandler = handler
+            // Counts as up as soon as the channel exists: applySettings() must NOT fall back to
+            // the SPY-view windows just because the receiver is created a beat later, and the
+            // creation cannot fail in practice (a failure is logged and retried from scratch).
             monitorActive = true
             // channel.token is @hide too: never let a diagnostics call decide whether the
             // transport counts as up.
             val tokenDesc = runCatching { channel.token.toString() }.getOrElse { "?" }
-            logger(
-                Log.INFO,
-                "MON_INPUT_READY name=$MONITOR_NAME display=$DISPLAY_ID channel=$tokenDesc " +
-                    boundsForLog(),
-                null,
-            )
+            handler.post {
+                if (disposed || monitor !== created) return@post
+                try {
+                    receiver = object : InputEventReceiver(channel, thread.looper) {
+                        override fun onInputEvent(event: InputEvent) {
+                            var handled = false
+                            try {
+                                handled = onMonitorEvent(event)
+                            } catch (t: Throwable) {
+                                logger(Log.WARN, "MON_EVENT_FAILED", t)
+                                stroke?.cancel()
+                            } finally {
+                                // A monitor observes: it must never swallow what it did not claim.
+                                finishInputEvent(event, handled)
+                            }
+                        }
+                    }
+                    logger(
+                        Log.INFO,
+                        "MON_INPUT_READY name=$MONITOR_NAME display=$DISPLAY_ID channel=$tokenDesc " +
+                            boundsForLog() + " thread=${thread.name}",
+                        null,
+                    )
+                    warmUp()
+                    handler.post(stateWatchdog)
+                } catch (t: Throwable) {
+                    // Recovery is a full restart of the transport (the receiver cannot be built
+                    // twice on the same channel anyway), but it must not become a loop: after a
+                    // couple of attempts the monitor transport is declared unusable and the
+                    // SPY-view fallback takes over — the same degradation a failed
+                    // monitorGestureInput gets.
+                    logger(Log.WARN, "MON_RECEIVER_CREATE_FAILED", t)
+                    receiverCreateFailures++
+                    mainHandler.post {
+                        runCatching { stopMonitorTransport() }
+                        if (receiverCreateFailures > MAX_RECEIVER_ATTEMPTS) {
+                            monitorTransportDisabled = true
+                            logger(
+                                Log.ERROR,
+                                "MON_RECEIVER_GIVING_UP attempts=$receiverCreateFailures " +
+                                    "— 角落采集降级为 SPY 窗口",
+                                null,
+                            )
+                        }
+                        applySettings()
+                    }
+                }
+            }
         } catch (t: Throwable) {
             monitorActive = false
             logger(Log.WARN, "MON_INPUT_UNAVAILABLE_FALLBACK_SPY_VIEW", t)
             disposeMonitor()
         }
+    }
+
+    /**
+     * Power/keyguard refresher. It lives on the input thread (mostly idle) and never on the
+     * DOWN path, so the gate's two binder calls cost the gesture nothing even in the worst
+     * case — the first touch after a long idle, when both system_server and this process are
+     * cold.
+     */
+    private val stateWatchdog = object : Runnable {
+        override fun run() {
+            refreshState()
+            // Self-heal: a geometry refresh that failed (or raced SystemUI's start-up) must not
+            // leave the corner gate with an empty display for the rest of the process' life —
+            // with a cached Rect that never got filled, every DOWN would fall outside the
+            // sector. The main thread does the work; this is only the nudge.
+            if (displayBoundsCache.width() <= 0 || displayBoundsCache.height() <= 0) {
+                mainHandler.post(::refreshGeometry)
+            }
+            inputHandler?.postDelayed(this, STATE_REFRESH_MS)
+        }
+    }
+
+    /**
+     * Touch the DOWN path once per SystemUI start so the first real corner gesture does not
+     * pay for class loading, hidden-API linkage and JIT on the race's critical path. Pure
+     * maths plus one throwaway [CornerGestureEngine] — no pilfer, no window, no log per call.
+     */
+    private fun warmUp() {
+        val started = SystemClock.uptimeMillis()
+        runCatching {
+            repeat(WARMUP_ROUNDS) {
+                val bounds = displayBoundsCache
+                sideFor(bounds.right - 1f, bounds.bottom - 1f)
+                sideFor(1f, bounds.bottom - 1f)
+                AdaptiveSpyGestureConfig.create(
+                    displayWidth = bounds.width().toFloat(),
+                    displayHeight = bounds.height().toFloat(),
+                    touchSlop = touchSlop,
+                    density = density,
+                    triggerRangeDp = settings.rangeDp,
+                    leftEnabled = settings.left,
+                    rightEnabled = settings.right,
+                )
+                val engine = CornerGestureEngine()
+                engine.down(0, bounds.right - 1f, bounds.bottom - 1f, SpySide.RIGHT)
+                engine.up(0)
+                isUnlockedAndInteractive()
+                cornerBoxPx()
+            }
+        }.onFailure { logger(Log.WARN, "MON_WARMUP_FAILED", it) }
+        logger(
+            Log.INFO,
+            "MON_WARMUP rounds=$WARMUP_ROUNDS ms=${SystemClock.uptimeMillis() - started} " +
+                boundsForLog(),
+            null,
+        )
     }
 
     /**
@@ -441,11 +730,31 @@ class CornerInputMonitor(
         throw IllegalStateException("no gesture-monitor route: $failures")
     }
 
+    /**
+     * Teardown happens ON the input thread: the receiver, the monitor's channel and the live
+     * [Stroke] all belong to that looper, so disposing them from the main thread would race the
+     * very callbacks that are still arriving. The thread quits straight afterwards, which also
+     * drops the watchdog.
+     */
     private fun stopMonitorTransport() {
         if (!monitorActive && monitor == null) return
-        stroke?.cancel()
-        disposeMonitor()
+        val thread = inputThread
+        val toDispose = receiver
+        val monitorToDispose = monitor
+        receiver = null
+        monitor = null
+        inputThread = null
+        inputHandler = null
         monitorActive = false
+        val cleanup = Runnable {
+            stroke?.cancel()
+            stroke = null
+            runCatching { toDispose?.dispose() }
+            runCatching { monitorToDispose?.dispose() }
+            thread?.quitSafely()
+        }
+        val handler = thread?.takeIf { it.isAlive }?.let { Handler(it.looper) }
+        if (handler != null) handler.post(cleanup) else cleanup.run()
         logger(Log.INFO, "MON_INPUT_STOPPED", null)
     }
 
@@ -455,6 +764,9 @@ class CornerInputMonitor(
         runCatching { monitor?.dispose() }
         receiver = null
         monitor = null
+        inputThread?.quitSafely()
+        inputThread = null
+        inputHandler = null
     }
 
     /** One dispatcher event from the gesture monitor; returns whether WE claimed the stream. */
@@ -526,6 +838,14 @@ class CornerInputMonitor(
                     val index = ev.findPointerIndex(s.pointerId)
                     val ux = if (index >= 0) ev.getRawX(index) else ev.rawX
                     val uy = if (index >= 0) ev.getRawY(index) else ev.rawY
+                    if (!s.tracking) {
+                        // The stroke already ended (engine cancel, second finger, UP); `stroke`
+                        // is cleared in Stroke.end(), so reaching here means a stroke that was
+                        // never armed. Logging it against the stale origin used to print whole
+                        // screens of MON_STROKE_END lines for touches that began elsewhere and
+                        // buried the real gestures.
+                        return@let
+                    }
                     val moved = hypot(ux - s.originX, uy - s.originY)
                     val duration = SystemClock.uptimeMillis() - s.downUptime
                     // One line per gesture, so a user report ("I tapped and something else
@@ -548,15 +868,16 @@ class CornerInputMonitor(
 
             MotionEvent.ACTION_CANCEL -> {
                 // A CANCEL means SOMEONE ELSE took this stream — in the bottom strip that is
-                // MiuiHome's swipe-up monitor pilfering ~9 ms after DOWN. KEEP THE STROKE
-                // ALIVE: our monitor carries the DO_NOT_PILFER bit (see MONITOR_NAME), so the
-                // dispatcher keeps publishing the rest of the gesture to us and we can still
+                // MiuiHome's swipe-up monitor / its `app requestRedirect` taking over. KEEP THE
+                // STROKE ALIVE: our monitor carries the DO_NOT_PILFER bit (see MONITOR_NAME), so
+                // the dispatcher keeps publishing the rest of the gesture to us and we can still
                 // decide later. Robbing it back HERE (what this code used to do) made US the
                 // owner of every tap in the strip, and the app — which had already received
                 // the real DOWN — then needed a second, synthetic tap to get a click, which is
                 // exactly the "tapping the bottom-left corner types twice" bug. Instead we stay
-                // an observer and only pilfer on Activate (Stroke.move), i.e. once the finger
-                // has really travelled far enough to be a drawer gesture.
+                // an observer (unless the DOWN already owned the strip, see [inPreOwnStrip]) and
+                // otherwise only pilfer on Activate (Stroke.move), i.e. once the finger has
+                // really travelled far enough to be a drawer gesture.
                 val s = stroke
                 if (s != null && s.tracking && !s.claimed) {
                     s.robbedByOtherAt = SystemClock.uptimeMillis()
@@ -564,7 +885,8 @@ class CornerInputMonitor(
                 logger(
                     Log.INFO,
                     "MON_SYSTEM_CANCEL tracking=${stroke?.tracking} claimed=${stroke?.claimed} " +
-                        "kept=$((s != null && s.tracking && !s.claimed)) " +
+                        "kept=${s != null && s.tracking && !s.claimed} " +
+                        "owned=${s?.owned} " +
                         "x=${ev.rawX} y=${ev.rawY} inSector=${sideFor(ev.rawX, ev.rawY) != null} " +
                         "foreignInjections=$foreignInjectionsInStroke",
                     null,
@@ -592,7 +914,7 @@ class CornerInputMonitor(
             }
             return
         }
-        // PRE-OWN THE DOWN inside the bottom band — that is what stops MiuiHome from
+        // PRE-OWN THE DOWN inside the bottom strip — that is what stops MiuiHome from
         // recognising HOME out of the corner (its Rust: "on_pilfered_at_down:
         // passthrough_eligible = true" / "skip DOWN pilfer"; whoever pilfered at DOWN makes it
         // stand down). Observing instead and claiming on travel is NOT enough: a device test
@@ -607,14 +929,21 @@ class CornerInputMonitor(
         // the synthetic tap we needed to hand the touch back. With the keyboard up, taps are
         // therefore served by the app itself (a corner drawer gesture started over the keyboard
         // is the trade-off, taking the same HOME risk as any observed stroke).
-        val bottom = displayBounds().bottom
-        val inHomeBand = y >= bottom - HOME_GESTURE_BAND_DP * density
+        //
+        // NOTHING BELOW MAY BLOCK. Every value here is a cached field (see the cached-state
+        // block) and the only call left is `pilferPointers()` itself — measured end to end at
+        // ~2 ms on this device, which is the whole margin against the launcher's own
+        // take-over. `lat` is that measurement, per stroke, in the log: it is the number to
+        // read when a corner swipe goes HOME with the fan.
+        val inPreOwnStrip = inPreOwnStrip(y)
         val imePx = imeVisibleHeightPx()
-        val owned = imePx <= 0 && inHomeBand && pilferMonitor()
+        val owned = imePx <= 0 && inPreOwnStrip && pilferMonitor()
+        val now = SystemClock.uptimeMillis()
         logger(
             Log.INFO,
-            "MON_DOWN side=$side x=$x y=$y box=${cornerBoxPx()} band=$inHomeBand " +
-                "ime=${imePx}px mode=${if (owned) "pre-own" else "observe"} " + boundsForLog(),
+            "MON_DOWN side=$side x=$x y=$y box=${cornerBoxPx()} band=$inPreOwnStrip " +
+                "ime=${imePx}px mode=${if (owned) "pre-own" else "observe"} " +
+                "lat=${now - ev.downTime} " + boundsForLog(),
             null,
         )
         val config = AdaptiveSpyGestureConfig.create(
@@ -664,19 +993,20 @@ class CornerInputMonitor(
      * `mInputShown=true` (verified on device), so it is useless here. The dependable signal is
      * the IME inset of a window we own: an invisible, non-touchable, full-screen overlay that
      * requests only `WindowInsets.Type.ime()`, kept for the life of the monitor. The system
-     * updates its insets whenever the keyboard shows or hides, so one field read per corner
-     * DOWN answers the question that decides whether we may take the DOWN at all.
+     * updates its insets whenever the keyboard shows or hides — the listener installed in
+     * [ensureInsetProbe] stores them in [imeHeightCache] — so the DOWN path only reads a field.
      */
-    private fun imeVisibleHeightPx(): Int {
-        val probe = ensureInsetProbe() ?: return 0
-        return runCatching {
-            probe.rootWindowInsets?.getInsets(WindowInsets.Type.ime())?.bottom ?: 0
-        }.getOrDefault(0)
-    }
+    private fun imeVisibleHeightPx(): Int = imeHeightCache
 
-    /** Lazily adds the IME-inset probe window (see [imeVisibleHeightPx]); null if it cannot. */
+    /**
+     * Adds the IME-inset probe window (see [imeVisibleHeightPx]) and keeps [imeHeightCache]
+     * current from its insets listener. MAIN THREAD ONLY (it is a window), and called from
+     * [start] — never from an input callback, which is the whole point of the cache.
+     */
     private fun ensureInsetProbe(): View? {
         insetProbe?.let { return it }
+        if (insetProbeAttempted && insetProbe == null) return null
+        insetProbeAttempted = true
         return runCatching {
             val view = View(context)
             val lp = WindowManager.LayoutParams(
@@ -695,10 +1025,28 @@ class CornerInputMonitor(
             lp.gravity = Gravity.BOTTOM or Gravity.START
             lp.title = "bubble slide ime probe"
             view.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            // Every inset change lands here instead of in the DOWN path. Dispatch happens on
+            // the thread that owns the view (this one).
+            view.setOnApplyWindowInsetsListener { _, insets ->
+                imeHeightCache = runCatching {
+                    insets.getInsets(WindowInsets.Type.ime()).bottom
+                }.getOrDefault(0)
+                insets
+            }
             wm.addView(view, lp)
+            // Read once right away: the listener only fires on a change, and the keyboard may
+            // already be up when this window appears.
+            imeHeightCache = runCatching {
+                view.rootWindowInsets?.getInsets(WindowInsets.Type.ime())?.bottom ?: 0
+            }.getOrDefault(0)
             insetProbe = view
             view
-        }.onFailure { logger(Log.WARN, "MON_IME_PROBE_FAILED", it) }.getOrNull()
+        }.onFailure {
+            logger(Log.WARN, "MON_IME_PROBE_FAILED", it)
+            // Without the probe the gate cannot see the keyboard, so it will pre-own over it
+            // (corner taps over a keyboard then need the synthetic tap). Say so once.
+            logger(Log.WARN, "MON_IME_PROBE_MISSING — the corner strip will be owned even over the keyboard", null)
+        }.getOrNull()
     }
 
     private fun bottomExtentPx(): Float =
@@ -708,7 +1056,25 @@ class CornerInputMonitor(
         (CornerTriggerRegion.radiusPx(settings.edgeDp, density) + 0.5f).toInt().toFloat()
 
     /**
-     * Physical display bounds for the corner gate.
+     * Is this DOWN inside the strip whose pointer stream we must take at DOWN?
+     *
+     * Always true in practice, and deliberately so: the caller has already accepted the touch
+     * as a corner DOWN ([sideFor]), so this test only ever *subtracts* from our own trigger
+     * area. It used to subtract a lot: the strip was a fixed 28 dp against MiuiHome's measured
+     * 21–24 dp take-over band, while the trigger area's vertical axis is the user's
+     * "沿侧边向上" setting and reaches up to 160 dp. Every DOWN in the upper part of the sector
+     * therefore armed a stroke WITHOUT owning its DOWN — the fan opened and MiuiHome was still
+     * free to commit HOME from the same gesture. The strip is now the larger of the two: the
+     * launcher's observed band (with its margin) or the sector's own reach.
+     */
+    private fun inPreOwnStrip(y: Float): Boolean {
+        val bottom = displayBoundsCache.bottom
+        val reach = maxOf(HOME_GESTURE_BAND_DP * density, edgeExtentPx())
+        return y >= bottom - reach
+    }
+
+    /**
+     * Physical display bounds for the corner gate — the CACHED copy (see [refreshGeometry]).
      *
      * `currentWindowMetrics` describes the area a MATCH_PARENT window would occupy and
      * may EXCLUDE system decorations: on this ROM the navigation-bar strip measures
@@ -719,21 +1085,15 @@ class CornerInputMonitor(
      * the very corner — which is what "works in landscape, not in portrait" looks like.
      * `maximumWindowMetrics` is the full display; take the union so the band can never
      * end up above the physical edge on either metric.
+     *
+     * READ-ONLY for callers: the returned Rect is the cache itself, so the input thread never
+     * allocates and never asks WindowManager for anything.
      */
-    private fun displayBounds(): Rect {
-        val max = wm.maximumWindowMetrics.bounds
-        val cur = wm.currentWindowMetrics.bounds
-        return Rect(
-            minOf(max.left, cur.left),
-            minOf(max.top, cur.top),
-            maxOf(max.right, cur.right),
-            maxOf(max.bottom, cur.bottom),
-        )
-    }
+    private fun displayBounds(): Rect = displayBoundsCache
 
     private fun boundsForLog(): String {
-        val max = wm.maximumWindowMetrics.bounds
-        val cur = wm.currentWindowMetrics.bounds
+        val max = maximumBoundsCache
+        val cur = currentBoundsCache
         return "cur=${cur.width()}x${cur.height()} max=${max.width()}x${max.height()}"
     }
 
@@ -832,15 +1192,23 @@ class CornerInputMonitor(
 
         var pointerId: Int = -1
             private set
+
+        // Written on [inputThread], read there and by the back-gesture guard on the main
+        // thread (isCornerCommitWindow) — hence @Volatile.
+        @Volatile
         var tracking = false
             private set
+
+        @Volatile
         var claimed = false
             private set
 
         /**
-         * True once we pilfered this stream ourselves — always mid-gesture, on Activate
-         * (`Stroke.move`); nothing is taken at DOWN any more.
+         * True while WE hold this stream: set by the DOWN-time pre-own ([beginMonitorStroke])
+         * or by the mid-stroke pilfer on Activate. It is what decides whether a tap has to be
+         * rebuilt for the app at release (see [up]).
          */
+        @Volatile
         var owned = false
             private set
 
@@ -857,7 +1225,9 @@ class CornerInputMonitor(
         var downUptime = 0L
             private set
 
-        /** uptime of the last CLAIMED stroke end (0 = never) — read by [isCornerCommitWindow]. */
+        /** uptime of the last CLAIMED stroke end (0 = never) — read by [isCornerCommitWindow]
+         *  from the main thread, written here on the input thread. */
+        @Volatile
         var lastClaimedEndUptime: Long = 0L
             private set
 
@@ -887,23 +1257,17 @@ class CornerInputMonitor(
             val cfg = config ?: return
             // The corner is a COMPLETE SECTOR: there is no upward hand-off to the system's
             // bottom up-swipe any more (user request — a swipe straight up out of the corner
-            // opens the panel). The gesture is taken HERE and only here: nothing was pilfered
-            // at DOWN, so by the time the engine says Activate the app has had the touch for
-            // the whole decision distance — which is what keeps its taps intact — and MiuiHome
-            // has not committed HOME yet (its `record_area_height_px` is larger than our
-            // activation distance).
+            // opens the panel). The gesture is taken HERE and only here, so the app has had the
+            // touch for the whole decision distance — which is what keeps its taps intact — and
+            // without the DOWN pre-own below, MiuiHome would still be free to commit HOME from
+            // the same stroke.
             when (val action = engine.move(pointerId, raw.pointerCount, x, y, cfg)) {
                 is SpyAction.Activate -> {
                     if (!isUnlockedAndInteractive()) {
                         cancel()
                         return
                     }
-                    if (!pilferAttempted && !owned) {
-                        pilferAttempted = true
-                        val ok = pilferMonitor()
-                        if (ok) owned = true
-                        pilfered(ok)
-                    }
+                    takeStream()
                     claimed = true
                     logger(Log.INFO, "MON_ACTIVATE side=${action.side.name} x=$x y=$y", null)
                     openFan(action.side, x, y)
@@ -918,6 +1282,35 @@ class CornerInputMonitor(
 
                 else -> Unit // PassThrough — still observing, the app keeps its stream
             }
+        }
+
+        /**
+         * Take the pointer stream for the drawer. Called once per stroke, on Activate.
+         *
+         * When the DOWN was already pre-owned in the bottom strip this is the SECOND pilfer,
+         * and it is deliberate: `pilferPointers()` reports nothing, so a pre-own that lost the
+         * race to MiuiHome's own take-over is indistinguishable from one that won. Pilfering
+         * again a few millimetres into the gesture costs one binder call and is the only way
+         * left to pull the stream back from a launcher that got there first (its HOME commit
+         * needs more travel than our activation threshold, and it is that animation the extra
+         * pilfer interrupts).
+         */
+        private fun takeStream() {
+            if (pilferAttempted) {
+                if (owned) {
+                    val ok = pilferMonitor()
+                    logger(
+                        Log.INFO,
+                        "MON_PILFER_RETRY ok=$ok lat=${SystemClock.uptimeMillis() - downUptime}",
+                        null,
+                    )
+                }
+                return
+            }
+            pilferAttempted = true
+            val ok = pilferMonitor()
+            if (ok) owned = true
+            pilfered(ok)
         }
 
         fun up(raw: MotionEvent, x: Float, y: Float) {
@@ -946,7 +1339,7 @@ class CornerInputMonitor(
                     )
                 }
             } else {
-                // Observed stroke (IME showing, or outside the launcher's band): the app has
+                // Observed stroke (IME showing, or a DOWN the gate did not accept): the app has
                 // been serving this touch itself the whole time, so a tap needs NOTHING from us.
                 val moved = hypot(x - originX, y - originY)
                 logger(
@@ -979,6 +1372,9 @@ class CornerInputMonitor(
             config = null
             if (wasClaimed || wasOwned) lastClaimedEndUptime = SystemClock.uptimeMillis()
             if (retract) retractFan()
+            // Drop the reference so the next ACTION_UP cannot be logged against this dead
+            // stroke's origin (see onMonitorEvent's UP branch).
+            if (stroke === this) stroke = null
         }
     }
 
@@ -1378,8 +1774,27 @@ class CornerInputMonitor(
          * `Home pilfer_pointers`) and takes the gesture away from the app inside it.
          * 28 dp keeps the whole observed band owned with a small margin; everything
          * above it stays a pure observer.
+         *
+         * It is a FLOOR, not the strip itself: [inPreOwnStrip] takes the larger of this and
+         * the trigger area's own vertical reach, so no part of our corner can be owned by
+         * the launcher instead of us.
          */
         const val HOME_GESTURE_BAND_DP = 28f
+
+        /**
+         * How often the power/keyguard snapshot is refreshed on the input thread (see
+         * [stateWatchdog]). It exists so the DOWN path never makes a binder call: 250 ms is
+         * far below the time it takes a user to lock the phone and reach for the corner, and
+         * screen on/off and keyguard changes also push an immediate refresh.
+         */
+        const val STATE_REFRESH_MS = 250L
+
+        /**
+         * How many times [warmUp] walks the DOWN path at start. Enough for the JIT to compile
+         * the gate (measured in the log as MON_WARMUP ms=...) without costing anything worth
+         * mentioning on SystemUI's start-up thread.
+         */
+        const val WARMUP_ROUNDS = 24
 
         /** a stroke shorter than this that barely moved counts as a tap */
         const val TAP_MAX_MS = 250L
@@ -1406,6 +1821,9 @@ class CornerInputMonitor(
 
         /** how long the stream must continue after a re-pilfer to count as working */
         const val SHADOW_CONFIRM_MS = 200L
+
+        /** receiver-creation attempts before the monitor transport is written off (see [startMonitorTransport]) */
+        const val MAX_RECEIVER_ATTEMPTS = 2
 
 
         /** Grace after a corner stroke ends during which the native back handler's late
