@@ -1243,6 +1243,9 @@ class CornerInputMonitor(
         var downUptime = 0L
             private set
 
+        /** true when this stroke's DOWN was already taken by the pre-own in [beginMonitorStroke] */
+        private var preOwnedAtDown = false
+
         /** uptime of the last CLAIMED stroke end (0 = never) — read by [isCornerCommitWindow]
          *  from the main thread, written here on the input thread. */
         @Volatile
@@ -1262,6 +1265,7 @@ class CornerInputMonitor(
             config = newConfig
             claimed = false
             owned = newOwned
+            preOwnedAtDown = newOwned
             pilferAttempted = false
             downUptime = SystemClock.uptimeMillis()
             originX = x
@@ -1305,30 +1309,30 @@ class CornerInputMonitor(
         /**
          * Take the pointer stream for the drawer. Called once per stroke, on Activate.
          *
-         * When the DOWN was already pre-owned in the bottom strip this is the SECOND pilfer,
-         * and it is deliberate: `pilferPointers()` reports nothing, so a pre-own that lost the
-         * race to MiuiHome's own take-over is indistinguishable from one that won. Pilfering
-         * again a few millimetres into the gesture costs one binder call and is the only way
-         * left to pull the stream back from a launcher that got there first (its HOME commit
-         * needs more travel than our activation threshold, and it is that animation the extra
-         * pilfer interrupts).
+         * When the DOWN was already pre-owned in the bottom strip this is the stroke's SECOND
+         * pilfer, and it is deliberate: `pilferPointers()` reports nothing, so a pre-own that
+         * lost the race to MiuiHome's own take-over is indistinguishable from one that won.
+         * Pilfering again a few millimetres into the gesture costs one binder call and is the
+         * only way left to pull the stream back from a launcher that got there first (its HOME
+         * commit needs more travel than our activation threshold, and it is that animation the
+         * extra pilfer interrupts). The log distinguishes the two — `MON_PILFER_RETRY` for the
+         * repeat — so a log reader can tell "no pilfer happened at all" from "the one at DOWN
+         * was repeated".
          */
         private fun takeStream() {
-            if (pilferAttempted) {
-                if (owned) {
-                    val ok = pilferMonitor()
-                    logger(
-                        Log.INFO,
-                        "MON_PILFER_RETRY ok=$ok lat=${SystemClock.uptimeMillis() - downUptime}",
-                        null,
-                    )
-                }
-                return
-            }
+            if (pilferAttempted) return
             pilferAttempted = true
             val ok = pilferMonitor()
             if (ok) owned = true
-            pilfered(ok)
+            if (preOwnedAtDown) {
+                logger(
+                    Log.INFO,
+                    "MON_PILFER_RETRY ok=$ok lat=${SystemClock.uptimeMillis() - downUptime}",
+                    null,
+                )
+            } else {
+                pilfered(ok)
+            }
         }
 
         fun up(raw: MotionEvent, x: Float, y: Float) {

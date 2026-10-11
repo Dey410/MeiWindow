@@ -189,7 +189,7 @@ MON_INPUT_READY name=BubbleDrawer-corner-MultiTaskSwitch …
 | `MON_WARMUP` | 启动时预热 DOWN 路径（几何缓存就绪的证据） |
 | `MON_DOWN` / `MON_DOWN_REJECTED` | DOWN 是否落在触发区（`box=`、`band=`、`mode=pre-own\|observe`、`lat=` 触摸到抢占用时 ms） |
 | `MON_ACTIVATE` | 已认领并展开扇子 |
-| `MON_PILFER_OK` / `MON_PILFER_FAILED` / `MON_PILFER_RETRY` | pilfer 结果（`_RETRY` = 中途再抢一次，用于把被 launcher 先接管的流拉回来） |
+| `MON_PILFER_OK` / `MON_PILFER_FAILED` / `MON_PILFER_RETRY` | pilfer 结果（`_RETRY` = 这一笔在 DOWN 已经抢过，Activate 时又抢了一次；没有 `_RETRY` 说明 DOWN 那次没抢） |
 | `MON_SWALLOWED` | 被我们吃掉但既不是扇子也不是轻点（真拖动） |
 | `MON_TAP_PASSTHROUGH_DELEGATED` / `_INJECTED` | 轻点交还：桌面补了 / 我们补了 |
 | `MON_SYSTEM_CANCEL` | 外力取消；**带 `owned=true` 就是"抢下的笔被系统夺回"**（扇面+回桌面同时发生的签名） |

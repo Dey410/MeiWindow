@@ -366,6 +366,8 @@ OS3 上模块改为调用 ROM 自己的转换入口 `MiuiFreeformModeController.
 ### A16 日志判据
 - [ ] 每一笔 `MON_DOWN … band=true ime=0px mode=pre-own lat=N`：`lat` 是个位到十几毫秒
       （真机实测正常 2ms；`lat` 超过 8ms 诊断页会开始提示"偏慢"）
+- [ ] 紧接着 `MON_PILFER_RETRY ok=true lat=…`（这一笔在 Activate 时又抢了一次 ——
+      DOWN 那次是抢到了的；**整笔没有这条**说明 DOWN 根本没抢）
 - [ ] 这一笔之后**没有** `MON_SYSTEM_CANCEL … owned=true`（有就是"被 launcher 抢回去了"，
       扇面和桌面会一起出现）
 - [ ] `MON_INPUT_READY … thread=bubbledrawer-corner-input`（不再是主线程）
