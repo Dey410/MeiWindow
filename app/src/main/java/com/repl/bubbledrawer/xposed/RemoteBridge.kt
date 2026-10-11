@@ -163,6 +163,7 @@ object RemoteBridge {
             .putInt(RemotePrefs.KEY_RECOMMEND_COUNT, snap.recommendCount)
             .putBoolean(RemotePrefs.KEY_FLYME_FREEFORM_ENABLED, snap.flymeFreeformEnabled)
             .putBoolean(RemotePrefs.KEY_FLYME_FREEFORM_CENTER, snap.flymeFreeformCenter)
+            .putInt(RemotePrefs.KEY_FLYME_FREEFORM_VERTICAL_PCT, snap.flymeFreeformVerticalPct)
             .putBoolean(RemotePrefs.KEY_FLYME_FREEFORM_NO_OFFSET, snap.flymeFreeformNoOffset)
             .putInt(RemotePrefs.KEY_FLYME_FREEFORM_SCALE, snap.flymeFreeformScale)
             .putBoolean(RemotePrefs.KEY_FLYME_FREEFORM_OUTSIDE_DISMISS, snap.flymeFreeformOutsideDismiss)

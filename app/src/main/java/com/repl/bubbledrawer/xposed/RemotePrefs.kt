@@ -158,6 +158,7 @@ object RemotePrefs {
     /** 实验性：Flyme 样式轻量小窗设置 */
     const val KEY_FLYME_FREEFORM_ENABLED = "flyme_freeform_enabled"
     const val KEY_FLYME_FREEFORM_CENTER = "flyme_freeform_center"
+    const val KEY_FLYME_FREEFORM_VERTICAL_PCT = "flyme_freeform_vertical_pct"
     const val KEY_FLYME_FREEFORM_NO_OFFSET = "flyme_freeform_no_offset"
     const val KEY_FLYME_FREEFORM_SCALE = "flyme_freeform_scale"
     const val KEY_FLYME_FREEFORM_OUTSIDE_DISMISS = "flyme_freeform_outside_dismiss"
@@ -169,6 +170,18 @@ object RemotePrefs {
 
     const val DEFAULT_FLYME_FREEFORM_ENABLED = false
     const val DEFAULT_FLYME_FREEFORM_CENTER = true
+
+    /**
+     * 小窗**上下位置**：竖屏时相对「正中的上下余量」的百分比 —— 0 = 正中、-100 = 贴顶、+100 = 贴底。
+     *
+     * 为什么是余量的百分比而不是 dp：余量 = 屏幕高 − 小窗可见高，所以这个值永远落在屏幕内，
+     * 换分辨率/换缩放都不用重算。用户 2026-10-11：「竖方向默认居中但可以上下位置调整」，
+     * 并且**横屏不要生效** —— 横屏小窗几乎占满高度，挪一下就出屏（那一边由 [KEY_FLYME_FREEFORM_CENTER]
+     * 的居中负责，维持原样）。
+     */
+    const val DEFAULT_FLYME_FREEFORM_VERTICAL_PCT = 0
+    const val FLYME_FREEFORM_VERTICAL_MIN = -100
+    const val FLYME_FREEFORM_VERTICAL_MAX = 100
 
     /**
      * 禁止小窗偏移：已经有小窗时，新开的小窗不再为了避开它而挪位。
@@ -250,6 +263,8 @@ object RemotePrefs {
         /** 实验性：Flyme 样式轻量小窗设置 */
         val flymeFreeformEnabled: Boolean = DEFAULT_FLYME_FREEFORM_ENABLED,
         val flymeFreeformCenter: Boolean = DEFAULT_FLYME_FREEFORM_CENTER,
+        /** 小窗上下位置：占「上下余量」的百分比，0 = 正中（横屏不生效） */
+        val flymeFreeformVerticalPct: Int = DEFAULT_FLYME_FREEFORM_VERTICAL_PCT,
         /** 已经有小窗时，新小窗不再为避让而偏移（HyperOS 默认 X+78dp / Y+44dp） */
         val flymeFreeformNoOffset: Boolean = DEFAULT_FLYME_FREEFORM_NO_OFFSET,
         val flymeFreeformScale: Int = DEFAULT_FLYME_FREEFORM_SCALE,
@@ -311,6 +326,8 @@ object RemotePrefs {
             recommendCount = snappedRecCount,
             flymeFreeformEnabled = sp.getBoolean(KEY_FLYME_FREEFORM_ENABLED, DEFAULT_FLYME_FREEFORM_ENABLED),
             flymeFreeformCenter = sp.getBoolean(KEY_FLYME_FREEFORM_CENTER, DEFAULT_FLYME_FREEFORM_CENTER),
+            flymeFreeformVerticalPct = sp.getInt(KEY_FLYME_FREEFORM_VERTICAL_PCT, DEFAULT_FLYME_FREEFORM_VERTICAL_PCT)
+                .coerceIn(FLYME_FREEFORM_VERTICAL_MIN, FLYME_FREEFORM_VERTICAL_MAX),
             flymeFreeformNoOffset = sp.getBoolean(KEY_FLYME_FREEFORM_NO_OFFSET, DEFAULT_FLYME_FREEFORM_NO_OFFSET),
             flymeFreeformScale = sp.getInt(KEY_FLYME_FREEFORM_SCALE, DEFAULT_FLYME_FREEFORM_SCALE).coerceIn(FLYME_FREEFORM_SCALE_MIN, FLYME_FREEFORM_SCALE_MAX),
             flymeFreeformOutsideDismiss = sp.getBoolean(KEY_FLYME_FREEFORM_OUTSIDE_DISMISS, DEFAULT_FLYME_FREEFORM_OUTSIDE_DISMISS),

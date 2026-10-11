@@ -167,6 +167,14 @@ object SettingsStore {
     fun setFlymeFreeformCenter(context: Context, enabled: Boolean) =
         putBoolean(context, RemotePrefs.KEY_FLYME_FREEFORM_CENTER, enabled)
 
+    /** 小窗上下位置：占「上下余量」的百分比，0 = 正中（横屏不生效）。 */
+    fun setFlymeFreeformVerticalPct(context: Context, pct: Int) =
+        putInt(
+            context,
+            RemotePrefs.KEY_FLYME_FREEFORM_VERTICAL_PCT,
+            pct.coerceIn(RemotePrefs.FLYME_FREEFORM_VERTICAL_MIN, RemotePrefs.FLYME_FREEFORM_VERTICAL_MAX),
+        )
+
     fun setFlymeFreeformNoOffset(context: Context, enabled: Boolean) =
         putBoolean(context, RemotePrefs.KEY_FLYME_FREEFORM_NO_OFFSET, enabled)
 

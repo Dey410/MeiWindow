@@ -2133,7 +2133,10 @@ class FlymeFreeformController(
                         .intercept { chain ->
                             val result = chain.proceed()
                             val snap = RemotePrefs.read(prefs)
-                            if (snap.flymeFreeformEnabled && snap.flymeFreeformCenter && result is Rect && !result.isEmpty) {
+                            // 总开关只管"模块要不要接管小窗"；**居中的开关现在只管横向**
+                            // （用户 2026-10-11：「居中仅为横方向居中，竖方向默认居中但可以上下位置调整」），
+                            // 所以这里不再要求 `flymeFreeformCenter` —— 否则关掉居中，上下滑杆也跟着失效。
+                            if (snap.flymeFreeformEnabled && result is Rect && !result.isEmpty) {
                                 // The package this rect is being computed for is a plain String argument in
                                 // every overload (`getCustomFreeformRect(ctx, …, pkg, …)`), and it is what
                                 // tells the avoid pass whether it is looking at the very window it is placing.
@@ -2383,6 +2386,12 @@ class FlymeFreeformController(
          * a扇形 launch states the side it was triggered from ([requestedLeft] sees it in the ROM's own
          * arguments, `MiuiFreeform.triggerSideRect` computed it), and centering would silently undo it.
          * The vertical placement is still ours — that is the part the ROM gets wrong in landscape.
+         *
+         * 两个轴现在各管各的（用户 2026-10-11）：
+         *  - **横向**：`小窗居中` 开着才居中，关掉就不动它；扇形触发侧永远优先（[keepLeft]）；
+         *  - **纵向**：默认正中（`小窗居中` 开着时等于今天的正中，关着时保持 ROM 给的位置），
+         *    再叠加 `小窗上下位置` 滑杆（[verticalOffsetPx]）—— 滑杆只在竖屏生效。
+         * 滑杆默认 0，所以这条路径在默认设置下与以前逐像素一致。
          */
         private fun centerRectOnScreen(
             rect: Rect,
@@ -2433,13 +2442,24 @@ class FlymeFreeformController(
                 return
             }
             val (targetLeft, targetTop) = centeredOrigin(visualW, visualH, screenW, screenH)
-            // [keepLeft]: 水平落点由启动方给定（扇形触发侧），居中只负责垂直方向 —— 否则「小窗居中」
-            // 会在 ROM 按触发侧算完之后再把它搬回屏幕中间，用户看到的还是"哪边划出来都一样"。
-            rect.offsetTo(if (keepLeft) rect.left else targetLeft, targetTop)
+            // 横向：居中开关关掉时**不动**它（那正是"不居中"的意思），[keepLeft] 时留给启动方指定的
+            // 触发侧 —— 否则居中会在 ROM 按触发侧算完之后再把它搬回屏幕中间。
+            val left = if (keepLeft || !snap.flymeFreeformCenter) rect.left else targetLeft
+            // 纵向：居中开关管到哪一步就停在哪一步（开着 = 正中，关着 = ROM 给的位置），然后叠加
+            // 「小窗上下位置」的滑杆 —— 滑杆只在竖屏生效（横屏窗口几乎占满高度，挪一下就出屏）。
+            val centered = snap.flymeFreeformCenter
+            val verticalBase = if (centered) targetTop else rect.top
+            val offset = if (isWideScreen(screenW, screenH)) {
+                0
+            } else {
+                verticalOffsetPx(snap.flymeFreeformVerticalPct, screenH, visualH)
+            }
+            rect.offsetTo(left, verticalBase + offset)
             // 禁止小窗偏移 = 关: 把已经居中好的窗口再交给 ROM 的避让逻辑一次，第二个小窗因此落在
             // 「第一个的位置 + 右 78dp / 下 44dp」（方向选择与屏幕内夹取都由 ROM 自己决定）。
-            // 落点被明确指定时不参与：移开就不是用户划出来的那一边了。
-            val avoided = if (!snap.flymeFreeformNoOffset && !keepLeft) {
+            // 落点被明确指定时不参与（移开就不是用户划出来的那一边了）；居中关掉时也不参与 ——
+            // 那是"模块不要重摆窗口"的意思，滑杆为 0 时这条路径必须与以前完全一样。
+            val avoided = if (centered && !snap.flymeFreeformNoOffset && !keepLeft) {
                 applyRomAvoidOffset(rect, visualW, visualH, selfPackage, selfTaskId)
             } else {
                 false
@@ -2454,7 +2474,8 @@ class FlymeFreeformController(
             log(
                 "CENTERED_BOUNDS rect=$rect scale=$scale src=${if (applied != null) "rom" else if (assumed != null) "assumed" else "setting"} " +
                     "applied=$applied assumed=$assumed targetScale=$targetScale avoided=$avoided " +
-                    "left=${if (keepLeft) "triggered" else "centered"} " +
+                    "left=${if (keepLeft) "triggered" else if (centered) "centered" else "rom"} " +
+                    "vpos=${snap.flymeFreeformVerticalPct}%(${offset}px) centered=$centered " +
                     "visual=(${visualW.toInt()}x${visualH.toInt()}) screen=($screenW x $screenH)",
             )
         }
@@ -2929,6 +2950,9 @@ class FlymeFreeformController(
                         .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                         .setId("bubbledrawer.freeform.gesture_anim")
                         .intercept { chain ->
+                            // 窗口正在动 —— 联系人条的跟随由此切回逐帧（空闲时它是定时器采样）。
+                            // 一次 volatile 读 + 一次 post，跑在 `wmshell.main` 上，可以忽略不计。
+                            com.repl.bubbledrawer.contactbar.onFreeformWindowMotion?.invoke()
                             // 迷你小窗 as the ROM's own 迷你动画 (type 11). This only makes sense once the
                             // ROM has *already* turned the window into 迷你小窗 — its animation target is
                             // then the mini rect and its scale the mini scale, both of which this keeps.
@@ -2995,6 +3019,19 @@ class FlymeFreeformController(
             log("HOOK_INSTALLED_MiuiFreeformModeAnimation.startGestureAnimation")
         }
     }
+}
+
+/**
+ * 小窗上下位置的滑杆（设置项「小窗上下位置」）：竖屏时相对**正中的上下余量**的百分比。
+ *
+ * `0` = 正中、`-100` = 贴顶、`+100` = 贴底 —— 因为余量 = 屏幕高 − 可见高，所以任何取值都落在屏幕内，
+ * 换分辨率/换缩放都不用重算（用户 2026-10-11：「竖方向默认居中但可以上下位置调整」）。
+ *
+ * 横屏不调用它：那里的窗口几乎占满高度，挪一下就出屏（见 `centerRectOnScreen`）。
+ */
+fun verticalOffsetPx(pct: Int, screenH: Int, visualH: Float): Int {
+    val slack = (screenH - visualH).coerceAtLeast(0f)
+    return Math.round(slack * pct.coerceIn(-100, 100) / 200f)
 }
 
 /**

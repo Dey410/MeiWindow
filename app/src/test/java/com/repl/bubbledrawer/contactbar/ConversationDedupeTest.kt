@@ -119,6 +119,26 @@ class ConversationDedupeTest {
         assertEquals(listOf("新会话", "中间", "老会话"), dedupeByPerson(items).map { it.title })
     }
 
+    // ------------------------------------------------------------------ 通知事件的过滤
+
+    @Test
+    fun onlyChatNotificationsAreWorthARebuild() {
+        // 通知 key 的真实形状（AOSP `Notification.getKey`）：userId|pkg|id|tag|uid。
+        assertEquals(
+            "com.tencent.mm",
+            imPackageOfKey("0|com.tencent.mm|42|chat|10123"),
+        )
+        assertEquals(
+            "org.telegram.messenger",
+            imPackageOfKey("0|org.telegram.messenger|null|1234567|10123"),
+        )
+        // 音乐播放器的进度通知一秒一条：跟联系人条无关，不该触发全量重建。
+        assertEquals(null, imPackageOfKey("0|com.netease.cloudmusic|1001|null|10200"))
+        assertEquals(null, imPackageOfKey("0|android|1|null|1000"))
+        assertEquals(null, imPackageOfKey(""))
+        assertEquals(null, imPackageOfKey("garbage"))
+    }
+
     // ------------------------------------------------------------------ helpers
 
     private fun conversation(

@@ -119,6 +119,7 @@ object AppEnumProbe {
     private fun flymePrefs(snap: RemotePrefs.Snapshot?): String {
         if (snap == null) return "UNREADABLE"
         return "enabled=${snap.flymeFreeformEnabled} center=${snap.flymeFreeformCenter} " +
+            "vpos=${snap.flymeFreeformVerticalPct} " +
             "scale=${snap.flymeFreeformScale} mini=${snap.flymeFreeformSwipeUpMini} " +
             "dim=${snap.flymeFreeformDimBg} outside=${snap.flymeFreeformOutsideDismiss} " +
             "noOffset=${snap.flymeFreeformNoOffset}"

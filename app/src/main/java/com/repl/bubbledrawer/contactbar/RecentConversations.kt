@@ -308,6 +308,13 @@ class RecentConversations(
     private fun prune(now: Long) {
         remembered.values.removeAll { now - it.lastSeenAt > TTL_MS }
         forgotten.entries.removeAll { now - it.value.at > FORGET_TTL_MS }
+        // 头像副本是 144x144 ARGB（≈83KB/条）而 [cachedIcons] 以前只增不减：记忆有 TTL 和条数上限，
+        // 这个缓存没有，一场长会话下来能攒到几十 MB。被遗忘/过期的 key 在这里一起清掉。
+        if (cachedIcons.size > MAX_CACHED_ICONS) {
+            val live = remembered.values.mapNotNullTo(HashSet()) { it.key }
+            cachedIcons.keys.retainAll(live)
+            cachedPrints.keys.retainAll(live)
+        }
         remembered.values.groupBy { it.pkg }.forEach { (_, list) ->
             if (list.size > MAX_REMEMBERED_PER_APP) {
                 list.sortedByDescending { it.lastSeenAt }
@@ -487,6 +494,9 @@ class RecentConversations(
         private const val MAX_REMEMBERED_PER_APP = 12
         private const val MAX_REMEMBERED_TOTAL = 60
 
+        /** 头像副本/指纹的上限（超出时只留还有记忆引用的那些），见 [prune]。 */
+        private const val MAX_CACHED_ICONS = 40
+
         private const val PROXY_NAME = "BubbleDrawerNotificationListener"
 
         /** Every class this module ships lives under this prefix — how a stale proxy is recognised. */
@@ -628,7 +638,11 @@ class RecentConversations(
                         "toString" -> PROXY_NAME
                         else -> {
                             if (method.name.startsWith("onEntry")) {
-                                onChanged?.invoke()
+                                // **只对白名单里的聊天应用做全量重建。** 通知事件是全系统的：音乐
+                                // 播放器的进度通知一秒一条、下载/系统提示同样不少，而它们跟联系人条
+                                // 一点关系都没有 —— 以前每一条都会走一遍"遍历所有通知 + 重建列表 +
+                                // 写一行模块日志"（主线程文件 I/O），一首歌就是几百次。
+                                if (isBarRelevant(args)) onChanged?.invoke()
                                 // Diagnostics for the HyperOS behaviour this class exists to survive:
                                 // when the app is opened its notifications are cancelled, so an
                                 // `onEntryRemoved` burst right before the small window appears is
@@ -656,8 +670,23 @@ class RecentConversations(
             }.onFailure { module.log(Log.WARN, TAG, "CONTACT_BAR_NOTIF_LISTENER_FAILED", it.cause ?: it) }
         }
 
-        /** The `NamedListenerSet` behind `NotifPipeline.mNotifCollection` — see the dump notes. */
-        private fun listenerList(pipeline: Any): java.util.Collection<Any?>? = runCatching {
+        /**
+         * 这条通知事件跟联系人条有没有关系 —— 只认白名单里的聊天应用。
+         *
+         * 判断必须便宜：`onEntryAdded/Updated` 给的是 `NotificationEntry`（读它自己的 `mSbn.packageName`，
+         * 一次字段反射），`onEntryRemoved` 只给通知 key（`userId|pkg|id|tag|uid`，按 `|` 切开找白名单包名）。
+         * 拿不准一律按"无关"处理：宁可少一次刷新，也不要为一条音乐通知重建整个列表。
+         */
+        private fun isBarRelevant(args: Array<Any?>?): Boolean {
+            val first = args?.firstOrNull() ?: return false
+            if (first is String) return imPackageOfKey(first) != null
+            val pkg = runCatching {
+                (first.javaClass.getField("mSbn").get(first) as? StatusBarNotification)?.packageName
+            }.getOrNull()
+            return pkg != null && pkg in IM_WHITELIST
+        }
+
+        /** The `NamedListenerSet` behind `NotifPipeline.mNotifCollection` — see the dump notes. */        private fun listenerList(pipeline: Any): java.util.Collection<Any?>? = runCatching {
             val collection = pipeline.javaClass.getField("mNotifCollection").get(pipeline) ?: return null
             val set = collection.javaClass.getField("mNotifCollectionListeners").get(collection) ?: return null
             @Suppress("UNCHECKED_CAST")
@@ -741,6 +770,15 @@ class RecentConversations(
 
 /** 指纹的分辨率：16x16 足够认人，又小到可以逐字节比对。 */
 const val AVATAR_PRINT_SIDE = 16
+
+/**
+ * 通知 key（`userId|pkg|id|tag|uid`）里白名单聊天应用的那个包名，没有就返回 null。
+ *
+ * `onEntryRemoved` 只给 key（`NotificationEntry` 已经拆掉了），而通知事件是全系统的 ——
+ * 靠它把"这条跟我有关"的判断压到一次字符串切分（见 `RecentConversations.isBarRelevant`）。
+ */
+fun imPackageOfKey(key: String): String? =
+    key.split('|').firstOrNull { it in RecentConversations.IM_WHITELIST }
 
 /** 每个通道 4 位 —— 1/16 的量化步长，重新编码不会改变结论。 */
 private const val PRINT_LEVELS = 16

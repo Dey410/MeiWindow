@@ -661,6 +661,18 @@ fun ExperimentalSettingsScreen(
                             onCheckedChange = actions::setFlymeFreeformCenter,
                         )
                     })
+                    add(CardItem("vertical-window") {
+                        IntSliderRow(
+                            title = stringResource(R.string.exp_window_vertical),
+                            summary = stringResource(R.string.exp_window_vertical_hint),
+                            value = snap.flymeFreeformVerticalPct,
+                            min = RemotePrefs.FLYME_FREEFORM_VERTICAL_MIN,
+                            max = RemotePrefs.FLYME_FREEFORM_VERTICAL_MAX,
+                            enabled = snap.flymeFreeformEnabled,
+                            valueText = { stringResource(R.string.pct_value, it) },
+                            onCommit = actions::setFlymeFreeformVerticalPct,
+                        )
+                    })
                     add(CardItem("no-offset") {
                         SwitchRow(
                             title = stringResource(R.string.exp_no_offset),

@@ -76,11 +76,23 @@ class ContactBarController(
 
     @Volatile
     private var frameScheduled = false
+
+    /** 空闲时的采样定时器（窗口不动时不再是每帧）——与 [frameScheduled] 互斥地推进同一个循环。 */
+    private var idleScheduled = false
     private var frames = 0
     private var items: List<Conversation> = emptyList()
     private var currentPkg: String? = null
     private var lastRect: Rect? = null
     private var lastLogAt = 0L
+
+    /**
+     * `refreshData` 对"为什么没有内容"的结论（`NOT_IM_APP` 之类）；没有结论时 `onFrame` 才用
+     * 自己的 `NO_CONTACTS`。见 [ContactBarController.onFrame]。
+     */
+    private var lastDataReason: String? = null
+
+    /** 当前是按帧跑还是按 [IDLE_TICK_MS] 采样 —— 只在切换时打一行，见 [scheduleNext]/[kick]。 */
+    private var idleMode = false
     private var hideReason: String? = null
     private var fastUntil = 0L
     private var capacityShown = 0
@@ -116,6 +128,8 @@ class ContactBarController(
         // Bind the frame loop to the main thread's Choreographer up front (the constructor itself may
         // run on the module's own thread after a hot reload).
         onMain { mainChoreographer = Choreographer.getInstance() }
+        // 窗口一动就切回逐帧跟随（ROM 的 `startGestureAnimation` hook 转发，见 [onFreeformWindowMotion]）。
+        onFreeformWindowMotion = { onMain { kick() } }
         RecentConversations.onChanged = {
             onMain {
                 // Capture first, then render: HyperOS cancels an app's notifications the moment the
@@ -272,7 +286,55 @@ class ContactBarController(
             return@FrameCallback
         }
         onFrame()
-        if (task != null && enabled()) scheduleFrame()
+        scheduleNext()
+    }
+
+    /**
+     * 下一次什么时候再看：窗口在动（或刚动过 [FAST_WINDOW_MS] 内）就下一帧 —— 贴边跟随必须逐帧；
+     * 否则退到 [IDLE_TICK_MS] 的定时器。
+     *
+     * 为什么要退：（2026-10-11 性能复查）以前只要有一个普通小窗存在，Choreographer 回调就**按帧常驻**
+     * —— 60 次/秒的主线程唤醒，空闲时也照样反射读状态、每 700ms 写一行模块日志（主线程文件 I/O），
+     * 而这些工作在没有移动的窗口上得到的是同一个答案。现在静止时 4 次/秒，动起来仍然逐帧。
+     */
+    private fun scheduleNext() {
+        if (task == null || !enabled()) return
+        if (SystemClock.uptimeMillis() < fastUntil) {
+            scheduleFrame()
+        } else {
+            if (!idleMode) {
+                idleMode = true
+                log(Log.INFO, "CONTACT_BAR_LOOP idle (${IDLE_TICK_MS}ms sampling)")
+            }
+            scheduleIdleTick()
+        }
+    }
+
+    private fun scheduleIdleTick() {
+        if (idleScheduled) return
+        idleScheduled = true
+        main.postDelayed(idleTick, IDLE_TICK_MS)
+    }
+
+    private val idleTick = Runnable {
+        idleScheduled = false
+        onFrame()
+        scheduleNext()
+    }
+
+    /**
+     * 「窗口正在动」的事件入口 —— 由 `FlymeFreeformController` 的
+     * `MiuiFreeformModeAnimation.startGestureAnimation` hook 转发（ROM 每个 move/resize 都经过它）。
+     * 事件比定时器快：拖动一开始就跟上，不必等下一次 tick。
+     */
+    private fun kick() {
+        if (task == null || !enabled()) return
+        if (idleMode) {
+            idleMode = false
+            log(Log.INFO, "CONTACT_BAR_LOOP per-frame (window moving)")
+        }
+        fastUntil = SystemClock.uptimeMillis() + FAST_WINDOW_MS
+        scheduleFrame()
     }
 
     private fun onFrame() {
@@ -285,12 +347,10 @@ class ContactBarController(
 
         // A resize/move drag registers an animation (MiuiFreeformModeResizeHandler pushes every
         // move into `startGestureAnimation`), which is exactly when the bar must track per frame.
-        // Idle windows are polled on every IDLE_FRAME_STRIDE-th frame instead — same geometry, a
-        // fraction of the work; the stride is also why a mode change can take one extra frame.
+        // 空闲时不再逐帧醒来，而是由 [scheduleNext] 退到定时器 + [kick] 的事件唤醒。
         val animating = FreeformTask.isAnimating(info)
         val now = SystemClock.uptimeMillis()
         if (animating) fastUntil = now + FAST_WINDOW_MS
-        if (!animating && now > fastUntil && frames % IDLE_FRAME_STRIDE != 0) return
 
         // Closing: hide immediately and stay hidden while the window animates away (the user's
         // "关闭小窗动画期间不要跟随" rule). Two sources: the exit hook and the task's own EXITING state.
@@ -349,7 +409,9 @@ class ContactBarController(
         }
 
         if (items.isEmpty()) {
-            detach("NO_CONTACTS")
+            // [refreshData] 已经知道原因（不是聊天应用 / 没有会话）时不重复报一个笼统的 NO_CONTACTS：
+            // 以前这两行在同一个 pass 里一前一后地打，看上去就是"每帧都在隐藏又隐藏"。
+            detach(lastDataReason ?: "NO_CONTACTS")
             return
         }
 
@@ -518,11 +580,13 @@ class ContactBarController(
         val pkg = FreeformTask.packageName(info)
         if (pkg == null || pkg !in RecentConversations.IM_WHITELIST) {
             items = emptyList()
+            lastDataReason = "NOT_IM_APP"
             detach("NOT_IM_APP")
             return@onMain
         }
         val list = recent.conversations(pkg, force)
         if (list == items) return@onMain
+        lastDataReason = null
         items = list
         val v = view ?: return@onMain
         val rect = lastRect ?: return@onMain
@@ -713,6 +777,9 @@ class ContactBarController(
     fun dispose() = onMain {
         runCatching { prefs.unregisterOnSharedPreferenceChangeListener(prefsListener) }
         if (RecentConversations.onChanged != null) RecentConversations.onChanged = null
+        main.removeCallbacks(idleTick)
+        idleScheduled = false
+        onFreeformWindowMotion = null
         detach("DISPOSE")
         task = null
         // Also unregister our notification listener: a hot reload replaces our classes but not the
@@ -744,10 +811,24 @@ class ContactBarController(
         /** How long after an animation ends the bar keeps tracking every single frame. */
         const val FAST_WINDOW_MS = 400L
 
-        /** Idle polling stride: geometry is unchanged, so every 4th frame is plenty. */
-        const val IDLE_FRAME_STRIDE = 4
+        /**
+         * 空闲时的采样间隔：窗口静止时几何不会变，几百毫秒看一眼就够 —— 这一条同时也是
+         * "ROM 的移动事件 hook 没装上"时的兜底（[kick] 接到的才是逐帧路径）。
+         */
+        const val IDLE_TICK_MS = 250L
 
         /** At most this many freeform tasks are remembered for focus lookups (two is the ROM's cap). */
         const val MAX_TRACKED_TASKS = 4
     }
 }
+
+/**
+ * 「窗口正在动」的事件入口 —— 由 `FlymeFreeformController` 的 `startGestureAnimation` hook 调用
+ * （跑在 `wmshell.main` 上，所以实现里只做一次 post 回主线程），见 [ContactBarController.kick]。
+ *
+ * 联系人条用它把「逐帧跟随」限制在真正需要的那段时间里：空闲时按 `IDLE_TICK_MS` 采样，窗口一动立刻
+ * 切回逐帧 —— 事件比定时器快，拖动的第一帧就跟得上（这是把常驻 Choreographer 回调换成定时器采样
+ * 之后仍然不丢跟随的原因）。
+ */
+@Volatile
+var onFreeformWindowMotion: (() -> Unit)? = null

@@ -462,9 +462,7 @@ class CornerInputMonitor(
         }
         // Kept as a field so dispose() can take it back off: a lambda registered inline is
         // unreachable afterwards, and every hot reload left another live listener behind.
-        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
-            if (Looper.myLooper() == mainHandler.looper) applySettings() else mainHandler.post(::applySettings)
-        }
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> scheduleApplySettings() }
         prefsListener = listener
         prefs.registerOnSharedPreferenceChangeListener(listener)
         registerDebugReceiver()
@@ -664,6 +662,29 @@ class CornerInputMonitor(
         logger(Log.INFO, "MON_DISPOSED_FOR_HOT_RELOAD id=${System.identityHashCode(this)}", null)
     }
 
+    /**
+     * 一次设置写入会**逐 key** 回调监听器：设置页保存一次要改二十来个 key，于是 `applySettings()`
+     * 在一次点击里跑二十来遍（日志上就是同一毫秒里二十行一模一样的 `PREFS_APPLIED`，每行还都要
+     * 走一遍 geometry/小窗快照/图标的读取）。合并成一次：主线程下一轮统一应用。
+     *
+     * 合并是安全的 —— [applySettings] 每次都从 prefs 重新读，晚一轮读到的只会更完整。
+     */
+    private fun scheduleApplySettings() {
+        if (Looper.myLooper() != mainHandler.looper) {
+            mainHandler.post(::scheduleApplySettings)
+            return
+        }
+        if (applySettingsPending) return
+        applySettingsPending = true
+        mainHandler.postAtFrontOfQueue {
+            applySettingsPending = false
+            applySettings()
+        }
+    }
+
+    /** main-thread only (see [scheduleApplySettings]). */
+    private var applySettingsPending = false
+
     private fun applySettings() {
         settings = RemotePrefs.read(prefs)
         val wanted = settings.enabled && (settings.left || settings.right)
@@ -688,6 +709,7 @@ class CornerInputMonitor(
                 // RemoteBridge.syncLocal).
                 " freeform[enabled=" + settings.flymeFreeformEnabled +
                 " center=" + settings.flymeFreeformCenter +
+                " vpos=" + settings.flymeFreeformVerticalPct +
                 " scale=" + settings.flymeFreeformScale +
                 " mini=" + settings.flymeFreeformSwipeUpMini +
                 " noOffset=" + settings.flymeFreeformNoOffset +

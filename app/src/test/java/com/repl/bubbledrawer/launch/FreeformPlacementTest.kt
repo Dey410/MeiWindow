@@ -266,4 +266,46 @@ class FreeformPlacementTest {
         assertEquals(null, requestedLeft(listOf("context", "not an int", 107, true, "pkg")))
         assertEquals(null, requestedLeft(emptyList()))
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // 小窗上下位置（滑杆）—— 用户 2026-10-11：竖方向默认居中，但可以上下调，横屏不生效
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    fun theVerticalSliderMovesWithinTheSlackAndNeverOffScreen() {
+        // Portrait: 2656 tall screen, a 小窗 drawn at 1952 x scale.
+        val visualH = portraitH * 0.70f
+        val slack = DISPLAY_H - visualH
+        val top = Math.round((DISPLAY_H - visualH) / 2f)
+
+        assertEquals("0 = 正中", 0, verticalOffsetPx(0, DISPLAY_H, visualH))
+        // 贴底/贴顶按"一像素以内"判：上下各取一次整，差 1px 是取整而不是位置错。
+        assertEquals(
+            "+100 = 贴底",
+            (DISPLAY_H - visualH).toFloat(),
+            (top + verticalOffsetPx(100, DISPLAY_H, visualH)).toFloat(),
+            1f,
+        )
+        assertEquals("−100 = 贴顶", 0f, (top + verticalOffsetPx(-100, DISPLAY_H, visualH)).toFloat(), 1f)
+        assertEquals("一半 = 余量的一半", Math.round(slack / 4f), verticalOffsetPx(50, DISPLAY_H, visualH))
+        assertEquals("往上", -Math.round(slack / 4f), verticalOffsetPx(-50, DISPLAY_H, visualH))
+    }
+
+    @Test
+    fun theSliderIsClampedAndHarmlessWhenThereIsNoSlack() {
+        val visualH = portraitH * 0.70f
+        assertEquals(verticalOffsetPx(100, DISPLAY_H, visualH), verticalOffsetPx(400, DISPLAY_H, visualH))
+        assertEquals(verticalOffsetPx(-100, DISPLAY_H, visualH), verticalOffsetPx(-400, DISPLAY_H, visualH))
+        // A window as tall as the screen has nowhere to go: the offset must stay 0, not push it out.
+        assertEquals(0, verticalOffsetPx(100, DISPLAY_H, DISPLAY_H.toFloat()))
+        assertEquals(0, verticalOffsetPx(-100, DISPLAY_H, DISPLAY_H + 200f))
+    }
+
+    @Test
+    fun theSliderOnlyAppliesToPortrait() {
+        // 横屏不生效 —— 横屏小窗几乎占满高度，挪一下就出屏（`centerRectOnScreen` 只在竖屏调它）。
+        val landVisualH = DISPLAY_W * 0.59f
+        assertTrue("landscape would have slack too", DISPLAY_W - landVisualH > 100f)
+        assertTrue("but the caller must not use it", isWideScreen(DISPLAY_H, DISPLAY_W))
+    }
 }
