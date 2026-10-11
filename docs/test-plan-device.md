@@ -189,8 +189,19 @@ Flyme 样式下小窗的大小 = 一个缩放系数 × ROM 自己的**未缩放*
       —— `target` = 设置值，`rom` = ROM 按屏幕算出的上限，`used` = 实际生效值；
       `clamped=true` 表示这次被上限压小了（横屏正常就是 true，竖屏应为 false）
 - [ ] 快捷判据：`adb logcat -s BubbleDrawer | findstr CENTERED_BOUNDS`
-      —— `scale` 是实际生效系数，`visual=(宽x高)` 是窗口在屏上的大小；
+      —— `scale` 是模块用来摆放的系数，`src=` 说明它是从哪来的（`rom` = ROM 自己给的，`assumed` = ROM
+      review 过的设置值，`setting` = 裸设置值），`visual=(宽x高)` 是窗口在屏上的大小；
       横屏应满足 `visual 宽 ≤ 屏幕宽`、且 `rect.left/top` 都是正数（居中而非贴边）
+- [ ] **摆放用的系数必须等于 ROM 真正使用的系数** —— 这是「设置了居中却看起来没居中」的头号原因：
+      窗口是按**未缩放** bounds 定位、再乘系数绘制的，系数错一点，窗口本身就偏半格。
+      日志里 `applied ≠ assumed` 说明这台 ROM **没有**按模块的设置值给小窗定尺寸
+      （`MiuiFreeformLaunchConfig.getFreeformArg` / `getFreeFormScale` 这条链没接上），
+      这时必须以 `applied` 为准（`src=rom`）；两个数值相等时说明设置值本来就是它用的值。
+      `applied` 的来源：迷你→普通恢复取 `getRestoredBounds` 的返回值（`singleTap` 原样把它交给
+      `setAnimParam`），启动/切换路径取模块自己 `getFreeFormScale` 钩子给 ROM 的那个答案
+- [ ] 出现 `CENTER_SCREEN_MISMATCH` 说明 `Resources.getSystem().displayMetrics` 与 ROM 的
+      `getDisplaySize`（= `windowConfiguration.getMaxBounds`）不是同一个尺寸 —— 模块已统一改用 ROM 的值
+      （两条居中路径都受影响，所以只差这一点也会整体偏）
 
 ## A12 禁止小窗偏移（第二个小窗仍开在同一个位置）
 HyperOS 的「错开」在 `MiuiMultiWindowUtils.avoidIfNeeded:1807`（手机走这一支）：新小窗与已有小窗
@@ -222,6 +233,16 @@ HyperOS 的「错开」在 `MiuiMultiWindowUtils.avoidIfNeeded:1807`（手机走
       因为新小窗就开在默认位置上），于是新窗口被推离居中位置 78dp/44dp —— 这就是
       「OS3 上小窗居中不生效」（`activeTaskInfo` 只在下一次 focus 事件才更新，`onTaskVanished`
       过去并不清它）。
+- [ ] **迷你→普通恢复还有第二道门**：`MiuiFreeformModeMiniStateHandler.singleTap` 的顺序是死的 ——
+      先 `getRestoredBounds(taskInfo, rect)`（模块在这一步居中），紧接着
+      `avoidOtherFreeformTaskIfNeed(taskInfo, rect, scale)` 原地改**同一个 `Rect` 对象**。
+      这是唯一一个「模块写完之后 ROM 还会改写」的摆放点（启动/切换路径的避让都在 ROM 方法*内部*，
+      也就是模块居中*之前*）。模块在上一步已经自己做过这个决定（`avoided=true`，或「禁止小窗偏移」
+      明确要求不偏移），所以那一次避让被跳过，日志
+      `RESTORE_AVOID_SKIPPED rect=… — the module's own placement stands`；模块没替 ROM 做决定的场合
+      （开关关着、且模块自己也没算出偏移）仍然由 ROM 说话。
+      判定：有第二个普通小窗时，还原后的窗口要么与它错开（开关关）、要么与它**重叠但居中**（开关开），
+      都不应该"既重合又偏半格"
 - [ ] 迷你小窗自己的排布（同侧迷你自动排队）、贴边/侧边栏避让不受影响
 - [ ] 全屏 → 小窗切换（小白条上滑悬停等）与直接打开的表现一致
 

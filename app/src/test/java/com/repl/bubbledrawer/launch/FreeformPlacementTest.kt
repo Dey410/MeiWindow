@@ -122,4 +122,58 @@ class FreeformPlacementTest {
         assertEquals(Math.round((DISPLAY_H - portraitH * 0.80f) / 2f), y)
         assertTrue(x > 0 && y > 0)
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // Which scale the centring may believe (小窗居中 on a ROM whose size does not follow the setting)
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    fun theScaleTheRomSaidItWillApplyWins() {
+        // 迷你 → 普通 restore: `getRestoredBounds` hands back the scale it puts into the anim target,
+        // so it is *the* size of the restored window — even when it is not the setting.
+        assertEquals(0.70f, centerScale(applied = 0.70f, assumed = 0.80f, setting = 0.80f), 1e-6f)
+        // A window launched after the module's scale hook answered: same thing.
+        assertEquals(0.66f, centerScale(applied = 0.66f, assumed = null, setting = 0.80f), 1e-6f)
+    }
+
+    @Test
+    fun withoutARomAnswerTheReviewedSettingIsUsedAsBefore() {
+        assertEquals(0.80f, centerScale(applied = null, assumed = 0.80f, setting = 0.80f), 1e-6f)
+        // 横屏 inside the window: the review shrank the setting, and that is what was used before.
+        assertEquals(0.36f, centerScale(applied = null, assumed = 0.36f, setting = 0.80f), 1e-6f)
+    }
+
+    @Test
+    fun unusableRomAnswersFallBackInsteadOfPoisoningTheMath() {
+        // `getFreeformArg` answers 0 when its resolution table cannot be read, and a scale above 1
+        // would mean a window larger than its own unscaled bounds. Neither may decide the placement.
+        for (bad in listOf(null, 0f, -0.5f, Float.NaN, Float.POSITIVE_INFINITY, 1.6f)) {
+            assertTrue("$bad must not be usable", !bad.isUsableScale())
+            assertEquals(0.80f, centerScale(applied = bad, assumed = 0.80f, setting = 0.80f), 1e-6f)
+        }
+        // Nothing usable at all: the raw setting is still better than no scale.
+        assertEquals(0.80f, centerScale(applied = null, assumed = null, setting = 0.80f), 1e-6f)
+        assertTrue(0.8f.isUsableScale())
+    }
+
+    @Test
+    fun aWrongScaleIsWhatPushesACentredWindowOffTheMiddle() {
+        // The failure this ordering exists for: the ROM sizes the window at 65% while the module
+        // centred it as if it were 80%. The top-left origin is the same, so the *window* ends up
+        // (0.80 - 0.65) / 2 of its unscaled bounds up and to the left of the middle.
+        val applied = 0.65f
+        val assumed = 0.80f
+        val (x, y) = centeredOrigin(portraitW * assumed, portraitH * assumed, DISPLAY_W, DISPLAY_H)
+        val offX = (x + portraitW * applied / 2f) - DISPLAY_W / 2f
+        val offY = (y + portraitH * applied / 2f) - DISPLAY_H / 2f
+
+        assertTrue("visibly off centre horizontally", offX < -60f)
+        assertTrue("visibly off centre vertically", offY < -130f)
+
+        // With the ROM's own scale the window is exactly in the middle.
+        val good = centerScale(applied, assumed, 0.80f)
+        val (gx, gy) = centeredOrigin(portraitW * good, portraitH * good, DISPLAY_W, DISPLAY_H)
+        assertEquals(DISPLAY_W / 2f, gx + portraitW * good / 2f, 1f)
+        assertEquals(DISPLAY_H / 2f, gy + portraitH * good / 2f, 1f)
+    }
 }

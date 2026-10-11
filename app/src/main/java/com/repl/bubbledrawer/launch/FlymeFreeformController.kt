@@ -1385,6 +1385,21 @@ class FlymeFreeformController(
         private const val MINI_FALLBACK_UNBLOCK_AT = 10
 
         /**
+         * How long the scale the module's own hook gave the ROM still counts as "the scale of the
+         * window being placed" (see [appliedScaleFor]). The ROM asks for the scale and for the rect a
+         * few instructions apart on the same thread, so a couple of seconds is generous — and short
+         * enough that a later, unrelated placement never inherits a stale answer.
+         */
+        private const val APPLIED_SCALE_TTL_MS = 3000L
+
+        /**
+         * How long after the module centred the 迷你 → 普通 restore rect the ROM's own avoid pass may
+         * still be recognised as "the one that would undo it" (see [hookRestoreAvoid]). The two calls
+         * are adjacent statements inside one `singleTap`; anything older is somebody else's rect.
+         */
+        private const val RESTORE_GUARD_MS = 2000L
+
+        /**
          * The window whose 小白条 up-swipe is being turned into 迷你小窗 right now, and when the ROM
          * announced that conversion (`onTaskModeChanged` to a non-normal mode), 0 while it has not.
          *
@@ -1471,6 +1486,27 @@ class FlymeFreeformController(
             else -> arg.javaClass.simpleName
         }
 
+        /**
+         * The package of the window a hook is currently placing: a plain `String` argument in the
+         * framework's rect functions (`getFreeformRect` / `getCustomFreeformRect`, where the package is
+         * the only String of the signature), the task's own package in the shell's
+         * `MulWinSwitchInteractUtil.*(RunningTaskInfo)`.
+         *
+         * Two consumers: the avoid step must never dodge the window it is placing, and the applied-scale
+         * memo is keyed by package (see [appliedScaleFor]).
+         */
+        private fun packageOf(args: List<Any?>): String? =
+            args.filterIsInstance<String>().lastOrNull()
+                ?: args.filterIsInstance<ActivityManager.RunningTaskInfo>().firstOrNull()?.let { info ->
+                    // `realActivity` is not in the public SDK the module compiles against, hence the
+                    // reflection; `topActivity` is, and is the same window in practice.
+                    runCatching {
+                        val real = info.javaClass.getField("realActivity").get(info)
+                        (real as? android.content.ComponentName)?.packageName
+                    }.getOrNull()
+                        ?: runCatching { info.topActivity?.packageName }.getOrNull()
+                }
+
         fun getTaskId(taskInfo: Any): Int {
             return runCatching {
                 taskInfo.javaClass.getMethod("getTaskId").invoke(taskInfo) as Int
@@ -1522,6 +1558,7 @@ class FlymeFreeformController(
             hookFreeformLaunchConfig(module, prefs, classLoader)
             hookFreeformScale(module, prefs, classLoader)
             hookBoundsCentering(module, prefs, classLoader)
+            hookRestoreAvoid(module, prefs, classLoader)
             hookFreeformAvoidOffset(module, prefs, classLoader)
             hookTaskRepository(module, classLoader)
             hookRawTaskAppeared(module, classLoader)
@@ -1881,7 +1918,15 @@ class FlymeFreeformController(
         ) {
             val configClass = runCatching {
                 classLoader.loadClass("android.util.MiuiFreeformLaunchConfig")
-            }.getOrNull() ?: return
+            }.getOrNull()
+            if (configClass == null) {
+                // Silent until now, and it is the difference between "the 缩放 setting decides the
+                // 小窗's size" and "the ROM's own resolution table does": without this hook the ROM
+                // sizes the window itself, so the centering arithmetic must take its scale from the
+                // ROM instead of from the setting (see [centerRectOnScreen]).
+                log("HOOK_SKIPPED_FreeformLaunchConfig cls=false")
+                return
+            }
 
             val method = runCatching {
                 configClass.getDeclaredMethod(
@@ -1891,7 +1936,21 @@ class FlymeFreeformController(
                     Int::class.javaPrimitiveType,
                     Int::class.javaPrimitiveType,
                 )
-            }.getOrNull() ?: return
+            }.getOrNull()
+            if (method == null) {
+                log(
+                    "HOOK_SKIPPED_FreeformLaunchConfig cls=true method=false " +
+                        "methods=${configClass.declaredMethods.joinToString { "${it.name}/${it.parameterCount}" }}",
+                )
+                return
+            }
+
+            // The argType values are public constants on that very class and they are what the ROM's
+            // own callers pass, so read them rather than trusting the numbers this module was written
+            // against: a ROM that renumbers them would otherwise get the 缩放 setting handed back as,
+            // say, its left margin.
+            val originalScale = intConstant(configClass, "ARGS_ORIGINAL_SCALE", 2)
+            val leftMargin = intConstant(configClass, "ARGS_LEFT_MARGIN", 4)
 
             module.hook(method)
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
@@ -1905,8 +1964,8 @@ class FlymeFreeformController(
                     val targetScale = (snap.flymeFreeformScale.coerceIn(50, 95)) / 100f
 
                     when (argType) {
-                        2 -> targetScale // ARGS_ORIGINAL_SCALE
-                        4 -> { // ARGS_LEFT_MARGIN
+                        originalScale -> targetScale
+                        leftMargin -> {
                             if (snap.flymeFreeformCenter) {
                                 -1.0f // Sentinel for horizontal centering in HyperOS: (displayShortSide - freeFormWidth) / 2
                             } else {
@@ -1916,8 +1975,11 @@ class FlymeFreeformController(
                         else -> chain.proceed()
                     }
                 }
-            log("HOOK_INSTALLED_MiuiFreeformLaunchConfig.getFreeformArg")
+            log("HOOK_INSTALLED_MiuiFreeformLaunchConfig.getFreeformArg scale=$originalScale leftMargin=$leftMargin")
         }
+
+        private fun intConstant(cls: Class<*>, name: String, fallback: Int): Int =
+            runCatching { cls.getField(name).getInt(null) }.getOrDefault(fallback)
 
         /**
          * The 小窗's size is one scale factor that the ROM multiplies with its own unscaled task
@@ -1943,8 +2005,13 @@ class FlymeFreeformController(
         ) {
             val utilsClass = runCatching {
                 classLoader.loadClass("android.util.MiuiMultiWindowUtils")
-            }.getOrNull() ?: return
+            }.getOrNull()
+            if (utilsClass == null) {
+                log("HOOK_SKIPPED_FreeformScale cls=false")
+                return
+            }
 
+            var hooked = 0
             for (m in utilsClass.declaredMethods) {
                 if (m.name == "getFreeFormScale" || m.name == "getOriFreeformScale") {
                     runCatching {
@@ -1957,13 +2024,20 @@ class FlymeFreeformController(
                                 val target = (snap.flymeFreeformScale.coerceIn(50, 95)) / 100f
                                 val rom = (chain.proceed() as? Number)?.toFloat()
                                 val used = fitFreeformScale(target, rom)
+                                // Publish it: this answer *is* the size the 小窗 being placed will
+                                // have, and the centering hooks need exactly that number (see
+                                // [centerRectOnScreen] / [appliedScaleFor]) instead of re-deriving it
+                                // from the setting — which is only the same value while this hook is
+                                // the one deciding the size.
+                                noteAppliedScale(chain.args, used)
                                 logScale(m.name, chain.args, target, rom, used)
                                 used
                             }
                     }
+                    hooked++
                 }
             }
-            log("HOOK_INSTALLED_MiuiMultiWindowUtils.getFreeFormScale")
+            log("HOOK_INSTALLED_MiuiMultiWindowUtils.getFreeFormScale hooks=$hooked")
         }
 
         /**
@@ -2066,7 +2140,7 @@ class FlymeFreeformController(
                                 centerRectOnScreen(
                                     result,
                                     snap,
-                                    selfPackage = chain.args.filterIsInstance<String>().lastOrNull(),
+                                    selfPackage = packageOf(chain.args),
                                 )
                             } else {
                                 logCenterSkip("${m.name}/${m.parameterCount}", snap)
@@ -2099,7 +2173,11 @@ class FlymeFreeformController(
                             val result = chain.proceed()
                             val snap = RemotePrefs.read(prefs)
                             if (snap.flymeFreeformEnabled && snap.flymeFreeformCenter && result is Rect && !result.isEmpty) {
-                                centerRectOnScreen(result, snap)
+                                // The window being placed, so that (a) the avoid step never dodges it
+                                // and (b) the scale the module's own hook last gave the ROM is
+                                // recognised as *this* window's size (see [appliedScaleFor]) — the
+                                // same two things the framework hooks pass as `selfPackage`.
+                                centerRectOnScreen(result, snap, selfPackage = packageOf(chain.args))
                             } else {
                                 logCenterSkip("MulWinSwitch.${m.name}", snap)
                             }
@@ -2133,10 +2211,20 @@ class FlymeFreeformController(
                                 if (rect != null && !rect.isEmpty) {
                                     // 迷你 → 普通小窗 (点击还原): the window being placed is the one the
                                     // first argument describes, so the avoid pass must not run against it.
+                                    //
+                                    // `result` is not a guess: `singleTap` hands exactly this float to
+                                    // `setAnimParam(rect, restoredBounds, restoredBounds, 0)`, i.e. it IS
+                                    // the scale the restored window is drawn at (the task's own scale
+                                    // before it went mini, times the ROM's fit correction). Centring with
+                                    // the setting instead — as this did — leaves the window off the
+                                    // centre by half the difference whenever they differ, and the ROM's
+                                    // avoid step then compares that same wrong rect.
                                     centerRectOnScreen(
                                         rect,
                                         snap,
                                         selfTaskId = chain.args.getOrNull(0)?.let { getTaskId(it) } ?: 0,
+                                        scaleOverride = (result as? Number)?.toFloat(),
+                                        armRestoreGuard = true,
                                     )
                                 } else {
                                     logCenterSkipArgs("mini.getRestoredBounds", chain.args)
@@ -2162,6 +2250,87 @@ class FlymeFreeformController(
             if (miniHooks == 0) {
                 log("BOUNDS_CENTER_NO_MATCH MiniStateHandler cls=${miniHandlerClass != null} methods=${miniHandlerClass?.declaredMethods?.joinToString { "${it.name}/${it.parameterCount}" }}")
             }
+        }
+
+        /**
+         * 迷你 → 普通 恢复：ROM 的避让跑在**模块居中之后**。
+         *
+         * `MiuiFreeformModeMiniStateHandler.singleTap` 的顺序是死的：先 `getRestoredBounds(taskInfo,
+         * rect)`（模块就在这一步居中），再 `avoidOtherFreeformTaskIfNeed(taskInfo, rect, scale)` ——
+         * 后者**原地**改的是同一个 `Rect` 对象，只要还有第二个普通小窗在，它就把刚算好的居中再推走
+         * 78dp/44dp。这是唯一一个「模块写完之后 ROM 还会改写」的摆放点（启动路径与切换路径的避让都在
+         * ROM 方法内部、也就是模块居中之前），所以它也是「设置了居中却看起来没居中」的最后一道门。
+         *
+         * 模块在上一步已经把该不该偏移决定过了（[applyRomAvoidOffset]，用的就是 ROM 自己那套
+         * `avoidAsPossible`），于是这里只做一件事：让模块的决定成为最终决定 —— 跳过这一次避让。
+         *
+         * 触发条件是「模块刚居中过**这个** `Rect`」（对象同一性 + [RESTORE_GUARD_MS] 窗口）。ROM 的
+         * 其它调用点（贴边恢复等）拿的是别的对象，行为完全不变；而模块没有替 ROM 做决定的场合
+         * （禁止偏移开着，或者模块自己算出的避让没有真的挪动窗口）也不跳，ROM 照旧说话。
+         */
+        private fun hookRestoreAvoid(
+            module: XposedModule,
+            prefs: SharedPreferences,
+            classLoader: ClassLoader,
+        ) {
+            val algorithmClass = runCatching {
+                classLoader.loadClass("com.android.wm.shell.multitasking.miuifreeform.MiuiFreeformModeAvoidAlgorithm")
+            }.getOrNull()
+
+            val method = algorithmClass?.declaredMethods?.firstOrNull {
+                it.name == "avoidOtherFreeformTaskIfNeed" && it.parameterCount == 3 &&
+                    it.parameterTypes.getOrNull(1) == Rect::class.java
+            }
+            if (method == null) {
+                log("HOOK_SKIPPED_RestoreAvoid cls=${algorithmClass != null}")
+                return
+            }
+
+            runCatching {
+                module.hook(method)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("bubbledrawer.freeform.restore_avoid")
+                    .intercept { chain ->
+                        val rect = chain.args.getOrNull(1) as? Rect
+                        val snap = RemotePrefs.read(prefs)
+                        if (rect != null && snap.flymeFreeformEnabled && snap.flymeFreeformCenter &&
+                            centeredRectModuleDecided && isFreshlyCentered(rect)
+                        ) {
+                            logRestoreAvoidSkipped(rect)
+                            null
+                        } else {
+                            chain.proceed()
+                        }
+                    }
+                log("HOOK_INSTALLED_RestoreAvoid")
+            }.onFailure { log("HOOK_FAILED_RestoreAvoid", it) }
+        }
+
+        /** Identity + age of the rect [centerRectOnScreen] just placed, for [hookRestoreAvoid]. */
+        @Volatile private var centeredRectId = 0
+        @Volatile private var centeredRectAt = 0L
+        @Volatile private var centeredRectModuleDecided = false
+
+        private fun armRestoreCentered(rect: Rect, moduleDecided: Boolean) {
+            centeredRectId = System.identityHashCode(rect)
+            centeredRectAt = SystemClock.uptimeMillis()
+            centeredRectModuleDecided = moduleDecided
+        }
+
+        private fun isFreshlyCentered(rect: Rect?): Boolean =
+            rect != null && centeredRectId != 0 &&
+                System.identityHashCode(rect) == centeredRectId &&
+                SystemClock.uptimeMillis() - centeredRectAt <= RESTORE_GUARD_MS
+
+        @Volatile private var restoreSkipLogged = false
+        @Volatile private var lastRestoreSkipKey = 0
+
+        private fun logRestoreAvoidSkipped(rect: Rect) {
+            val key = rect.hashCode()
+            if (restoreSkipLogged && key == lastRestoreSkipKey) return
+            restoreSkipLogged = true
+            lastRestoreSkipKey = key
+            log("RESTORE_AVOID_SKIPPED rect=$rect — the module's own placement stands")
         }
 
         /**
@@ -2211,11 +2380,29 @@ class FlymeFreeformController(
             snap: RemotePrefs.Snapshot,
             selfPackage: String? = null,
             selfTaskId: Int = 0,
+            scaleOverride: Float? = null,
+            armRestoreGuard: Boolean = false,
         ) {
-            val dm = android.content.res.Resources.getSystem().displayMetrics
             val targetScale = (snap.flymeFreeformScale.coerceIn(50, 95)) / 100f
-            val fitted = launchScale(rect, targetScale)
-            if (fitted == null && rect.width() >= rect.height()) {
+            // **Which scale will the ROM multiply this rect by?** That is the whole question: the
+            // window is positioned by its *unscaled* origin and drawn at `rect * scale`, so a wrong
+            // scale here does not merely mis-size the assumed window, it also moves the real one off
+            // the centre by half the difference — and, with 禁止小窗偏移 off, it makes the avoid step
+            // below compare a rect that is bigger/smaller than the window it stands for, i.e. dodge a
+            // window that does not even overlap. Both symptoms the OS3 report describes ("新开的" and
+            // "还原的都不居中") come out of exactly this one number.
+            //
+            // `launchScale` answers it with the *setting* reviewed by the ROM, which is only the
+            // truth as long as the module's own scale hook ([hookFreeformScale]) is what decided the
+            // window's size. Where the ROM keeps another preferred-scale source the module cannot
+            // reach (`MiuiFreeformLaunchConfig` has a different shape on that build), the ROM sizes
+            // the window by its own value and every placement below is off. So prefer what the ROM
+            // itself said, in this order: the scale it just handed back to its own caller
+            // ([scaleOverride] — the `getRestoredBounds` return value *is* the anim target's scale),
+            // then the value the module's scale hook last gave the ROM ([appliedScaleFor]).
+            val applied = scaleOverride?.takeIf { it.isUsableScale() } ?: appliedScaleFor(selfPackage)
+            val assumed = launchScale(rect, targetScale)
+            if (applied == null && assumed == null && rect.width() >= rect.height()) {
                 // A landscape window's visible size is ~1/aspect *smaller* than the setting, so
                 // centering it with the setting would be wrong in the harmful direction (off both
                 // edges). Without the ROM's reviewed scale, leave its own placement — top-aligned,
@@ -2223,21 +2410,98 @@ class FlymeFreeformController(
                 log("CENTERED_BOUNDS_SKIPPED_WIDE rect=$rect targetScale=$targetScale")
                 return
             }
-            val scale = fitted ?: targetScale
+            val scale = centerScale(applied, assumed, targetScale)
+            val (screenW, screenH) = screenSizeForCentering()
             val visualW = rect.width() * scale
             val visualH = rect.height() * scale
-            val (targetLeft, targetTop) = centeredOrigin(visualW, visualH, dm.widthPixels, dm.heightPixels)
+            if (visualW > screenW + 0.5f || visualH > screenH + 0.5f) {
+                // The window is bigger than the display at this scale, so "centred" would mean "half
+                // off every edge". Only reachable when the scale came from a ROM answer we could not
+                // review (the setting path is reviewed by [launchScale]) — leave the ROM's own
+                // placement alone rather than hanging the window off the screen.
+                log("CENTERED_BOUNDS_SKIPPED_TOO_BIG rect=$rect scale=$scale visual=(${visualW.toInt()}x${visualH.toInt()}) screen=($screenW x $screenH)")
+                return
+            }
+            val (targetLeft, targetTop) = centeredOrigin(visualW, visualH, screenW, screenH)
             rect.offsetTo(targetLeft, targetTop)
             // 禁止小窗偏移 = 关: 把已经居中好的窗口再交给 ROM 的避让逻辑一次，第二个小窗因此落在
             // 「第一个的位置 + 右 78dp / 下 44dp」（方向选择与屏幕内夹取都由 ROM 自己决定）。
-            if (!snap.flymeFreeformNoOffset) {
+            val avoided = if (!snap.flymeFreeformNoOffset) {
                 applyRomAvoidOffset(rect, visualW, visualH, selfPackage, selfTaskId)
+            } else {
+                false
+            }
+            if (armRestoreGuard) {
+                // Armed only for the 迷你 → 普通 restore, whose caller runs the ROM's *own* avoid on
+                // this very rect right after this hook returns ([hookRestoreAvoid]). The module has
+                // already made that decision here — the toggle says "no offset at all", or the avoid
+                // above just placed the window — so that later pass must not undo it.
+                armRestoreCentered(rect, moduleDecided = snap.flymeFreeformNoOffset || avoided)
             }
             log(
-                "CENTERED_BOUNDS rect=$rect scale=$scale targetScale=$targetScale " +
-                    "visual=(${visualW.toInt()}x${visualH.toInt()}) screen=(${dm.widthPixels}x${dm.heightPixels})",
+                "CENTERED_BOUNDS rect=$rect scale=$scale src=${if (applied != null) "rom" else if (assumed != null) "assumed" else "setting"} " +
+                    "applied=$applied assumed=$assumed targetScale=$targetScale avoided=$avoided " +
+                    "visual=(${visualW.toInt()}x${visualH.toInt()}) screen=($screenW x $screenH)",
             )
         }
+
+        /**
+         * The applied scale the module's own scale hook last gave the ROM ([hookFreeformScale]), i.e.
+         * the size a 小窗 opened right now will actually have. Kept as a one-slot memo because the
+         * ROM asks for the scale a few instructions before it asks for the rect — same thread, same
+         * call chain — and answers the same value for the same package/window every time.
+         */
+        @Volatile private var appliedScaleAt = 0L
+        @Volatile private var appliedScalePackage: String? = null
+        @Volatile private var appliedScaleValue = 0f
+
+        private fun noteAppliedScale(args: List<Any?>, used: Float) {
+            if (!used.isUsableScale()) return
+            appliedScaleValue = used
+            appliedScalePackage = args.filterIsInstance<String>().lastOrNull()
+            appliedScaleAt = SystemClock.uptimeMillis()
+        }
+
+        private fun appliedScaleFor(packageName: String?): Float? {
+            val value = appliedScaleValue
+            if (!value.isUsableScale()) return null
+            if (SystemClock.uptimeMillis() - appliedScaleAt > APPLIED_SCALE_TTL_MS) return null
+            val forPackage = appliedScalePackage
+            if (packageName != null && forPackage != null && packageName != forPackage) return null
+            return value
+        }
+
+        /**
+         * 居中的参考系：ROM 自己的显示器尺寸 — `MiuiMultiWindowUtils.getDisplaySize`，也就是
+         * `Resources.getSystem().getConfiguration().windowConfiguration.getMaxBounds()`，ROM 自己
+         * 摆放小窗时用的就是它（`getCustomFreeformRect` / `getSwitchedFreeformTargetBounds`）。
+         *
+         * `Resources.getSystem().displayMetrics` 是同一个屏幕的另一种说法，两者一般相等 —— 但只要
+         * 不等（状态栏/导航栏、显示尺寸覆盖、折叠态…），用哪一个就会整体差半个差值，而且是**两条
+         * 居中路径一起差**。既然 ROM 有权威答案，就用它的；拿不到时才退回原来的 metrics。
+         */
+        private fun screenSizeForCentering(): Pair<Int, Int> {
+            val rom = runCatching {
+                Class.forName("android.util.MiuiMultiWindowUtils")
+                    .getMethod("getDisplaySize", Context::class.java)
+                    .invoke(null, savedContext) as? Rect
+            }.getOrNull()
+            val metrics = android.content.res.Resources.getSystem().displayMetrics
+            if (rom != null && rom.width() > 0 && rom.height() > 0) {
+                if (rom.width() != metrics.widthPixels || rom.height() != metrics.heightPixels) {
+                    val message = "CENTER_SCREEN_MISMATCH rom=(${rom.width()}x${rom.height()}) " +
+                        "metrics=(${metrics.widthPixels}x${metrics.heightPixels}) — using the ROM's"
+                    if (message != lastScreenMismatch) {
+                        lastScreenMismatch = message
+                        log(message)
+                    }
+                }
+                return rom.width() to rom.height()
+            }
+            return metrics.widthPixels to metrics.heightPixels
+        }
+
+        @Volatile private var lastScreenMismatch: String? = null
 
         /**
          * 「禁止小窗偏移」关闭时，让 ROM 的避让在**居中之后**再生效一次。
@@ -2263,7 +2527,7 @@ class FlymeFreeformController(
             visualH: Float,
             selfPackage: String?,
             selfTaskId: Int,
-        ) {
+        ): Boolean {
             val candidate = findOtherWindow(selfTaskId, selfPackage)
             val other = candidate.bounds
             if (other == null) {
@@ -2275,9 +2539,9 @@ class FlymeFreeformController(
                     "CENTERED_BOUNDS_AVOID_SKIPPED reason=$reason src=${candidate.source} " +
                         "selfMatches=${candidate.selfMatches} selfTaskId=$selfTaskId selfPkg=$selfPackage",
                 )
-                return
+                return false
             }
-            val area = freeformAccessibleArea() ?: return
+            val area = freeformAccessibleArea() ?: return false
             val mobile = Rect(rect.left, rect.top, rect.left + visualW.toInt(), rect.top + visualH.toInt())
             val applied = runCatching {
                 Class.forName("android.util.MiuiMultiWindowUtils")
@@ -2285,11 +2549,12 @@ class FlymeFreeformController(
                     .invoke(null, mobile, other, area)
                 true
             }.getOrDefault(false)
-            if (!applied) return
+            if (!applied) return false
             val dx = mobile.left - rect.left
             val dy = mobile.top - rect.top
             rect.offset(dx, dy)
             log("CENTERED_BOUNDS_AVOIDED other=$other visual=$mobile delta=($dx,$dy) src=${candidate.source}")
+            return dx != 0 || dy != 0
         }
 
         /** Answer of [findOtherWindow]: the rect to dodge (null = there is no other 小窗). */
@@ -2728,6 +2993,35 @@ class FlymeFreeformController(
  */
 fun fitFreeformScale(target: Float, romScale: Float?): Float =
     if (romScale == null || !romScale.isFinite() || romScale <= 0f) target else minOf(target, romScale)
+
+/**
+ * Whether a number a ROM handed back can be the scale a 小窗 is drawn at: positive, finite and within
+ * the range the ROM itself uses (a scale above 1 would mean a window bigger than its own unscaled
+ * bounds, and a zero/NaN answer means the ROM could not compute one).
+ */
+fun Float?.isUsableScale(): Boolean =
+    this != null && this.isFinite() && this > 0.05f && this <= 1.5f
+
+/**
+ * Which scale the centring arithmetic may use, most trustworthy first:
+ *
+ *  1. [applied] — what the ROM itself said it will apply (the `getRestoredBounds` return value, or the
+ *     last answer of the module's own `getFreeFormScale`/`getOriFreeformScale` hook). The window is
+ *     drawn at `unscaled bounds x this`, so centring with it puts the *real* window in the middle.
+ *  2. [assumed] — the ROM's review of the user's setting (`reviewFreeFormBounds`), i.e. what the module
+ *     used to centre with. Correct exactly while the module's scale hook is what decides the size.
+ *  3. [setting] — the raw 缩放 setting, the last resort when the ROM cannot be asked at all.
+ *
+ * Why the order matters: centring with a scale that is too large puts the real (smaller) window up and
+ * to the left of the middle by half the size difference, and vice versa — and the same wrong size also
+ * makes the 避让 step compare a rect that does not match the window, so it can push a window that does
+ * not even overlap. Both are visible as "设置了居中，可是并不居中".
+ */
+fun centerScale(applied: Float?, assumed: Float?, setting: Float): Float {
+    if (applied.isUsableScale()) return applied as Float
+    if (assumed != null && assumed.isFinite() && assumed > 0f) return assumed
+    return setting
+}
 
 /**
  * Top-left corner that centers a `visualW x visualH` window on a `screenW x screenH` screen — the
