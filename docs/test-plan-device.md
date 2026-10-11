@@ -214,8 +214,14 @@ HyperOS 的「错开」在 `MiuiMultiWindowUtils.avoidIfNeeded:1807`（手机走
 - [ ] 迷你小窗恢复成普通小窗时同样按开关处理（关=错开，开=重合）
 - [ ] **迷你小窗点击还原**（`TASK_RESTORED_TO_FREEFORM`）落在屏幕中央：日志有
       `CENTERED_BOUNDS rect=…`；**只有一个窗口时不应出现 `CENTERED_BOUNDS_AVOIDED`** ——
-      那意味着模块把「正在摆放的这个窗口」当成了「另一个小窗」去避让，窗口会偏 78dp/44dp
-      （修复后这种自避让会记成 `CENTERED_BOUNDS_AVOID_SKIPPED reason=SELF|SAME_PACKAGE`）
+      避让的"另一个小窗"只认 shell 仓库里**还活着**、且不是正在摆放的那一个
+      （`MultiTaskingTaskRepository.getFreeformTasksInZOrder` → `getMiuiFreeformTaskInfo`，
+      日志尾部带 `src=shell|tracked`）；跳过的情形记
+      `CENTERED_BOUNDS_AVOID_SKIPPED reason=SELF_OR_SAME_PACKAGE|NO_OTHER_WINDOW`。
+      早期版本拿遮罩跟踪的那个窗口去避让，而它可能是**已经关掉**的窗口（位置恰好和新窗口重叠，
+      因为新小窗就开在默认位置上），于是新窗口被推离居中位置 78dp/44dp —— 这就是
+      「OS3 上小窗居中不生效」（`activeTaskInfo` 只在下一次 focus 事件才更新，`onTaskVanished`
+      过去并不清它）。
 - [ ] 迷你小窗自己的排布（同侧迷你自动排队）、贴边/侧边栏避让不受影响
 - [ ] 全屏 → 小窗切换（小白条上滑悬停等）与直接打开的表现一致
 
@@ -251,7 +257,8 @@ OS3 上模块改为调用 ROM 自己的转换入口 `MiuiFreeformModeController.
 2. 万一 release 动画永远不上报完成（标记一直挂着），第 10 次（≈600ms）时模块**只清这一个标记**
    （`removeRunningAnimationType(2)`），让 ROM 的转换接手 —— 这一步在日志里是 `MINI_FALLBACK_UNBLOCK`。
 
-- [ ] OS3：小窗上滑小白条 → **变成侧边迷你小窗**（窗口收缩并落到左上/右上角）- [ ] OS3 日志判据：`ACTION_UP_SWIPE_MINI taskId=… dy=…` → `MINI_SWIPE_FALLBACK taskId=…` →
+- [ ] OS3：小窗上滑小白条 → **变成侧边迷你小窗**（窗口收缩并落到左上/右上角）
+- [ ] OS3 日志判据：`ACTION_UP_SWIPE_MINI taskId=… dy=…` → `MINI_SWIPE_FALLBACK taskId=…` →
       `MINI_SWIPE_CONVERTED_BY_ROM taskId=… old=0 new=1` → `MINI_FALLBACK_CONVERTED taskId=… afterMs=…`
       （`afterMs` = 等 release 动画花了多久；若 `afterMs` 很小，说明窗口是直接滑过去的，
       若接近 300~600ms，说明它先弹回原位再贴边 —— 想消掉这段回弹再做一版）
@@ -264,6 +271,20 @@ OS3 上模块改为调用 ROM 自己的转换入口 `MiuiFreeformModeController.
 - [ ] 迷你小窗恢复成普通小窗后，黑色遮罩与联系人条照常回来（A8/A9 的判据）
 - [ ] OS3 上「上滑悬停 → 交还原生小窗」与「下滑 → 全屏」不受影响
 - [ ] 快捷判据：`adb logcat -s BubbleDrawer | findstr /R "MINI_"`
+
+## A14 顶部「重启系统界面」按钮（需要 root）
+入口：主页（魅窗）右上角的 miuix `Refresh` 图标。
+用途：模块的 hook 都活在 SystemUI 进程里 —— `adb install -r` 触发的 LSPosed 热重载会丢弃上一代
+所有 hook，只重建模块自己的运行时（`SystemUiHookInstaller.reinstall`），进程里那些"只在启动时读一次"
+的状态也不会重来。想从干净进程复现问题、或让改动立刻生效，按这个比重启手机快。
+实现：`SystemUiRestart` 走 `su -c`，命令依次尝试 `killall` → `pkill -f` → `pidof` + `kill -9`
+（toybox 三个都有，本机实测 `su -c "pidof com.android.systemui"` 直接返回 pid）。
+- [ ] 有 root：点击 → toast「正在重启系统界面…」→ 状态栏/导航栏消失约一秒后回来；
+      `adb logcat -s BubbleDrawer` 出现 `SYSTEMUI_RESTART exit=0`，随后 SystemUI 进程 id 变化
+      并且重新打出整串 `HOOK_INSTALLED_*` / `FLYME_FREEFORM_CONTROLLER_STARTED`
+- [ ] 无 root（或拒绝授权）：toast「重启失败：需要 root 权限」，SystemUI 不动
+      （日志 `SYSTEMUI_RESTART exit=…` 非 0）
+- [ ] 重启后设置页、扇子、小窗功能一切照旧（模块在 SystemUI 启动时重新装 hook）
 
 ## 贴边模式（可选，root）
 - [ ] 设置页"贴边模式"：无 su → toast 需要 root；有 su → inset=0，正上滑角落也能出扇

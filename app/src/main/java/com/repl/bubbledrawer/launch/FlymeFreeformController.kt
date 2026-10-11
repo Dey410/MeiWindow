@@ -216,6 +216,13 @@ class FlymeFreeformController(
         if (maskTaskId == taskId) maskTaskId = null
         // A pending 迷你小窗 conversion must not outlive its window.
         if (miniSwipeTaskId == taskId) cancelMiniFallback()
+        // The window the mask followed is gone — forget it as "another 小窗" as well. Leaving it in
+        // place made a *closed* window a dodge target for the next launch, and since a new 小窗 opens
+        // exactly where the dead one was, that always "overlapped" (see [applyRomAvoidOffset]).
+        if (activeTaskId == taskId) {
+            activeTaskId = null
+            activeTaskInfo = null
+        }
         log("TASK_VANISHED taskId=$taskId remaining=${windows.keys}")
         refreshMask("VANISHED")
         if (windows.isEmpty()) backgroundDecoration?.release()
@@ -2242,12 +2249,13 @@ class FlymeFreeformController(
          *
          * 这里直接调 ROM 自己的 `avoidAsPossible(mobile, fixed, restriction)`：左右/上下的方向选择、
          * 78dp/44dp 的常量、以及"挪出去会出屏"时的夹取，全部沿用它的 if-else，不复刻一套。
-         * 拿不到"另一个小窗"（没有小窗、或遮罩没跟踪到它）时什么都不做 —— 与"只有一个窗口"时的
-         * 原生行为一致。
          *
-         * **正在摆放的那个窗口不算"另一个小窗"**：单窗口场景下模块跟踪的窗口往往就是目标本身
-         * （迷你小窗点击还原、同一应用再次以小窗打开），拿它去避让等于躲自己，窗口会被推离居中位置
-         * 一个 78dp/44dp —— 用户看到的「还原后不居中」。调用方给出 selfPackage/selfTaskId 时按此跳过。
+         * **"另一个小窗"必须是真的、还活着、且不是正在摆放的这一个**（[findOtherWindow]）：
+         * 早期版本直接拿模块跟踪的那个窗口（遮罩当前跟谁），而它并不保证还活着 —— 窗口关掉后
+         * 只有 `onTaskVanished` 会清 `windows`，`activeTaskInfo` 会留到下一次 focus 事件；
+         * 拿一个已经关掉的窗口去避让，新窗口（默认位置和它一样）必然被判为"重叠"，于是被推离
+         * 刚算好的居中位置 78dp/44dp。用户看到的就是「居中不生效」，而这只在
+         * 「禁止小窗偏移」默认改成**关**（87b46c8）之后才可能出现 —— 那次之前这个补偿根本不会跑。
          */
         private fun applyRomAvoidOffset(
             rect: Rect,
@@ -2256,18 +2264,19 @@ class FlymeFreeformController(
             selfPackage: String?,
             selfTaskId: Int,
         ) {
-            // `activeTaskInfo` is the mask's window (the volatile mirror, readable from any thread);
-            // it is the "other 小窗" for a launch that is happening right now.
-            val otherInfo = instance?.activeTaskInfo?.takeIf { FreeformTask.isPlain(it) } ?: return
-            if (selfTaskId > 0 && selfTaskId == FreeformTask.taskId(otherInfo)) {
-                log("CENTERED_BOUNDS_AVOID_SKIPPED reason=SELF taskId=$selfTaskId")
+            val candidate = findOtherWindow(selfTaskId, selfPackage)
+            val other = candidate.bounds
+            if (other == null) {
+                val reason = when {
+                    candidate.selfMatches > 0 -> "SELF_OR_SAME_PACKAGE"
+                    else -> "NO_OTHER_WINDOW"
+                }
+                log(
+                    "CENTERED_BOUNDS_AVOID_SKIPPED reason=$reason src=${candidate.source} " +
+                        "selfMatches=${candidate.selfMatches} selfTaskId=$selfTaskId selfPkg=$selfPackage",
+                )
                 return
             }
-            if (selfPackage != null && selfPackage == FreeformTask.packageName(otherInfo)) {
-                log("CENTERED_BOUNDS_AVOID_SKIPPED reason=SAME_PACKAGE pkg=$selfPackage")
-                return
-            }
-            val other = FreeformTask.visualBounds(otherInfo)?.takeIf { !it.isEmpty } ?: return
             val area = freeformAccessibleArea() ?: return
             val mobile = Rect(rect.left, rect.top, rect.left + visualW.toInt(), rect.top + visualH.toInt())
             val applied = runCatching {
@@ -2280,7 +2289,66 @@ class FlymeFreeformController(
             val dx = mobile.left - rect.left
             val dy = mobile.top - rect.top
             rect.offset(dx, dy)
-            log("CENTERED_BOUNDS_AVOIDED other=$other visual=$mobile delta=($dx,$dy)")
+            log("CENTERED_BOUNDS_AVOIDED other=$other visual=$mobile delta=($dx,$dy) src=${candidate.source}")
+        }
+
+        /** Answer of [findOtherWindow]: the rect to dodge (null = there is no other 小窗). */
+        private class OtherWindow(val bounds: Rect?, val selfMatches: Int, val source: String)
+
+        /**
+         * The *other* live 小窗 a window being placed has to dodge.
+         *
+         * The list comes from the shell's own repository (`MultiTaskingTaskRepository
+         * .getFreeformTasksInZOrder` → `getMiuiFreeformTaskInfo`, both used by the ROM's own avoid
+         * logic) instead of from the window the 黑色遮罩 happens to follow. Those are not the same
+         * question: the mask's window outlives the window itself, and a 迷你/贴边 one is not a valid
+         * dodge target either — while the repository knows exactly which tasks are still open. The
+         * mask's window stays as the fallback for a ROM whose repository cannot be reached at all.
+         *
+         * The window being placed ([selfTaskId]/[selfPackage]) is never "another" one: the module
+         * reuses an app's existing 小窗 task on purpose (A4b), and a 迷你小窗 restore is the same task
+         * coming back — dodging it moved the window off the centre by 78dp/44dp.
+         */
+        private fun findOtherWindow(selfTaskId: Int, selfPackage: String?): OtherWindow {
+            val repo = instance?.getMultiTaskingTaskRepository()
+            val ids = repo?.let { repository ->
+                runCatching {
+                    (repository.javaClass.getMethod("getFreeformTasksInZOrder").invoke(repository) as? List<*>)
+                        ?.mapNotNull { (it as? Number)?.toInt() }
+                }.getOrNull()
+            }
+            if (!ids.isNullOrEmpty() && repo != null) {
+                var selfMatches = 0
+                for (id in ids) {
+                    if (id == selfTaskId) {
+                        selfMatches++
+                        continue
+                    }
+                    val info = instance?.callWithTaskId(repo, "getMiuiFreeformTaskInfo", id) ?: continue
+                    if (selfPackage != null && selfPackage == FreeformTask.packageName(info)) {
+                        selfMatches++
+                        continue
+                    }
+                    if (!FreeformTask.isPlain(info)) continue
+                    val leash = FreeformTask.leash(info)
+                    if (leash != null && !leash.isValid) continue
+                    val bounds = FreeformTask.visualBounds(info)
+                    if (bounds != null && !bounds.isEmpty) return OtherWindow(bounds, selfMatches, "shell")
+                }
+                return OtherWindow(null, selfMatches, "shell")
+            }
+            // Fallback: no repository answer (a ROM that reshaped the class, or a moment where it is
+            // not built yet). Only a live, plain, non-self window counts here either.
+            val tracked = instance?.activeTaskInfo?.takeIf { FreeformTask.isPlain(it) }?.also { info ->
+                if (selfTaskId > 0 && selfTaskId == FreeformTask.taskId(info)) return OtherWindow(null, 1, "tracked")
+                if (selfPackage != null && selfPackage == FreeformTask.packageName(info)) {
+                    return OtherWindow(null, 1, "tracked")
+                }
+                val leash = FreeformTask.leash(info)
+                if (leash != null && !leash.isValid) return OtherWindow(null, 0, "tracked")
+            }
+            val bounds = tracked?.let { FreeformTask.visualBounds(it) }?.takeIf { !it.isEmpty }
+            return OtherWindow(bounds, 0, if (tracked != null) "tracked" else "none")
         }
 
         /**
