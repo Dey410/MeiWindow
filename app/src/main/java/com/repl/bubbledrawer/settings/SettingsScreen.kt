@@ -43,6 +43,7 @@ fun MainSettingsScreen(
     onNavigateToFan: () -> Unit,
     onNavigateToMorePanel: () -> Unit,
     onNavigateToExperimental: () -> Unit,
+    onNavigateToDiagnostics: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -158,6 +159,13 @@ fun MainSettingsScreen(
                             title = stringResource(R.string.category_experimental),
                             summary = stringResource(R.string.category_experimental_summary),
                             onClick = onNavigateToExperimental,
+                        )
+                    },
+                    CardItem("diagnosis") {
+                        ArrowRow(
+                            title = stringResource(R.string.category_diagnosis),
+                            summary = stringResource(R.string.category_diagnosis_summary),
+                            onClick = onNavigateToDiagnostics,
                         )
                     },
                 ),

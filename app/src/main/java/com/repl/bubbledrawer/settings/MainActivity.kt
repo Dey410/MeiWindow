@@ -74,6 +74,7 @@ class MainActivity : ComponentActivity() {
                                 onNavigateToFan = { backStack.add(BubbleScreen.Fan) },
                                 onNavigateToMorePanel = { backStack.add(BubbleScreen.MorePanel) },
                                 onNavigateToExperimental = { backStack.add(BubbleScreen.Experimental) },
+                                onNavigateToDiagnostics = { backStack.add(BubbleScreen.Diagnostics) },
                             )
                         }
                         entry<BubbleScreen.Trigger>(swipeDismiss = swipeBack) {
@@ -106,6 +107,15 @@ class MainActivity : ComponentActivity() {
                         }
                         entry<BubbleScreen.Experimental>(swipeDismiss = swipeBack) {
                             ExperimentalSettingsScreen(
+                                state = state,
+                                actions = actions,
+                                onBack = {
+                                    if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
+                                },
+                            )
+                        }
+                        entry<BubbleScreen.Diagnostics>(swipeDismiss = swipeBack) {
+                            DiagnosticsScreen(
                                 state = state,
                                 actions = actions,
                                 onBack = {
