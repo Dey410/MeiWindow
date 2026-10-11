@@ -665,25 +665,22 @@ class CornerInputMonitor(
     /**
      * 一次设置写入会**逐 key** 回调监听器：设置页保存一次要改二十来个 key，于是 `applySettings()`
      * 在一次点击里跑二十来遍（日志上就是同一毫秒里二十行一模一样的 `PREFS_APPLIED`，每行还都要
-     * 走一遍 geometry/小窗快照/图标的读取）。合并成一次：主线程下一轮统一应用。
+     * 走一遍 geometry/小窗快照/图标的读取）。
      *
-     * 合并是安全的 —— [applySettings] 每次都从 prefs 重新读，晚一轮读到的只会更完整。
+     * 设备实测（2026-10-11）：LSPosed 把共享组镜像过来时是**一条一条**写的，所以"合并到主线程同一轮"
+     * 不够 —— 同一毫秒里仍然出现 11 行。改成**按时间合并**：最后一次回调之后 [APPLY_SETTINGS_DEBOUNCE_MS]
+     * 统一应用一次。合并是安全的，[applySettings] 每次都从 prefs 重新读，晚一点读到的只会更完整。
      */
     private fun scheduleApplySettings() {
         if (Looper.myLooper() != mainHandler.looper) {
             mainHandler.post(::scheduleApplySettings)
             return
         }
-        if (applySettingsPending) return
-        applySettingsPending = true
-        mainHandler.postAtFrontOfQueue {
-            applySettingsPending = false
-            applySettings()
-        }
+        mainHandler.removeCallbacks(applySettingsTask)
+        mainHandler.postDelayed(applySettingsTask, APPLY_SETTINGS_DEBOUNCE_MS)
     }
 
-    /** main-thread only (see [scheduleApplySettings]). */
-    private var applySettingsPending = false
+    private val applySettingsTask = Runnable { applySettings() }
 
     private fun applySettings() {
         settings = RemotePrefs.read(prefs)
@@ -2007,6 +2004,12 @@ class CornerInputMonitor(
          * cannot leave the gate stuck on "not interactive".
          */
         const val STATE_REFRESH_SCREEN_OFF_MS = 5000L
+
+        /**
+         * 设置变化合并窗口：共享组是逐 key 镜像过来的，同一毫秒里能到十几个回调；等最后一次之后
+         * 这么久再统一应用（用户感知不到这 120ms，日志与读取次数从"每个 key 一次"变成"一次点击一次"）。
+         */
+        const val APPLY_SETTINGS_DEBOUNCE_MS = 120L
 
         /**
          * How many times [warmUp] walks the DOWN path at start. Enough for the JIT to compile
