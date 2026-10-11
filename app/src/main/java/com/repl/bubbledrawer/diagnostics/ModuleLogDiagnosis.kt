@@ -696,22 +696,38 @@ object ModuleLogDiagnosis {
      *  - `SYSTEMUI_CORNER_READY transport=…`：走的是手势监听（能抢）还是降级的 SPY 窗口（抢不了）。
      */
     private fun cornerChecks(lines: List<String>): List<DiagnosisCheck> = buildList {
-        val transport = lines.lastOrNull { it.contains("SYSTEMUI_CORNER_READY") }
+        // The monitor itself states the transport on every settings application
+        // (`PREFS_APPLIED … transport=monitor|spy-view`), and that line is emitted AFTER the
+        // transport has been decided — unlike `SYSTEMUI_CORNER_READY`, which on the hot-reload
+        // path runs before the main thread has started the monitor and therefore says
+        // `pending`. Newest `transport=` line wins; `pending` is not a verdict.
+        val transportLine = lines.lastOrNull {
+            it.contains("transport=") &&
+                (it.contains("PREFS_APPLIED") || it.contains("SYSTEMUI_CORNER_READY"))
+        }
         val inputReady = lines.lastOrNull { it.contains("MON_INPUT_READY") }
-        val fallback = transport?.contains("spy-view-fallback") == true
-        if (transport != null || inputReady != null) {
+        if (transportLine != null || inputReady != null) {
+            val fallback = transportLine?.contains("transport=spy-view") == true
+            val pending = transportLine?.contains("transport=pending") == true
             add(
                 DiagnosisCheck(
                     id = "gesture.transport",
                     group = CheckGroup.GESTURE,
                     title = "角落手势的采集通道",
-                    status = if (fallback) CheckStatus.FAIL else CheckStatus.PASS,
-                    detail = if (fallback) {
-                        "降级成了 SPY 窗口：这条通道抢不下指针流，角落滑动时系统会同时执行回桌面"
-                    } else {
-                        "手势监听（DO_NOT_PILFER）：可以在 DOWN 时抢下指针流"
+                    status = when {
+                        fallback -> CheckStatus.FAIL
+                        pending -> CheckStatus.INFO
+                        else -> CheckStatus.PASS
                     },
-                    evidence = trimPrefix((transport ?: inputReady)!!),
+                    detail = when {
+                        fallback ->
+                            "降级成了 SPY 窗口：这条通道抢不下指针流，角落滑动时系统会同时执行回桌面"
+                        pending ->
+                            "还没确定：这一行是系统界面启动途中打的，等一次 `PREFS_APPLIED … transport=` 再看"
+                        else ->
+                            "手势监听（DO_NOT_PILFER）：可以在 DOWN 时抢下指针流"
+                    },
+                    evidence = trimPrefix((transportLine ?: inputReady)!!),
                 ),
             )
         }

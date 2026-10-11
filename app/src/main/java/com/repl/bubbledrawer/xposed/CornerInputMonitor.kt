@@ -305,6 +305,24 @@ class CornerInputMonitor(
         private set
 
     /**
+     * Which transport corner capture is (or is about to be) running on — the honest answer to
+     * "can this process shield a corner swipe from HOME", for the readiness log and for the
+     * diagnostics page.
+     *
+     * `pending` is a real state and must not be reported as a fallback: [start] applies the
+     * settings on the main thread, so a caller that runs earlier (the hot-reload entry point)
+     * used to print `transport=spy-view-fallback` for a monitor whose gesture monitor came up
+     * 8 ms later — a false alarm the diagnostics then repeated.
+     */
+    val transport: String
+        get() = when {
+            monitorActive -> "gesture-monitor"
+            monitorTransportDisabled -> "spy-view-fallback"
+            settings.enabled && (settings.left || settings.right) -> "pending"
+            else -> "disabled"
+        }
+
+    /**
      * Freeform-side tap interception, offered every monitor event BEFORE the corner gate.
      * CALLED ON [inputThread] (any thread-safe implementation is fine; window work is not).
      */

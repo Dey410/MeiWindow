@@ -39,7 +39,11 @@ class ModuleLogDiagnosisTest {
             "${LOGCAT_PREFIX}FREEFORM_SCALE getFreeFormScale(FanContext,true,false,1,true,false,mark.via,1220,2656) " +
                 "target=0.8 rom=0.8 used=0.8 clamped=false",
             // 边角手势：走手势监听（能抢），且最近一笔是「按下的 2ms 内抢下」（真机实测的正常值）。
+            // 顺序照真机：安装/重装先打 CORNER_READY，监视器随后自己报 transport（它才是权威）。
             "${LOGCAT_PREFIX}SYSTEMUI_CORNER_READY transport=gesture-monitor",
+            "${LOGCAT_PREFIX}PREFS_APPLIED enabled=true left=true right=true range=40 " +
+                "transport=monitor cur=1220x2656 max=1220x2656 " +
+                "freeform[enabled=true center=true scale=80 mini=true noOffset=false dim=true]",
             LSPD_PREFIX + "MON_DOWN side=RIGHT x=1139.0 y=2582.0 box=163.0 band=true ime=0px " +
                 "mode=pre-own lat=2 cur=1220x2656 max=1220x2656",
             LSPD_PREFIX + "MON_SYSTEM_CANCEL tracking=false claimed=false kept=false owned=false " +
@@ -260,6 +264,9 @@ class ModuleLogDiagnosisTest {
         val lines = HEALTHY.map {
             if (it.contains("SYSTEMUI_CORNER_READY")) {
                 it.replace("transport=gesture-monitor", "transport=spy-view-fallback")
+            } else if (it.contains("PREFS_APPLIED")) {
+                // 监视器没建起来时，监视器自己的那行也会写 spy-view。
+                it.replace("transport=monitor", "transport=spy-view")
             } else {
                 it
             }
@@ -267,6 +274,23 @@ class ModuleLogDiagnosisTest {
         val check = checksOf(lines).first { it.id == "gesture.transport" }
 
         fail(check, "降级", "回桌面")
+    }
+
+    @Test
+    fun aHotReloadThatIsStillStartingIsNotAFallback() {
+        // 热重载入口比主线程更早打 SYSTEMUI_CORNER_READY，那时 transport=pending；
+        // 8ms 后监视器自己报 transport=monitor —— 不许把前者当成降级。
+        val lines = HEALTHY.map {
+            if (it.contains("SYSTEMUI_CORNER_READY")) {
+                it.replace("transport=gesture-monitor", "transport=pending")
+            } else {
+                it
+            }
+        }
+        val check = checksOf(lines).first { it.id == "gesture.transport" }
+
+        assertEquals(CheckStatus.PASS, check.status)
+        assertTrue(check.evidence!!.contains("transport=monitor"))
     }
 
     @Test

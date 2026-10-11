@@ -162,8 +162,12 @@ class SystemUiHookInstaller(
             module.log(
                 Log.INFO,
                 TAG,
-                "SYSTEMUI_CORNER_READY transport=" +
-                    (if (monitor.monitorActive) "gesture-monitor" else "spy-view-fallback"),
+                // Ask the monitor, do not guess: `start()` applies the settings (and therefore
+                // brings the gesture monitor up) on the MAIN thread, so on the hot-reload entry
+                // point this line runs before the transport exists — reading `monitorActive`
+                // here printed `spy-view-fallback` for a monitor that came up 8 ms later, and
+                // the diagnostics page repeated that as a failure.
+                "SYSTEMUI_CORNER_READY transport=" + monitor.transport,
             )
             // Only arbitration left after the transport switch: keep the native back
             // handler's commit out of a corner stroke the drawer claimed for itself.
