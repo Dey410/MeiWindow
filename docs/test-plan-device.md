@@ -350,11 +350,13 @@ OS3 上模块改为调用 ROM 自己的转换入口 `MiuiFreeformModeController.
 - 主线程队列（SystemUI 启动、扇面/联系人条/面板的窗口工作）曾排在 DOWN 回调前面；
 - `PowerManager` / `KeyguardManager` 的 binder 调用、`WindowManager` 指标读取都在抢之前。
 
-现在的实现：探针窗口在 `start()` 建好（insets 监听维护缓存）、几何与电源/锁屏状态都是缓存字段
-（配置变化 / 亮灭屏 / 锁屏事件 + 输入线程上 250ms 看门狗刷新）、DOWN 回调跑在
-`bubbledrawer-corner-input` 专用线程（`THREAD_PRIORITY_URGENT_DISPLAY`），启动时 `MON_WARMUP`
-预热一遍，抢占的判定区也改成 `max(28dp, 触发区自身的纵向半径)`（此前触发区高于 28dp 的那部分
-按下只是"观察"，同样会被 launcher 抢走 HOME）。
+现在的实现：探针窗口在手势通道启动时建好（`startMonitorTransport`，主线程、与手指无关；功能关掉
+时随通道一起移除）、insets 监听维护缓存；几何与电源/锁屏状态都是缓存字段（配置变化 / 亮灭屏 / 锁屏
+事件 + 输入线程上看门狗：**亮屏 250ms、熄屏 5s** —— 这是本功能唯一不靠手指触发的开销，熄屏慢下来
+既省唤醒又不影响判定）、DOWN 回调跑在 `bubbledrawer-corner-input` 专用线程
+（`THREAD_PRIORITY_URGENT_DISPLAY`），启动时 `MON_WARMUP` 预热一遍，抢占的判定区也改成
+`max(28dp, 触发区自身的纵向半径)`（此前触发区高于 28dp 的那部分按下只是"观察"，同样会被 launcher
+抢走 HOME）。
 
 - [ ] **重启系统界面**（A14 的按钮，或 `adb shell su -c "killall com.android.systemui"`）→
       等界面回来 → **第一笔**右下角内滑：只出扇面，**不回桌面**；左上/左下角同理

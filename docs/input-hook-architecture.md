@@ -85,14 +85,18 @@ if (name != null && (name.endsWith("MultiTaskSwitch") || name.endsWith("pip-resi
 1. **在 DOWN 回调里建窗口**：键盘高度探针（IME inset 探针窗口）原本是第一个角落 DOWN 时现场
    `WindowManager.addView` —— 窗口添加是两次 binder 往返 + relayout + insets 分发，于是**每次
    SystemUI 启动后的第一笔角落手势必然输掉**，表现就是"重启系统界面后第一下会回桌面"。现在探针在
-   `start()` 建好，insets 变化由监听器写进 `imeHeightCache`，DOWN 只读一个字段。
+   手势通道启动时（`startMonitorTransport`，仍是主线程、仍与手指无关）就建好，功能关掉时随通道一起
+   移除；insets 变化由监听器写进 `imeHeightCache`，DOWN 只读一个字段。
 2. **在主线程处理输入**：DOWN 回调原本跑在 SystemUI 的主 looper 上，正好排在启动、扇面/联系人条/
    面板的窗口工作后面。现在收在 `bubbledrawer-corner-input` 专用 `HandlerThread`
    （`THREAD_PRIORITY_URGENT_DISPLAY`），只有"要动窗口"的动作才 `post` 回主线程。
 3. **抢之前先做 binder 调用**：`PowerManager.isInteractive` / `KeyguardManager.isKeyguardLocked`、
    `WindowManager` 指标读取都曾在抢占之前。现在几何（`refreshGeometry`，主线程）、电源/锁屏
-   （`refreshState`，输入线程上 250ms 看门狗 + 亮灭屏/锁屏事件）全是缓存字段，DOWN 路径只剩
+   （`refreshState`，输入线程上看门狗 + 亮灭屏/锁屏事件）全是缓存字段，DOWN 路径只剩
    **读字段 + 一次 `pilferPointers()`**。启动时 `MON_WARMUP` 还会把这条路径跑 24 遍（类加载/JIT）。
+
+看门狗是这套东西里唯一"不靠手指触发"的开销，所以它跟着屏幕走：亮屏 250ms（远小于人从锁屏摸到角落的
+时间），熄屏 5s（这时根本不会来角落手势，慢速 tick 只是兜底，防止亮屏广播丢了把闸门卡在"不可交互"）。
 
 判定区也从"底边上方 28dp"改成 `max(28dp, 触发区自身的纵向半径)`：触发区的纵向轴是用户设置
 （最多 160dp），此前高于 28dp 的那部分按下只是"观察"，同样会被 launcher 抢走 HOME。

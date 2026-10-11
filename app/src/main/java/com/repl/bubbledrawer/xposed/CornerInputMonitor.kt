@@ -369,9 +369,6 @@ class CornerInputMonitor(
         prefsListener = listener
         prefs.registerOnSharedPreferenceChangeListener(listener)
         registerDebugReceiver()
-        // The IME probe is a WINDOW (see [insetProbe]) and therefore belongs to a moment with
-        // no deadline — never to the first corner DOWN, where it used to cost the gesture.
-        mainHandler.post { ensureInsetProbe() }
         registerEnvironmentListeners()
         // Pre-warm FanHost and cached apps in background so the very first swipe has apps ready
         mainHandler.post { runCatching { ensureFan() } }
@@ -532,8 +529,7 @@ class CornerInputMonitor(
         keyguardListener = null
         prefsListener?.let { runCatching { prefs.unregisterOnSharedPreferenceChangeListener(it) } }
         prefsListener = null
-        insetProbe?.let { probe -> runCatching { wm.removeViewImmediate(probe) } }
-        insetProbe = null
+        removeInsetProbe()
         stroke = null
         monitorActive = false
         logger(Log.INFO, "MON_DISPOSED_FOR_HOT_RELOAD id=${System.identityHashCode(this)}", null)
@@ -589,6 +585,11 @@ class CornerInputMonitor(
             val handler = Handler(thread.looper)
             inputThread = thread
             inputHandler = handler
+            // The IME probe is a WINDOW (see [insetProbe]); it belongs to a moment with no
+            // deadline — never to the first corner DOWN, where it used to cost the gesture — and
+            // it belongs to the corner feature being ON, so it is created here rather than for
+            // every process that merely loads the module.
+            mainHandler.post { if (!disposed) ensureInsetProbe() }
             // Counts as up as soon as the channel exists: applySettings() must NOT fall back to
             // the SPY-view windows just because the receiver is created a beat later, and the
             // creation cannot fail in practice (a failure is logged and retried from scratch).
@@ -656,6 +657,16 @@ class CornerInputMonitor(
      * DOWN path, so the gate's two binder calls cost the gesture nothing even in the worst
      * case — the first touch after a long idle, when both system_server and this process are
      * cold.
+     *
+     * THE PERIOD DEPENDS ON THE SCREEN, because this is the one piece of the corner feature
+     * that runs without a finger on the glass. While the display is off no corner gesture can
+     * arrive at all (and the gate must answer "not interactive" while it lasts), so the timer
+     * slows from [STATE_REFRESH_MS] to [STATE_REFRESH_SCREEN_OFF_MS]: four wakeups per second
+     * with two binder round-trips each is small next to a lit display, but during standby it is
+     * pure waste — it keeps the SoC out of its deepest idle states and wakes system_server for
+     * an answer nobody is waiting for. The screen on/off receiver and the keyguard listener do
+     * the real work at the transitions; the slow tick is only a safety net, so a broadcast that
+     * never arrives cannot leave the gate stuck.
      */
     private val stateWatchdog = object : Runnable {
         override fun run() {
@@ -667,7 +678,10 @@ class CornerInputMonitor(
             if (displayBoundsCache.width() <= 0 || displayBoundsCache.height() <= 0) {
                 mainHandler.post(::refreshGeometry)
             }
-            inputHandler?.postDelayed(this, STATE_REFRESH_MS)
+            inputHandler?.postDelayed(
+                this,
+                if (deviceInteractive) STATE_REFRESH_MS else STATE_REFRESH_SCREEN_OFF_MS,
+            )
         }
     }
 
@@ -756,6 +770,9 @@ class CornerInputMonitor(
      */
     private fun stopMonitorTransport() {
         if (!monitorActive && monitor == null) return
+        // The corner feature is not wanted (or is being rebuilt): the probe window goes with it,
+        // so a disabled feature costs no window at all. It is re-created on the next start.
+        removeInsetProbe()
         val thread = inputThread
         val toDispose = receiver
         val monitorToDispose = monitor
@@ -1016,10 +1033,19 @@ class CornerInputMonitor(
      */
     private fun imeVisibleHeightPx(): Int = imeHeightCache
 
+    /** Drops the IME probe window (main thread, it is a window) and forgets its cached height. */
+    private fun removeInsetProbe() {
+        insetProbe?.let { probe -> runCatching { wm.removeViewImmediate(probe) } }
+        insetProbe = null
+        insetProbeAttempted = false
+        imeHeightCache = 0
+    }
+
     /**
      * Adds the IME-inset probe window (see [imeVisibleHeightPx]) and keeps [imeHeightCache]
      * current from its insets listener. MAIN THREAD ONLY (it is a window), and called from
-     * [start] — never from an input callback, which is the whole point of the cache.
+     * [startMonitorTransport] — never from an input callback, which is the whole point of the
+     * cache.
      */
     private fun ensureInsetProbe(): View? {
         insetProbe?.let { return it }
@@ -1804,12 +1830,19 @@ class CornerInputMonitor(
         const val HOME_GESTURE_BAND_DP = 28f
 
         /**
-         * How often the power/keyguard snapshot is refreshed on the input thread (see
-         * [stateWatchdog]). It exists so the DOWN path never makes a binder call: 250 ms is
-         * far below the time it takes a user to lock the phone and reach for the corner, and
-         * screen on/off and keyguard changes also push an immediate refresh.
+         * How often the power/keyguard snapshot is refreshed on the input thread while the
+         * display is ON (see [stateWatchdog]). It exists so the DOWN path never makes a binder
+         * call: 250 ms is far below the time it takes a user to lock the phone and reach for the
+         * corner, and screen on/off and keyguard changes also push an immediate refresh.
          */
         const val STATE_REFRESH_MS = 250L
+
+        /**
+         * …and while it is OFF, where nothing can be waiting for the answer: 20x fewer wakeups
+         * for the one timer this feature owns, kept running only so a missed screen-on broadcast
+         * cannot leave the gate stuck on "not interactive".
+         */
+        const val STATE_REFRESH_SCREEN_OFF_MS = 5000L
 
         /**
          * How many times [warmUp] walks the DOWN path at start. Enough for the JIT to compile
