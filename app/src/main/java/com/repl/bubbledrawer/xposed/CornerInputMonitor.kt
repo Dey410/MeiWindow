@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.KeyguardManager
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.hardware.input.InputManager
@@ -148,6 +149,38 @@ class CornerInputMonitor(
     @Volatile
     private var maximumBoundsCache = Rect(0, 0, 0, 0)
 
+    /**
+     * Rotation the caches were built for (`Display.getRotation()`, -1 = never built).
+     *
+     * THE CACHE MUST NOT OUTLIVE A ROTATION. It used to: `displayBounds()` was a plain cache
+     * read, and the only refreshers were the start-up path, a screen on/off, and a
+     * `ComponentCallbacks` hook that HyperOS's `SystemUIApplicationImpl` does not have to
+     * dispatch. Rotate to landscape afterwards and the corner gate keeps testing a PORTRAIT
+     * rect: `CornerSector.contains(x, y, 1220, 2656, …)` rejects every landscape DOWN
+     * (its vertical reach is measured from y=2656, so a real touch at y≤1220 is always "too
+     * far up") — the fan simply cannot be opened any more. Reported 2026-10-11 as
+     * "横屏下无法唤出扇形小窗".
+     *
+     * The DOWN path therefore checks this one INT before trusting the cache: `Display.getRotation`
+     * is a field read of the framework's cached DisplayInfo (no binder, no WindowManager lock),
+     * and the rotation itself is pushed to every process by the framework's own display listener.
+     * A stale cache is healed on the main thread and, for the event at hand, rebuilt locally by
+     * swapping the physical sides — a rotation cannot change the display's size, only its
+     * orientation.
+     */
+    @Volatile
+    private var geometryRotation = -1
+
+    /**
+     * The `Display` the caches were built for — held so the DOWN path never resolves one:
+     * `Context.getDisplay()` caches its object per Context, but resolving it the first time
+     * talks to DisplayManagerService, and this is the wrong path for a binder call. Its
+     * DisplayInfo (and therefore `getRotation()`) is kept current by the framework's own
+     * display listener.
+     */
+    @Volatile
+    private var geometryDisplay: android.view.Display? = null
+
     /** IME height in px, maintained by the probe window's insets listener (main thread). */
     @Volatile
     private var imeHeightCache = 0
@@ -177,7 +210,73 @@ class CornerInputMonitor(
                 maxOf(max.right, cur.right),
                 maxOf(max.bottom, cur.bottom),
             )
+            geometryRotation = liveRotation()
         }.onFailure { logger(Log.WARN, "MON_GEOMETRY_REFRESH_FAILED", it) }
+    }
+
+    /**
+     * `Display.getRotation()` — a field read of the DisplayInfo the framework caches and keeps
+     * up to date for every process through its own display listener (no binder, no
+     * WindowManager call, safe on the input thread). -1 when it cannot be read at all.
+     */
+    private fun liveRotation(): Int = runCatching {
+        val display = geometryDisplay ?: (context.display ?: wm.defaultDisplay).also { geometryDisplay = it }
+        display.rotation
+    }.getOrDefault(-1)
+
+    /** id of the display this monitor's geometry describes (defaults to the primary one). */
+    private fun liveDisplayId(): Int = runCatching {
+        val display = geometryDisplay ?: (context.display ?: wm.defaultDisplay).also { geometryDisplay = it }
+        display.displayId
+    }.getOrDefault(android.view.Display.DEFAULT_DISPLAY)
+
+    /**
+     * Live window bounds from this process's `Resources` — a LOCAL read (no WindowManager, no
+     * binder), used only as the belt for [geometryIsStale].
+     *
+     * `Configuration.windowConfiguration` is @hide, so it goes through the same reflection the
+     * freeform side uses (`MiuiFreeform.freeformTask`); `null` when unavailable, in which case
+     * the rotation check alone decides.
+     */
+    private fun liveConfigBounds(): Rect? = runCatching {
+        val config = context.resources.configuration
+        val windowConfig = Configuration::class.java
+            .getMethod("getWindowConfiguration").invoke(config) ?: return null
+        windowConfig.javaClass.getMethod("getBounds").invoke(windowConfig) as? Rect
+    }.getOrNull()
+
+    /** True while the cached geometry still describes the display's current orientation. */
+    private fun geometryIsStale(): Boolean {
+        val cached = displayBoundsCache
+        if (cached.width() <= 0 || cached.height() <= 0) return true
+        val live = liveRotation()
+        if (live >= 0 && geometryRotation >= 0 && live != geometryRotation) return true
+        // Belt: a rotation between the refresh and the listener callback can also be caught by
+        // the (local) configuration bounds, whose longer side must match the cache's.
+        val config = liveConfigBounds() ?: return false
+        if (config.width() <= 0 || config.height() <= 0) return false
+        return (config.width() > config.height()) != (cached.width() > cached.height())
+    }
+
+    /**
+     * The physical display rect for the CURRENT orientation, rebuilt locally when the cache
+     * belongs to the previous one (see [geometryRotation]). Rotation swaps the two sides and
+     * nothing else, so the stale cache is enough to answer correctly for this event instead of
+     * rejecting the stroke; the real metrics are re-read on the main thread right after.
+     */
+    private fun displayBoundsForEvent(): Rect {
+        val cached = displayBoundsCache
+        if (!geometryIsStale()) return cached
+        mainHandler.post(::refreshGeometry)
+        val long = maxOf(cached.width(), cached.height())
+        val short = minOf(cached.width(), cached.height())
+        if (long <= 0 || short <= 0) return cached
+        val landscape = when (liveRotation()) {
+            android.view.Surface.ROTATION_90, android.view.Surface.ROTATION_270 -> true
+            android.view.Surface.ROTATION_0, android.view.Surface.ROTATION_180 -> false
+            else -> liveConfigBounds()?.let { it.width() > it.height() } ?: false
+        }
+        return if (landscape) Rect(0, 0, long, short) else Rect(0, 0, short, long)
     }
 
     /** a stroke that moved no further than this counts as a tap at release */
@@ -382,13 +481,35 @@ class CornerInputMonitor(
     /**
      * Keep the cached environment fresh without ever asking for it on the DOWN path:
      *  • screen on/off + user present — the two moments the gate's answer changes;
-     *  • configuration changes — rotation moves the display metrics and the bottom edge;
+     *  • **rotation** — via `DisplayManager`, the only rotation signal that does not depend on
+     *    the host Application forwarding configuration changes (HyperOS's
+     *    `SystemUIApplicationImpl` need not, which is how the corner gate ended up testing a
+     *    portrait rect in landscape — see [geometryRotation]);
+     *  • configuration changes — same thing from the app side, kept as a second opinion;
      *  • keyguard state — event-driven, so "locked" cannot be a 250 ms stale guess.
      * All of them are registered in [start] and released in [dispose]; a hot reload that left
      * one behind would keep a dead instance's cache alive (same failure the prefs listener
      * and the debug receiver had, see [dispose]).
      */
     private fun registerEnvironmentListeners() {
+        if (displayListener == null) {
+            val dm = context.getSystemService(android.hardware.display.DisplayManager::class.java)
+            val listener = object : android.hardware.display.DisplayManager.DisplayListener {
+                override fun onDisplayAdded(displayId: Int) = Unit
+                override fun onDisplayRemoved(displayId: Int) = Unit
+                override fun onDisplayChanged(displayId: Int) {
+                    if (disposed) return
+                    if (displayId != liveDisplayId()) return
+                    mainHandler.post {
+                        refreshGeometry()
+                        refreshState()
+                    }
+                }
+            }
+            runCatching { dm?.registerDisplayListener(listener, mainHandler) }
+                .onSuccess { displayListener = listener }
+                .onFailure { logger(Log.WARN, "MON_DISPLAY_LISTENER_FAILED", it) }
+        }
         if (environmentReceiver == null) {
             val receiver = object : android.content.BroadcastReceiver() {
                 override fun onReceive(c: android.content.Context?, i: android.content.Intent?) {
@@ -486,6 +607,7 @@ class CornerInputMonitor(
     private var environmentReceiver: android.content.BroadcastReceiver? = null
     private var componentCallbacks: android.content.ComponentCallbacks? = null
     private var keyguardListener: KeyguardManager.KeyguardLockedStateListener? = null
+    private var displayListener: android.hardware.display.DisplayManager.DisplayListener? = null
 
     /** set by [dispose]; every receiver entry point checks it before touching the runtime */
     @Volatile
@@ -525,6 +647,13 @@ class CornerInputMonitor(
         environmentReceiver = null
         componentCallbacks?.let { runCatching { context.unregisterComponentCallbacks(it) } }
         componentCallbacks = null
+        displayListener?.let { listener ->
+            runCatching {
+                context.getSystemService(android.hardware.display.DisplayManager::class.java)
+                    ?.unregisterDisplayListener(listener)
+            }
+        }
+        displayListener = null
         keyguardListener?.let { runCatching { keyguardManager?.removeKeyguardLockedStateListener(it) } }
         keyguardListener = null
         prefsListener?.let { runCatching { prefs.unregisterOnSharedPreferenceChangeListener(it) } }
@@ -547,7 +676,12 @@ class CornerInputMonitor(
             Log.INFO,
             "PREFS_APPLIED enabled=" + settings.enabled + " left=" + settings.left +
                 " right=" + settings.right + " range=" + settings.rangeDp +
-                " transport=" + if (monitorActive) "monitor" else "spy-view" +
+                // `+` binds tighter than `if`, so the if-expression MUST be parenthesized here:
+                // unparenthesized, `… + if (monitorActive) "monitor" else "spy-view" + " " + …`
+                // parses as `… + (if (…) "monitor" else ("spy-view" + " " + …))` — i.e. with the
+                // gesture monitor up (the normal case) the geometry, the freeform snapshot and
+                // everything appended after it were silently dropped from this line.
+                " transport=" + (if (monitorActive) "monitor" else "spy-view") +
                 " " + boundsForLog() +
                 // The freeform half of the same snapshot: this process acts on THESE values, so a
                 // settings page that shows something else is a lost push, not a UI bug (see
@@ -557,7 +691,9 @@ class CornerInputMonitor(
                 " scale=" + settings.flymeFreeformScale +
                 " mini=" + settings.flymeFreeformSwipeUpMini +
                 " noOffset=" + settings.flymeFreeformNoOffset +
-                " dim=" + settings.flymeFreeformDimBg + "]",
+                " dim=" + settings.flymeFreeformDimBg + "]" +
+                // 图标那一半（见 AppRepository 的分身图标）：分身图标一律取主空间那张，这一项只管角标。
+                " icon[cloneBadge=" + settings.cloneBadge + "]",
             null,
         )
     }
@@ -671,11 +807,11 @@ class CornerInputMonitor(
     private val stateWatchdog = object : Runnable {
         override fun run() {
             refreshState()
-            // Self-heal: a geometry refresh that failed (or raced SystemUI's start-up) must not
-            // leave the corner gate with an empty display for the rest of the process' life —
-            // with a cached Rect that never got filled, every DOWN would fall outside the
-            // sector. The main thread does the work; this is only the nudge.
-            if (displayBoundsCache.width() <= 0 || displayBoundsCache.height() <= 0) {
+            // Self-heal, two ways: a geometry refresh that failed (or raced SystemUI's start-up)
+            // must not leave the corner gate with an empty display, and a ROTATION that no
+            // listener reported must not leave it with the previous orientation's — with either
+            // one, every DOWN falls outside the sector and the fan cannot be opened at all.
+            if (geometryIsStale()) {
                 mainHandler.post(::refreshGeometry)
             }
             inputHandler?.postDelayed(
@@ -1130,15 +1266,21 @@ class CornerInputMonitor(
      * `maximumWindowMetrics` is the full display; take the union so the band can never
      * end up above the physical edge on either metric.
      *
-     * READ-ONLY for callers: the returned Rect is the cache itself, so the input thread never
-     * allocates and never asks WindowManager for anything.
+     * READ-ONLY for callers: normally the cache itself (so the input thread never allocates and
+     * never asks WindowManager for anything); after a rotation it is a freshly built rect for
+     * the new orientation until the main thread has re-read the metrics — see
+     * [displayBoundsForEvent].
      */
-    private fun displayBounds(): Rect = displayBoundsCache
+    private fun displayBounds(): Rect = displayBoundsForEvent()
 
     private fun boundsForLog(): String {
         val max = maximumBoundsCache
         val cur = currentBoundsCache
-        return "cur=${cur.width()}x${cur.height()} max=${max.width()}x${max.height()}"
+        // `rot=` is what turns "the corner does not trigger" into a readable log line: a
+        // portrait `cur=` next to `rot=1` is a stale geometry cache, not a user missing the
+        // corner (see geometryRotation).
+        return "cur=${cur.width()}x${cur.height()} max=${max.width()}x${max.height()} " +
+            "rot=$geometryRotation stale=${geometryIsStale()}"
     }
 
     /** True inside a box twice the trigger size — used to log near misses (gate diagnosis). */
