@@ -10,6 +10,7 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.os.Handler
 import android.os.Looper
 import android.service.notification.StatusBarNotification
 import android.util.Log
@@ -40,6 +41,14 @@ data class Conversation(
      */
     val launchIntent: Intent? = null,
     val userId: Int = 0,
+    /**
+     * 头像指纹（[avatarPrint]）—— 用来认「这是同一个人」。
+     *
+     * 会话的标题认不出人：群消息的标题是 `群名：发送者`（Telegram 一类），而头像就是**发送者的脸** ——
+     * 同一个人在几个群里说话，条上就会出现几张一模一样的头像（用户反馈）。联系人条是「联系人」，
+     * 所以身份认头像：指纹相同 = 同一个人，只留最新的那条。
+     */
+    val avatarPrint: String? = null,
 )
 
 /**
@@ -91,6 +100,14 @@ class RecentConversations(
     private var cachedAt = 0L
     private var cachedIcons = HashMap<String, Drawable?>()
 
+    /**
+     * 通知 key → 头像指纹（[avatarPrint]），与 [cachedIcons] 同生命周期。
+     *
+     * 头像本身没法当身份用（每次通知都是新的 Bitmap 对象），指纹可以：同一个人在不同群里说话时，
+     * 通知的标题不同（`群名：发送者`）但头像字节几乎相同 —— 这就是「几个一样的联系人图标」。
+     */
+    private var cachedPrints = HashMap<String, String?>()
+
     /** Conversation memory that survives MIUI's "opening the app clears its notifications". */
     private class Remembered(
         val pkg: String,
@@ -102,6 +119,7 @@ class RecentConversations(
         var userId: Int,
         var postTime: Long,
         var lastSeenAt: Long,
+        var avatarPrint: String? = null,
     )
 
     private val remembered = HashMap<String, Remembered>()
@@ -149,12 +167,35 @@ class RecentConversations(
             if (conv.pkg != pkg || isForgotten(conv)) continue
             // One avatar per conversation: a chat that re-posts (or a summary line) keeps the
             // newest notification only — Flyme keeps a per-key bucket with the same effect.
-            live[conv.title] = conv.copy(live = true)
+            // (同一个人的多个会话在 [dedupeByPerson] 里再合成一条。）
+            val previous = live[conv.title]
+            if (previous == null || conv.postTime >= previous.postTime) live[conv.title] = conv.copy(live = true)
         }
         lastLiveCount = live.size
         prune(now)
-        return merge(pkg, live)
+        val out = merge(pkg, live)
+        logList(pkg, out)
+        return out
     }
+
+    /**
+     * 条上现在有什么（标题 + 有没有头像指纹 + 是不是还在通知栏里），**只在变化时**打一行。
+     *
+     * 这是「几个一样的联系人图标」唯一能事后核对的东西：合并发生在数据层，条上是看不见证据的，
+     * 而 `#p` 标记说明这条有指纹、能参与认人。
+     */
+    private fun logList(pkg: String, list: List<Conversation>) {
+        val line = "CONTACT_BAR_LIST pkg=$pkg n=${list.size} live=$lastLiveCount " +
+            list.take(8).joinToString(" | ") {
+                it.title + (if (it.avatarPrint != null) "#p" else "") + (if (it.live) "*" else "")
+            }
+        if (line == lastListLine) return
+        lastListLine = line
+        log(Log.INFO, line, null)
+    }
+
+    @Volatile
+    private var lastListLine: String? = null
 
     /**
      * Drop one conversation from the bar (Flyme's swipe-to-remove, `ContactListView.C2929d.onSwiped` →
@@ -162,11 +203,28 @@ class RecentConversations(
      * once something newer arrives for it.
      */
     fun forget(conversation: Conversation) {
-        val entry = key(conversation.pkg, conversation.title)
-        remembered.remove(entry)
-        forgotten[entry] = Forgotten(conversation.postTime, android.os.SystemClock.elapsedRealtime())
+        val now = android.os.SystemClock.elapsedRealtime()
+        // 条上那一条可能代表同一个人的好几个会话（见 [dedupeByPerson]）—— 划掉就要划掉整个人，
+        // 否则下一次重建会把同一张头像从另一个群的消息里再摆回来。
+        val person = conversation.avatarPrint
+        val samePerson = remembered.values.filter { record ->
+            if (person != null) printsMatch(record.avatarPrint, person) else record.title == conversation.title
+        }
+        val targets = samePerson.ifEmpty { null }
+            ?.map { it.title to it.postTime }
+            ?: listOf(conversation.title to conversation.postTime)
+        targets.forEach { (title, postTime) ->
+            val entry = key(conversation.pkg, title)
+            remembered.remove(entry)
+            forgotten[entry] = Forgotten(postTime, now)
+        }
         cachedPkg = null
-        log(Log.INFO, "CONTACT_BAR_FORGET pkg=${conversation.pkg} title=${conversation.title}", null)
+        log(
+            Log.INFO,
+            "CONTACT_BAR_FORGET pkg=${conversation.pkg} title=${conversation.title} " +
+                "entries=${targets.size}",
+            null,
+        )
     }
 
     private fun isForgotten(conv: Conversation): Boolean {
@@ -204,6 +262,7 @@ class RecentConversations(
         if (conv.launchIntent != null) record.launchIntent = conv.launchIntent
         record.userId = conv.userId
         record.key = conv.key
+        record.avatarPrint = conv.avatarPrint ?: record.avatarPrint
         record.postTime = maxOf(record.postTime, conv.postTime)
         record.lastSeenAt = now
     }
@@ -222,12 +281,28 @@ class RecentConversations(
                 postTime = record.postTime,
                 launchIntent = record.launchIntent,
                 userId = record.userId,
+                avatarPrint = record.avatarPrint,
             )
         }
         merged.putAll(live)
-        val out = merged.values.sortedByDescending { it.postTime }
+        // 一个联系人只留一条（同一个人可能在好几个群里都说了话），再按时间排、再截断 ——
+        // 顺序很要紧：先截断会把同一个人的几条都算进 20 条里，真实人数就被挤掉了。
+        val out = dedupeByPerson(merged.values.toList())
+        if (out.size != merged.size) logMerged(pkg, merged.size, out)
         return if (out.size > MAX_ITEMS) ArrayList(out.subList(0, MAX_ITEMS)) else out
     }
+
+    /** One line when a person's several conversations collapsed — the duplicate-avatar report. */
+    private fun logMerged(pkg: String, before: Int, people: List<Conversation>) {
+        val line = "CONTACT_BAR_MERGED pkg=$pkg conversations=$before people=${people.size} " +
+            "keep=${people.take(6).joinToString { it.title }}"
+        if (line == lastMergedLine) return
+        lastMergedLine = line
+        log(Log.INFO, line, null)
+    }
+
+    @Volatile
+    private var lastMergedLine: String? = null
 
     /** Drop conversations nobody refreshed for [TTL_MS], then enforce the per-app and global caps. */
     private fun prune(now: Long) {
@@ -274,6 +349,8 @@ class RecentConversations(
                     (extra as? android.graphics.drawable.Icon)?.loadDrawable(context)
                 }.getOrNull()
             cachedIcons[key] = ownAvatar(raw)
+            // 指纹只从**通知真的带了头像**时取：没有头像的条目画的是应用图标，认它会把所有人并成一个。
+            cachedPrints[key] = cachedIcons[key]?.let { printOf(it) }
         }
         return Conversation(
             pkg = pkg,
@@ -289,8 +366,26 @@ class RecentConversations(
                 PendingIntent::class.java.getMethod("getIntent").invoke(pi) as? Intent
             }.getOrNull(),
             userId = notificationUserId(sbn),
+            avatarPrint = cachedPrints[key],
         )
     }
+
+    /**
+     * The avatar's fingerprint ([avatarPrint]): the copy we already keep is redrawn into a 16x16
+     * bitmap, which is small enough to compare and coarse enough that re-encodings of the same
+     * picture still match.
+     */
+    private fun printOf(avatar: Drawable): String? = runCatching {
+        val side = AVATAR_PRINT_SIDE
+        val small = Bitmap.createBitmap(side, side, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(small)
+        avatar.setBounds(0, 0, side, side)
+        avatar.draw(canvas)
+        val pixels = IntArray(side * side)
+        small.getPixels(pixels, 0, side, 0, 0, side, side)
+        small.recycle()
+        avatarPrint(pixels, side)
+    }.getOrNull()
 
     /**
      * The avatar we keep: a copy in a bitmap of our own.
@@ -397,13 +492,21 @@ class RecentConversations(
         /** Every class this module ships lives under this prefix — how a stale proxy is recognised. */
         private const val MODULE_PACKAGE = "com.repl.bubbledrawer"
 
-        /** Flyme's own whitelist (`common/windowmode/model/AbstractC2304a.java:49-53`). */
+        /**
+         * Flyme's own whitelist (`common/windowmode/model/AbstractC2304a.java:49-53`), plus Telegram.
+         *
+         * Telegram 是后加的：它发的就是标准 MessagingStyle 聊天通知，群消息的标题正好是
+         * `群名：发送者`（设备日志里 `StarVoyager Ideal：ksm`、`YuKongA | Chat：Who care`），
+         * 也就是「几个一样的联系人图标」那条反馈的形状；而模块作者自己日常只用它 ——
+         * 不在白名单里，这个功能在本机上根本无从验证。
+         */
         val IM_WHITELIST = setOf(
             "com.tencent.mm",
             "com.tencent.mobileqq",
             "com.tencent.tim",
             "com.alibaba.android.rimet",
             "com.tencent.wework",
+            "org.telegram.messenger",
         )
 
         /** Flyme drops QQ's 「下线通知」 explicitly (`C2831I.java:533-539`). */
@@ -467,8 +570,19 @@ class RecentConversations(
             // hook above never fires — pull the same singleton out of the Dagger component instead
             // (`SystemUIAppComponentFactoryBase.systemUIInitializer` → `getSysUIComponent()` →
             // `ReferenceSysUIComponentImpl.notifPipelineProvider`, verified in the device dump).
-            if (pipelineRef == null) acquirePipeline(classLoader)
-            module.log(Log.INFO, TAG, "CONTACT_BAR_HOOKS_INSTALLED pipeline=${pipelineRef != null}")
+            //
+            // **主线程是硬要求**：`addCollectionListener` 在热重载线程上抛 `InvocationTargetException`
+            // （2026-10-11 设备实测：LSPosed 的 25978 线程装不上，而历史上每一次成功安装都发生在主线程
+            // ——`install()` 就是主线程调的）。所以构造 hook 在这里装，碰 pipeline 的部分发到主线程。
+            val finish = Runnable {
+                if (pipelineRef == null) acquirePipeline(classLoader)
+                module.log(Log.INFO, TAG, "CONTACT_BAR_HOOKS_INSTALLED pipeline=${pipelineRef != null}", null)
+            }
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                finish.run()
+            } else {
+                Handler(Looper.getMainLooper()).post(finish)
+            }
         }
 
         /**
@@ -539,7 +653,7 @@ class RecentConversations(
                 attachedProxy = proxy
                 listenerAttached = true
                 module.log(Log.INFO, TAG, "CONTACT_BAR_NOTIF_LISTENER_ATTACHED")
-            }.onFailure { module.log(Log.WARN, TAG, "CONTACT_BAR_NOTIF_LISTENER_FAILED", it) }
+            }.onFailure { module.log(Log.WARN, TAG, "CONTACT_BAR_NOTIF_LISTENER_FAILED", it.cause ?: it) }
         }
 
         /** The `NamedListenerSet` behind `NotifPipeline.mNotifCollection` — see the dump notes. */
@@ -619,4 +733,94 @@ class RecentConversations(
             module.log(Log.INFO, TAG, "CONTACT_BAR_NOTIF_REMOVED pkg=$pkg title=$title", null)
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// 一个联系人只占一条（纯算术，见 `ConversationDedupeTest`）
+// ---------------------------------------------------------------------------------------------
+
+/** 指纹的分辨率：16x16 足够认人，又小到可以逐字节比对。 */
+const val AVATAR_PRINT_SIDE = 16
+
+/** 每个通道 4 位 —— 1/16 的量化步长，重新编码不会改变结论。 */
+private const val PRINT_LEVELS = 16
+
+/** 量化级的字母表：一个头像 = `side * side * 3` 个十六进制字符。 */
+private const val PRINT_CHARS = "0123456789abcdef"
+
+/**
+ * 头像指纹：把 [pixels]（`side x side` 的 ARGB）按通道量化成十六进制字符（每像素 3 个）。
+ *
+ * 为什么需要它：会话的身份是标题，而群消息的标题是 `群名：发送者`（Telegram 一类）—— 同一个人在
+ * 几个群里说话就有几个标题，**头像却是同一张脸**，于是联系人条上出现几张一模一样的头像（用户反馈）。
+ * 头像本身不能当 key（每次通知都是新的 Bitmap），指纹可以。
+ *
+ * alpha 不参与：同一个人两次通知里的不透明度不同，不该被当成两个人。
+ */
+fun avatarPrint(pixels: IntArray, side: Int = AVATAR_PRINT_SIDE): String {
+    val count = minOf(pixels.size, side * side)
+    val out = StringBuilder(count * 3)
+    for (i in 0 until count) {
+        val pixel = pixels[i]
+        out.append(level((pixel shr 16) and 0xFF))
+            .append(level((pixel shr 8) and 0xFF))
+            .append(level(pixel and 0xFF))
+    }
+    return out.toString()
+}
+
+private fun level(channel: Int): Char =
+    PRINT_CHARS[(channel * PRINT_LEVELS / 256).coerceIn(0, PRINT_LEVELS - 1)]
+
+/**
+ * 两张头像是不是同一个人。
+ *
+ * 逐位相等太严格：同一张图在两次通知里可能是不同的分辨率/重采样结果（我们的 16x16 是从 144x144
+ * 的副本再缩一次得到的），差一两个量化级很正常。所以判据是「平均差小于一个量化级，且差得明显的
+ * 通道不超过 1/8」—— 同一张脸轻松通过，不同的头像（哪怕同色系）通不过。
+ *
+ * 指纹缺失（通知没带头像、绘制失败）时一律判为不同：没有头像的条目画的是应用图标，
+ * 认下来会把所有这样的人并成一条。
+ */
+fun printsMatch(a: String?, b: String?): Boolean {
+    if (a == null || b == null) return false
+    if (a.isEmpty() || a.length != b.length) return false
+    var sum = 0
+    var far = 0
+    for (i in a.indices) {
+        val diff = kotlin.math.abs(a[i] - b[i])
+        sum += diff
+        if (diff > 2) far++
+    }
+    return sum <= a.length && far * 8 <= a.length
+}
+
+/**
+ * 同一个人只留最新的一条（联系人条是联系人，不是会话列表）。
+ *
+ * 顺序与择优规则：
+ *  - 新的在前（`postTime` 大者胜；同一毫秒时「还在通知栏里」的那条胜，它才带红点）；
+ *  - 没有指纹的条目**只按标题**去重 —— 沿用原来的行为，也不会把两个没头像的人并掉；
+ *  - 被合并掉的会话不是丢了：划掉这一条会连它一起划掉（见 `RecentConversations.forget`）。
+ */
+fun dedupeByPerson(items: List<Conversation>): List<Conversation> {
+    val sorted = items.sortedWith(
+        compareByDescending<Conversation> { it.postTime }.thenByDescending { it.live },
+    )
+    val kept = ArrayList<Conversation>(sorted.size)
+    val prints = ArrayList<String?>(sorted.size)
+    val titles = HashSet<String>(sorted.size)
+    for (conversation in sorted) {
+        val print = conversation.avatarPrint
+        val duplicate = if (print != null) {
+            prints.any { printsMatch(it, print) }
+        } else {
+            titles.contains(conversation.title)
+        }
+        if (duplicate) continue
+        kept += conversation
+        prints += print
+        titles += conversation.title
+    }
+    return kept
 }

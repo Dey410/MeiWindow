@@ -436,5 +436,43 @@ OS3 上模块改为调用 ROM 自己的转换入口 `MiuiFreeformModeController.
 - [ ] 竖屏日志里 `bounds=Rect(183, 289 - 1403, 2241)`（ROM 的居中落点，模块没插手）
 - [ ] 关掉 Flyme 样式小窗总开关后行为一致（落点与总开关无关）
 
+## A19 联系人条：一个联系人只占一条（不再出现几张一样的头像）
+现象（用户反馈）：联系人条里可能出现几个一样的联系人图标。
+
+成因（设备日志里的真实标题）：群消息的标题是 `群名：发送者`，而通知带的大图标是**发送者的头像** ——
+日志里的 `StarVoyager Ideal：ksm`、`YuGongA | Chat：Who care`、`geymelody：平沢 憂` 全是这个形状。
+同一个人在几个群里说话，条上就是几张一模一样的脸。会话的身份（标题）认不出人，头像才能。
+
+做法：给每张头像算一个 **16x16、每通道 4 位**的指纹（`avatarPrint`）—— 头像本身不能当 key（每次通知
+都是新的 Bitmap 对象），指纹可以；同一个人（`printsMatch`：平均差小于一个量化级，且差得明显的通道
+不超过 1/8）只留**最新**的那条（同一毫秒时留在通知栏里的那条胜，它才带红点）。没有头像的条目画的是
+应用图标，所以它们仍然只按标题去重 —— 认头像会把所有这样的人并成一条。划掉一条 = 划掉**这个人**
+（`forget` 连他在别的群里的那几条一起划掉），否则下一次重建会把同一张脸摆回来。
+
+- [ ] 开一个微信/QQ/Telegram 小窗 → 条上头像互不重复；同一个人在两三个群里说话只出现一次
+- [ ] 日志 `CONTACT_BAR_LIST pkg=… n=N live=M 标题#p* | …`：`#p` = 这条有指纹（能参与认人）、
+      `*` = 还在通知栏里；同一个人的几条只剩一条
+- [ ] 合并且确实发生时有 `CONTACT_BAR_MERGED pkg=… conversations=3 people=2 keep=…`
+- [ ] 划掉某个人的头像 → 他在别的群里的那条也一起消失，不会立刻回来
+- [ ] 新消息到达后（更晚的 `postTime`）同一个人能重新出现
+
+白名单里补了 Telegram（`org.telegram.messenger`）：它发的就是标准 MessagingStyle 聊天通知，群消息标题
+正是 `群名：发送者` —— 也就是这条反馈的形状，而模块作者日常只用它（不在白名单里，这个功能在本机上
+根本无从验证）。
+
+### 顺带修掉的一个真问题：热重载之后联系人条收不到通知
+`reinstall()`（`adb install` 触发的热重载路径）只重装了 Flyme 那套 hook，**漏了联系人条的**
+（`RecentConversations.installHooks`）—— 它自己的注释里写着"联系人条也会静默失效"，但代码没跟上。
+后果：每次安装之后通知都进不来，条上只剩启动那一刻的记忆（日志上就是 `CONTACT_BAR_HIDE
+reason=NO_CONTACTS` 一直重复，看起来像"功能没做"）。
+
+而且这一步**必须发生在主线程**：在 LSPosed 的热重载线程上调 `addCollectionListener` 会抛
+`InvocationTargetException`（设备实测 tid 25978 失败，历史上每次成功都在主线程）。现在
+`installHooks` 把碰 pipeline 的那一步发到主线程。
+
+- [ ] `adb install -r` 之后：日志里有 `CONTACT_BAR_NOTIF_LISTENER_ATTACHED`，且它和
+      `CONTACT_BAR_HOOKS_INSTALLED pipeline=true` 的线程号等于该进程的主线程号
+- [ ] 随后条上仍能出新消息（不是只有重启系统界面之后才行）
+
 ## 贴边模式（可选，root）
 - [ ] 设置页"贴边模式"：无 su → toast 需要 root；有 su → inset=0，正上滑角落也能出扇

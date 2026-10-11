@@ -129,6 +129,18 @@ class SystemUiHookInstaller(
         }.onFailure {
             module.log(Log.WARN, TAG, "FLYME_FREEFORM_HOOKS_REINSTALL_FAILED", it)
         }
+        // 联系人条的数据源也是方法 hook（`NotifPipeline` 的构造 + `addCollectionListener`），
+        // 同样属于"换代就没了"的那一半：少了它，条上只剩启动那一刻的记忆，之后任何通知都进不来
+        // —— 设备日志上就是 `CONTACT_BAR_HIDE reason=NO_CONTACTS` 一直重复，看起来像"功能没做"。
+        // （`startInputMonitor` 只建了 ContactBarController，它负责摆窗口，不负责收通知。）
+        runCatching {
+            com.repl.bubbledrawer.contactbar.RecentConversations.installHooks(
+                module,
+                appClassLoader ?: context.classLoader,
+            )
+        }.onFailure {
+            module.log(Log.WARN, TAG, "CONTACT_BAR_HOOKS_REINSTALL_FAILED", it)
+        }
     }
 
     /** The Application Context captured at first start — handed to the next generation. */
