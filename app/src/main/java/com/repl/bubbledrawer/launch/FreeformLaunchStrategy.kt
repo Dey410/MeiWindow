@@ -25,9 +25,10 @@ import com.repl.bubbledrawer.pinyin.BubbleApp
  *     PendingIntent.send(..., bundle). Static framework util → reflectable from
  *     any app; the framework may still gate the actual freeform switch for
  *     non-system callers (LSPosed phase lifts that fully).
- *     When [position] is given the 5-argument overload with explicit
- *     `launchBoundsLeft/Top` is used instead (MiuiMultiWindowUtils:711), which is
- *     how the 更多页 hands the window over at the very spot the panel sat on.
+ *     When the launch knows where it was triggered from ([trigger]) the 5-argument
+ *     overload with explicit `launchBoundsLeft/Top` is used instead
+ *     (MiuiMultiWindowUtils:711) — the same entry point 安全中心's 侧边栏小窗 uses
+ *     (`FreeformUtil.m21966e` → `getActivityOptions(ctx, pkg, true, x, y)`).
  *  2. AOSP 15/16 "desktop windowing": public `setLaunchBounds(rect)` honoured
  *     as freeform when desktop mode is enabled; @hide
  *     `setLaunchWindowingMode(1)` where the ODM gate is on.
@@ -63,7 +64,7 @@ import com.repl.bubbledrawer.pinyin.BubbleApp
  * ("restart the app at its root activity"), not 小窗 semantics — the sidebar resumes the app
  * where the user left it.
  */
-class FreeformLaunchStrategy(private val position: Rect? = null) : ILaunchStrategy {
+class FreeformLaunchStrategy(private val trigger: FreeformTrigger? = null) : ILaunchStrategy {
 
     override fun launch(context: Context, app: BubbleApp): Boolean {
         val userHandle = MultiUserHelper.getUserHandle(app.userId)
@@ -111,7 +112,7 @@ class FreeformLaunchStrategy(private val position: Rect? = null) : ILaunchStrate
             // 2. Public LauncherApps.startMainActivity
             if (comp != null && launcherApps != null) {
                 val launcherOk = runCatching {
-                    launcherApps.startMainActivity(comp, userHandle, position, bundle)
+                    launcherApps.startMainActivity(comp, userHandle, null, bundle)
                     true
                 }.getOrElse { false }
                 if (launcherOk) return true
@@ -179,7 +180,7 @@ class FreeformLaunchStrategy(private val position: Rect? = null) : ILaunchStrate
                 "BubbleDrawer",
                 "LAUNCH_OPTS pkg=$pkg mode=$mode reuseTask=$existingTask bounds=$bounds ratio=$ratio " +
                     "romRect=$romRect romRatio=$romRatio " +
-                    "screen=${dm.widthPixels}x${dm.heightPixels} position=$position",
+                    "screen=${dm.widthPixels}x${dm.heightPixels} trigger=$trigger",
             )
         }
     }
@@ -187,18 +188,27 @@ class FreeformLaunchStrategy(private val position: Rect? = null) : ILaunchStrate
     /**
      * HyperOS path — `MiuiMultiWindowUtils.getActivityOptions(...)`.
      *
-     * POSITION IS NOT GEOMETRY (user ruling 2026-10-09): the small window always takes the ROM's
-     * own小窗 rectangle, whether it was opened from a fan tile or from a tile inside the 更多
-     * panel — "扇形打开的小窗和更多里打开的小窗应该一致". Passing the panel's rect used to
+     * SIZE IS NOT OURS (user ruling 2026-10-09): the small window always takes the ROM's own小窗
+     * rectangle, whether it was opened from a fan tile or from a tile inside the 更多 panel —
+     * "扇形打开的小窗和更多里打开的小窗应该一致". Passing the 更多 panel's rect used to
      * shrink/stretch the window to the panel's shape (976x1859 on this phone vs the ROM's
-     * 1220x1952), which is exactly the inconsistency reported. The 更多 panel's own size stays a
-     * user setting and is untouched. [position] therefore only survives as the source-bounds hint
-     * for the launcher-animation path and for [aospOptions] on ROMs with no MIUI geometry.
+     * 1220x1952), which is exactly the inconsistency reported; the panel's own size stays a user
+     * setting and is untouched.
+     *
+     * POSITION, on the other hand, is what the trigger decides (user report 2026-10-11: 横屏时
+     * 不管从哪个角落划出来小窗都在左边) — see [MiuiFreeform.triggerSideRect], which asks the ROM
+     * for its own rect and only moves it to the triggered side. Without a [trigger] the position
+     * stays the ROM's business, exactly as before.
      */
     private fun miuiOptions(context: Context, pkg: String): ActivityOptions? {
-        return (MiuiFreeform.activityOptions(context, pkg, noCheck = true, position = null)
+        val position = trigger?.let {
+            MiuiFreeform.triggerSideRect(context, pkg, it.anchorX, it.display)
+        }
+        return (MiuiFreeform.activityOptions(context, pkg, noCheck = true, position = position)
             // `getActivityOptions` is gated by checkAuthority() (third-party callers get
-            // null); the ROM's own builder is not, and is what its sidebar linkage uses.
+            // null); the ROM's own builder is not, and is what its sidebar linkage uses —
+            // and it takes the same left/top, so a gated answer keeps the triggered side.
+            ?: position?.let { MiuiFreeform.makeActivityOptions(context, pkg, it.left, it.top) }
             ?: MiuiFreeform.makeActivityOptions(context, pkg)
             ?: ActivityOptions.makeBasic().also {
                 runCatching {
@@ -210,34 +220,20 @@ class FreeformLaunchStrategy(private val position: Rect? = null) : ILaunchStrate
     }
 
     /**
-     * The rect a small window should have: the PHONE's proportions, like a reused task gets.
-     *
-     * Measured on device 2026-10-09 (1220x2656, freeformScale 0.7):
-     *  - ROM's own geometry for a fresh launch (`getCustomFreeformRect`, `isNormalFreeForm=true`),
-     *    identical for our fan and for 安全中心's sidebar: 1220x1952 = 10:16 → the app is laid out
-     *    on a canvas that is NOT the phone's shape, so a fresh 抖音 came up looking 16:9;
-     *  - a REUSED task keeps its fullscreen config 1220x2656 (the phone) and is only scaled
-     *    (854x1859) — always the shape the user called correct.
-     * So state the display rect and let MIUI scale it: window = display x freeformScale, phone
-     * shaped, exactly what the reuse path shows. With a panel rect (更多 tile) the vertical
-     * extent of the panel is kept and the width follows from the phone ratio, so the app still
-     * opens where the panel sat (that part was correct).
+     * The rect a small window should have on a ROM with no MIUI geometry — the same 62% box as
+     * before, moved to the triggered side when the launch knows it (see [FreeformTrigger]).
      */
-    // NOTE (2026-10-09): a "make it phone-proportioned" override was tried here and reverted —
-    // backwards. User's measurement of what is correct: 小窗 ≈ 9:16 (what the sidebar and the
-    // ROM's own `getCustomFreeformRect` give), and the BROKEN case is the opposite one — an app
-    // that already has a task comes up with the PHONE's proportions (1220x2656 config scaled)
-    // instead of the小窗 rect. See [reusableTaskId] for that fix.
-
     private fun aospOptions(context: Context): ActivityOptions {
         val opts = ActivityOptions.makeBasic()
         val dm: DisplayMetrics = context.resources.displayMetrics
-        val bounds = position ?: Rect().also {
-            val w = (dm.widthPixels * 0.62f).toInt()
-            val h = (dm.heightPixels * 0.62f).toInt()
-            val cx = dm.widthPixels / 2
-            val cy = (dm.heightPixels * 0.45f).toInt()
-            it.set(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+        val screenW = trigger?.display?.width() ?: dm.widthPixels
+        val screenH = trigger?.display?.height() ?: dm.heightPixels
+        val w = (screenW * 0.62f).toInt()
+        val h = (screenH * 0.62f).toInt()
+        val bounds = Rect().also {
+            val left = trigger?.let { t -> triggerSideLeft(t.anchorX, w, screenW, 0) } ?: (screenW - w) / 2
+            val top = (screenH * 0.45f).toInt() - h / 2
+            it.set(left, top, left + w, top + h)
         }
         runCatching { opts.setLaunchBounds(bounds) }
         runCatching {
@@ -249,6 +245,17 @@ class FreeformLaunchStrategy(private val position: Rect? = null) : ILaunchStrate
         return opts
     }
 }
+
+/**
+ * Where a小窗 launch was triggered from: the point on screen the user swiped out of (the fan's
+ * corner) and the display as it was at that moment.
+ *
+ * It exists because the ROM places a小窗 on its own (in landscape that is always the same side —
+ * the 2026-10-11 report), and the only way to land it on the side the user actually used is to
+ * state the position in the launch options. The display is passed in rather than read here: it has
+ * to be the one the fan was laid out with, which is also the one the touch coordinates came from.
+ */
+data class FreeformTrigger(val anchorX: Int, val display: Rect)
 
 /** Reads the user's 小窗启动 toggle at launch time (flyme parity: every bubble
  *  launch carries `start_windowmode`; our fallback is honest fullscreen).

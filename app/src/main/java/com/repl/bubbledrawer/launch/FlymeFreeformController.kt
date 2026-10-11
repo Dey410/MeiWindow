@@ -2137,10 +2137,14 @@ class FlymeFreeformController(
                                 // The package this rect is being computed for is a plain String argument in
                                 // every overload (`getCustomFreeformRect(ctx, …, pkg, …)`), and it is what
                                 // tells the avoid pass whether it is looking at the very window it is placing.
+                                //
+                                // 落点被明确指定时（扇形从哪个角落划出来，见 `MiuiFreeform.triggerSideRect`）
+                                // 只补垂直方向：水平那一半是用户划出来的意图，居中不该把它抹掉。
                                 centerRectOnScreen(
                                     result,
                                     snap,
                                     selfPackage = packageOf(chain.args),
+                                    keepLeft = m.name == "getCustomFreeformRect" && requestedLeft(chain.args) != null,
                                 )
                             } else {
                                 logCenterSkip("${m.name}/${m.parameterCount}", snap)
@@ -2374,6 +2378,11 @@ class FlymeFreeformController(
          * off both screen edges. This is also the only place a directly-opened 横屏小窗 gets centered
          * at all: the ROM centers such a window horizontally (`getLeftMargin`) but pins it to the top
          * of the screen (`getTopMargin` returns 0 whenever the display itself is portrait).
+         *
+         * [keepLeft] is for the one caller that already knows where the window belongs horizontally:
+         * a扇形 launch states the side it was triggered from ([requestedLeft] sees it in the ROM's own
+         * arguments, `MiuiFreeform.triggerSideRect` computed it), and centering would silently undo it.
+         * The vertical placement is still ours — that is the part the ROM gets wrong in landscape.
          */
         private fun centerRectOnScreen(
             rect: Rect,
@@ -2382,6 +2391,7 @@ class FlymeFreeformController(
             selfTaskId: Int = 0,
             scaleOverride: Float? = null,
             armRestoreGuard: Boolean = false,
+            keepLeft: Boolean = false,
         ) {
             val targetScale = (snap.flymeFreeformScale.coerceIn(50, 95)) / 100f
             // **Which scale will the ROM multiply this rect by?** That is the whole question: the
@@ -2423,10 +2433,13 @@ class FlymeFreeformController(
                 return
             }
             val (targetLeft, targetTop) = centeredOrigin(visualW, visualH, screenW, screenH)
-            rect.offsetTo(targetLeft, targetTop)
+            // [keepLeft]: 水平落点由启动方给定（扇形触发侧），居中只负责垂直方向 —— 否则「小窗居中」
+            // 会在 ROM 按触发侧算完之后再把它搬回屏幕中间，用户看到的还是"哪边划出来都一样"。
+            rect.offsetTo(if (keepLeft) rect.left else targetLeft, targetTop)
             // 禁止小窗偏移 = 关: 把已经居中好的窗口再交给 ROM 的避让逻辑一次，第二个小窗因此落在
             // 「第一个的位置 + 右 78dp / 下 44dp」（方向选择与屏幕内夹取都由 ROM 自己决定）。
-            val avoided = if (!snap.flymeFreeformNoOffset) {
+            // 落点被明确指定时不参与：移开就不是用户划出来的那一边了。
+            val avoided = if (!snap.flymeFreeformNoOffset && !keepLeft) {
                 applyRomAvoidOffset(rect, visualW, visualH, selfPackage, selfTaskId)
             } else {
                 false
@@ -2441,6 +2454,7 @@ class FlymeFreeformController(
             log(
                 "CENTERED_BOUNDS rect=$rect scale=$scale src=${if (applied != null) "rom" else if (assumed != null) "assumed" else "setting"} " +
                     "applied=$applied assumed=$assumed targetScale=$targetScale avoided=$avoided " +
+                    "left=${if (keepLeft) "triggered" else "centered"} " +
                     "visual=(${visualW.toInt()}x${visualH.toInt()}) screen=($screenW x $screenH)",
             )
         }
@@ -2981,6 +2995,22 @@ class FlymeFreeformController(
             log("HOOK_INSTALLED_MiuiFreeformModeAnimation.startGestureAnimation")
         }
     }
+}
+
+/**
+ * Whether the caller of the ROM's rect function asked for a specific position: `getCustomFreeformRect`
+ * takes `(Context, int left, int top, …)` and answers with the ROM's own rect *pinned* there, while
+ * the sentinel [MiuiFreeform.POS_AUTO] means "you decide" (see `MiuiFreeform.customFreeformRect`).
+ *
+ * The module's 小窗居中 must not override a position that was asked for: the扇形 launch states the
+ * side the user swiped from, and a ROM launch that states one (安全中心's sidebar does) means it too.
+ * Returns the requested `left`, or null when the position is the ROM's business.
+ */
+fun requestedLeft(args: List<Any?>): Int? {
+    val left = args.getOrNull(1) as? Int ?: return null
+    val top = args.getOrNull(2) as? Int ?: return null
+    if (left == MiuiFreeform.POS_AUTO || top == MiuiFreeform.POS_AUTO) return null
+    return left
 }
 
 /**

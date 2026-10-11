@@ -33,6 +33,9 @@ class FreeformPlacementTest {
 
         /** The ROM's `original_ratio` (`MiuiFreeformLaunchConfig` ARGS_ORIGINAL_RATIO). */
         const val RATIO = 0.85f
+
+        /** `FREEFORM_SIDE_MARGIN_DP` in pixels at this display's density (6dp x 3.25). */
+        const val MARGIN = 20
     }
 
     /** Landscape task bounds: `shortSide * ratio` tall, `aspect` times wider than that. */
@@ -175,5 +178,92 @@ class FreeformPlacementTest {
         val (gx, gy) = centeredOrigin(portraitW * good, portraitH * good, DISPLAY_W, DISPLAY_H)
         assertEquals(DISPLAY_W / 2f, gx + portraitW * good / 2f, 1f)
         assertEquals(DISPLAY_H / 2f, gy + portraitH * good / 2f, 1f)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // 横屏落点跟触发侧 (2026-10-11: "不管在左侧触发还是右侧触发，小窗都会显示在左侧")
+    // ---------------------------------------------------------------------------------------------
+
+    /** 横屏的屏与窗：2656 x 1220 的屏，小窗可见宽 = 1220 x 0.7。 */
+    private val landScreenW = DISPLAY_H
+    private val landScreenH = DISPLAY_W
+    private val landVisualW = Math.round(DISPLAY_W * 0.70f)
+
+    @Test
+    fun theTwoCornersLandOnTheTwoSidesInsteadOfTheSameSpot() {
+        val left = triggerSideLeft(anchorX = 0, visualW = landVisualW, screenW = landScreenW, marginPx = MARGIN)
+        val right = triggerSideLeft(anchorX = landScreenW, visualW = landVisualW, screenW = landScreenW, marginPx = MARGIN)
+
+        // The report was exactly this: two different triggers, one identical place.
+        assertTrue("the two sides must differ", right - left > landScreenW / 2)
+        assertEquals("left corner hugs the left edge", MARGIN, left)
+        assertEquals("right corner is flush with the right edge", landScreenW - landVisualW - MARGIN, right)
+        // And both are fully on screen — the ROM clamps again, but never on our behalf.
+        assertTrue(left >= 0)
+        assertTrue(right + landVisualW <= landScreenW)
+    }
+
+    @Test
+    fun theHalfDecidesNotTheDistanceFromTheMiddle() {
+        val mid = landScreenW / 2
+        assertEquals(
+            "just inside the left half stays left",
+            MARGIN,
+            triggerSideLeft(mid - 1, landVisualW, landScreenW, MARGIN),
+        )
+        assertEquals(
+            "the first pixel of the right half goes right",
+            landScreenW - landVisualW - MARGIN,
+            triggerSideLeft(mid, landVisualW, landScreenW, MARGIN),
+        )
+    }
+
+    @Test
+    fun theVisibleWidthIsWhatHugsTheEdge() {
+        // The window is drawn at `unscaled x scale` while its position is the unscaled origin's:
+        // hugging with the unscaled width would leave a 30% gap at the right edge.
+        val unscaledHug = triggerSideLeft(landScreenW, DISPLAY_W, landScreenW, MARGIN)
+        val visualHug = triggerSideLeft(landScreenW, landVisualW, landScreenW, MARGIN)
+
+        assertEquals(landScreenW - DISPLAY_W - MARGIN, unscaledHug)
+        assertTrue("the gap the visible width exists to remove", visualHug - unscaledHug > DISPLAY_W / 4)
+    }
+
+    @Test
+    fun aWindowWiderThanTheScreenStillGetsAUsableAnswer() {
+        // No answer can put it in view (the ROM clamps the size, not us); it must at least stay
+        // inside the screen rather than hang off the left edge, which is what a negative would do.
+        val left = triggerSideLeft(0, landScreenW + 400, landScreenW, MARGIN)
+        val right = triggerSideLeft(landScreenW, landScreenW + 400, landScreenW, MARGIN)
+
+        assertEquals(MARGIN, left)
+        assertEquals(MARGIN, right)
+    }
+
+    @Test
+    fun portraitKeepsTheRomsOwnPlacement() {
+        // The trigger only takes over a screen that is wider than it is tall: in portrait the ROM
+        // centres (`getLeftMargin`) and that is the position the user has been using.
+        assertTrue("landscape is where the side is a question", isWideScreen(DISPLAY_H, DISPLAY_W))
+        assertTrue("portrait is the ROM's business", !isWideScreen(DISPLAY_W, DISPLAY_H))
+        assertTrue("a square screen is not landscape", !isWideScreen(DISPLAY_W, DISPLAY_W))
+    }
+
+    @Test
+    fun anAskedForPositionIsNotCenteredAway() {
+        // The fan's own launch states where the window goes; 小窗居中 must leave that half alone
+        // (it still owns the vertical placement). The sentinel is "ROM, you decide" — no request.
+        assertEquals(
+            1782,
+            requestedLeft(listOf("context", 1782, 107, true, "pkg", true)),
+        )
+        assertEquals(0, requestedLeft(listOf("context", 0, 107, true, "pkg", true)))
+        assertEquals(null, requestedLeft(listOf("context", MiuiFreeform.POS_AUTO, MiuiFreeform.POS_AUTO, true, "pkg", true)))
+        assertEquals(null, requestedLeft(listOf("context", 20, MiuiFreeform.POS_AUTO, true, "pkg", true)))
+
+        // Other shapes of the same family (or other methods entirely) must not be read as a request.
+        assertEquals(null, requestedLeft(listOf("context")))
+        assertEquals(null, requestedLeft(listOf("context", "not an int", 107, true, "pkg")))
+        assertEquals(null, requestedLeft(emptyList()))
     }
 }

@@ -382,8 +382,9 @@ OS3 上模块改为调用 ROM 自己的转换入口 `MiuiFreeformModeController.
 
 ## A17 分身应用（双开）的图标与角标
 做法：分身应用的**图本身永远取主空间那张** —— `AppRepository.mainSpaceIcon(pkg)`：先问
-`LauncherApps.getActivityList(pkg, user 0)`（桌面上画的那张，含自适应/主题图标），拿不到再退
-`PackageManager.getApplicationIcon`。分身用户只决定要不要在这张图上**叠角标**
+`PackageManager.getApplicationIcon(pkg)`（列表里 user 0 那条画的就是它，所以分身和旁边那条像素一致），
+拿不到再退 `LauncherApps.getActivityList(pkg, user 0)` 的 `getIcon(dpi)`（HyperOS 上它可能给主题/
+自适应变体，所以只当兜底）。分身用户只决定要不要在这张图上**叠角标**
 （`RemotePrefs.KEY_CLONE_BADGE`，设置页「扇形面板外观 → 分身角标」，默认开）：
 
 - XSpace（user 999）：先交给 MIUI 自己的 `XSpaceUserHandle.getXSpaceIcon(context, base)` ——
@@ -400,6 +401,40 @@ OS3 上模块改为调用 ROM 自己的转换入口 `MiuiFreeformModeController.
 - [ ] 主空间那个应用的图标不受影响（`CLONE_ICON` 只对 user≠0 打）
 - [ ] 日志：`adb logcat -s MeiWindow_AppRepo | findstr CLONE_ICON` → `badge=true src=main-space+badge`；
       SystemUI 侧另有 `PREFS_APPLIED … icon[cloneBadge=true]`
+
+## A18 横屏小窗落点跟触发侧（左角划出来就开在左边）
+现象（用户报告 2026-10-11）：**横屏**下不管从左角还是右角划出扇形，点开的小窗都在**左边**。
+
+成因：小窗位置一直是 ROM 自己定的 —— 启动走 `getActivityOptions(ctx, pkg, noCheck)`
+（内部 `getCustomFreeformRect(POS_AUTO, POS_AUTO)`，`POS_AUTO` = "你决定"）。横屏时 ROM 给的落点是
+固定的那一侧（设备实测：两次启动留下的 task 配置 `mBounds.left` 完全相同，都是 418）；竖屏看不出来
+是因为 ROM 自己把小窗横向居中，而竖屏小窗可见宽度占屏宽七成，左右本来就没多少区别。
+
+做法：把"用户从哪个角落划出来"作为落点交给 ROM 自己的那个入口 ——
+`getActivityOptions(ctx, pkg, true, left, top)`（5 参数重载，正是**安全中心侧边栏小窗**
+`FreeformUtil` 用的同一个方法：`AbstractC6721e0.m21966e`）。落点由 `triggerSideLeft()` 算，
+与 `getFreeformWindowPositionX` 同一套判断：触发点在屏幕左半边 → 贴左边（留 `FREEFORM_SIDE_MARGIN_DP`
+= 6dp，与 ROM 的「小窗可用区域」同宽），右半边 → 右边对齐。用的是**可见**宽度
+（`getVisualBounds(rect, getOriFreeformScale(ctx, pkg))`）：窗口位置是*未缩放*矩形的原点，画出来只有
+那个宽度的 `scale` 倍，用未缩放宽度去贴边会差一条缝。
+
+- 尺寸仍然**全部**来自 ROM（`getCustomFreeformRect`，模块只挪位置）—— 2026-10-09 的裁定没变：
+  扇形和更多面板打开的小窗必须是同一个形状；
+- 只在**横屏**接管（`isWideScreen`）：竖屏 ROM 自己居中，那是用户一直在用的位置；
+- Flyme 样式小窗 + 小窗居中开着时，居中 hook 会在 ROM 算完之后重摆窗口 —— 现在它**只补垂直方向**
+  （`CENTERED_BOUNDS … left=triggered`），水平那一半是用户划出来的意图，不再被抹掉；
+- 更多面板里点应用走同一个 `freeformTrigger()`，落点一致。
+
+- [ ] 横屏：左角划出 → 点应用 → 小窗**在左边**；右角划出 → 点应用 → 小窗**在右边**（两个位置相差半屏以上）
+- [ ] 同一个应用先从左边开、关掉再从右边开：位置跟着走（不是被记住的旧位置）
+- [ ] 竖屏行为**不变**：还是 ROM 自己的居中位置
+- [ ] 更多面板里点应用：落点与扇形里点一致（面板本身仍然居中）
+- [ ] 日志：`adb logcat -s BubbleDrawer | findstr LAUNCH_OPTS` →
+      `screen=2656x1220 trigger=FreeformTrigger(anchorX=2656, display=Rect(0, 0 - 2656, 1220)) bounds=Rect(1916, …`
+      （右角；左角是 `anchorX=0`，`bounds` 的 left 是 20 —— ROM 会把它再夹到 150，那是横屏那一侧的
+      挖孔/应用区 inset，属于正常）
+- [ ] 竖屏日志里 `bounds=Rect(183, 289 - 1403, 2241)`（ROM 的居中落点，模块没插手）
+- [ ] 关掉 Flyme 样式小窗总开关后行为一致（落点与总开关无关）
 
 ## 贴边模式（可选，root）
 - [ ] 设置页"贴边模式"：无 su → toast 需要 root；有 su → inset=0，正上滑角落也能出扇

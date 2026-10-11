@@ -42,6 +42,7 @@ import com.repl.bubbledrawer.data.PrefsPinBackend
 import com.repl.bubbledrawer.gesture.Corner
 import com.repl.bubbledrawer.gesture.SpySide
 import com.repl.bubbledrawer.launch.FreeformLaunchStrategy
+import com.repl.bubbledrawer.launch.FreeformTrigger
 import com.repl.bubbledrawer.launch.FullscreenLaunchStrategy
 import com.repl.bubbledrawer.launch.ILaunchStrategy
 import com.repl.bubbledrawer.pin.PanelContentFactory
@@ -231,7 +232,20 @@ class FanHost(
     private val strategy = ILaunchStrategy { ctx, app ->
         // freeform toggle from the same prefs the monitor watches (remote group)
         val snap = RemotePrefs.read(prefs)
-        (if (snap.freeform) FreeformLaunchStrategy() else FullscreenLaunchStrategy()).launch(ctx, app)
+        (if (snap.freeform) FreeformLaunchStrategy(freeformTrigger()) else FullscreenLaunchStrategy()).launch(ctx, app)
+    }
+
+    /**
+     * 小窗要落在用户划出扇形的**那一边** (用户 2026-10-11：横屏从哪个角落划出来，小窗都在左边)。
+     *
+     * 这里只给一个点：左下角 = 屏幕左端，右下角 = 右端 —— [FreeformLaunchStrategy] 再把它换算成
+     * 小窗的落点 (`MiuiFreeform.triggerSideRect`)。屏幕一并交出去，因为要用的必须是**扇形当时**
+     * 那一块屏：它既决定了横竖屏（只有横屏才需要跟边），也是触控坐标的来源。
+     */
+    private fun freeformTrigger(): FreeformTrigger {
+        val display = Rect(wm.currentWindowMetrics.bounds)
+        val anchorX = if (currentCorner() == Corner.BOTTOM_RIGHT) display.width() else 0
+        return FreeformTrigger(anchorX, display)
     }
 
     /** Tile factory — the verbatim slide_gesture_list_item structure built in
@@ -920,7 +934,7 @@ class FanHost(
         hideMorePanel(animated = false)
         val snap = RemotePrefs.read(prefs)
         val strategy: ILaunchStrategy =
-            if (snap.freeform) FreeformLaunchStrategy() else FullscreenLaunchStrategy()
+            if (snap.freeform) FreeformLaunchStrategy(freeformTrigger()) else FullscreenLaunchStrategy()
         val ok = runCatching { strategy.launch(context, app) }.getOrDefault(false)
         LaunchCountStore.increment(context, app.packageName, app.userId)
         com.repl.bubbledrawer.data.predict.AppPredictor.recordLaunch(context, app.packageName, app.userId)
