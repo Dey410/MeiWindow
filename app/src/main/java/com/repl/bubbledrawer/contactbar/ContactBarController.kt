@@ -130,6 +130,17 @@ class ContactBarController(
         onMain { mainChoreographer = Choreographer.getInstance() }
         // 窗口一动就切回逐帧跟随（ROM 的 `startGestureAnimation` hook 转发，见 [onFreeformWindowMotion]）。
         onFreeformWindowMotion = { onMain { kick() } }
+        // 通知栏一拉开就让开、收起来再回来（见 [ShadeState]：系统窗口里没有比窗帘更低的一层）。
+        ShadeState.onChanged = { expanded ->
+            onMain {
+                if (expanded) {
+                    detach("SHADE")
+                } else {
+                    hideReason = null
+                    scheduleFrame()
+                }
+            }
+        }
         RecentConversations.onChanged = {
             onMain {
                 // Capture first, then render: HyperOS cancels an app's notifications the moment the
@@ -340,6 +351,12 @@ class ContactBarController(
     private fun onFrame() {
         if (!enabled()) {
             if (added) detach("DISABLED")
+            return
+        }
+        // 通知栏拉开了：条会让开，否则它压在通知上面（用户 2026-10-12 的报告）。
+        // 事件回调是主路径，这一句是"回调没装上/漏了一次"时的兜底。
+        if (ShadeState.isExpanded()) {
+            detach("SHADE")
             return
         }
         val info = task ?: return
@@ -781,6 +798,7 @@ class ContactBarController(
     fun dispose() = onMain {
         runCatching { prefs.unregisterOnSharedPreferenceChangeListener(prefsListener) }
         if (RecentConversations.onChanged != null) RecentConversations.onChanged = null
+        ShadeState.onChanged = null
         main.removeCallbacks(idleTick)
         idleScheduled = false
         onFreeformWindowMotion = null

@@ -436,25 +436,29 @@ OS3 上模块改为调用 ROM 自己的转换入口 `MiuiFreeformModeController.
 - [ ] 竖屏日志里 `bounds=Rect(183, 289 - 1403, 2241)`（ROM 的居中落点，模块没插手）
 - [ ] 关掉 Flyme 样式小窗总开关后行为一致（落点与总开关无关）
 
-## A19 联系人条：一个联系人只占一条（不再出现几张一样的头像）
-现象（用户反馈）：联系人条里可能出现几个一样的联系人图标。
+## A19 联系人条：一个会话只占一条，群通知显示群名
+现象（用户反馈 + 用户复现）：联系人条里可能出现几个一样的联系人图标。2026-10-12 的复现是
+`YuKongA | Chat：Perlinkca` 与 `YuKongA | Chat：Yife Playte` 两条 —— 同一个群里的两个人。
 
-成因（设备日志里的真实标题）：群消息的标题是 `群名：发送者`，而通知带的大图标是**发送者的头像** ——
-日志里的 `StarVoyager Ideal：ksm`、`YuGongA | Chat：Who care`、`geymelody：平沢 憂` 全是这个形状。
-同一个人在几个群里说话，条上就是几张一模一样的脸。会话的身份（标题）认不出人，头像才能。
+成因：群通知的标题是 `群名：发送者`（设备日志实例：`StarVoyager Ideal：ksm`、`YuKongA | Chat：Perlinkca`），
+而名字列只有 **45dp**，两条都截成 `YuKongA | Chat` —— 看着就是"两条重复的联系人"。
+（更早还试过按头像指纹认人，那条规则正好相反：它会把同一个人的几个群并成一条，已按用户裁定撤掉。）
 
-做法：给每张头像算一个 **16x16、每通道 4 位**的指纹（`avatarPrint`）—— 头像本身不能当 key（每次通知
-都是新的 Bitmap 对象），指纹可以；同一个人（`printsMatch`：平均差小于一个量化级，且差得明显的通道
-不超过 1/8）只留**最新**的那条（同一毫秒时留在通知栏里的那条胜，它才带红点）。没有头像的条目画的是
-应用图标，所以它们仍然只按标题去重 —— 认头像会把所有这样的人并成一条。划掉一条 = 划掉**这个人**
-（`forget` 连他在别的群里的那几条一起划掉），否则下一次重建会把同一张脸摆回来。
+做法（用户裁定原话「**群通知应该用群名啊**」）：条上的身份 = **会话名** ——
+`MessagingStyle.conversationTitle`（权威）→ `EXTRA_CONVERSATION_TITLE`（@hide，用字面量）→ 标题里
+`群名：发送者` 的**前半段**（`conversationName()`）。按会话名去重、按会话名显示（`dedupeByConversation`）。
+同一个群里两个人说话 = 同一个会话名 → 一条；同一个人在两个群里说话 = 两个会话名 → 两条。
+头像仍然取那位发送者的（`MessagingStyle` 里最后一条不是自己的消息的 `Person.getIcon()`，
+Telegram 的聊天通知不带大图标，只认 `getLargeIcon` 的话条上只能画应用图标）。
+`extractMessagingStyleFromNotification` 是 @hide，走反射（缓存一次）。
 
-- [ ] 开一个微信/QQ/Telegram 小窗 → 条上头像互不重复；同一个人在两三个群里说话只出现一次
-- [ ] 日志 `CONTACT_BAR_LIST pkg=… n=N live=M 标题#p* | …`：`#p` = 这条有指纹（能参与认人）、
-      `*` = 还在通知栏里；同一个人的几条只剩一条
-- [ ] 合并且确实发生时有 `CONTACT_BAR_MERGED pkg=… conversations=3 people=2 keep=…`
-- [ ] 划掉某个人的头像 → 他在别的群里的那条也一起消失，不会立刻回来
-- [ ] 新消息到达后（更晚的 `postTime`）同一个人能重新出现
+- [ ] 开一个 Telegram/微信/QQ 小窗 → 同一个群的几条消息只占一条，显示**群名**
+- [ ] 同一个人在两个群里说话 → **两条**（各显示自己的群名），不再"并成一条"
+- [ ] 1:1 会话显示对方的名字（标题里没有分隔符 → 整个标题就是会话名）
+- [ ] 日志 `CONTACT_BAR_LIST pkg=… n=N live=M 会话名* | …`（`*` = 还在通知栏里）；
+      合并发生时有 `CONTACT_BAR_MERGED pkg=… notifications=3 conversations=2 keep=…`
+- [ ] 划掉一条 → 该会话的其它标题也一起消失（`forget` 按 `conversationName` 扫），不会立刻回来
+- [ ] 新消息到达后（更晚的 `postTime`）能重新出现
 
 白名单里补了 Telegram（`org.telegram.messenger`）：它发的就是标准 MessagingStyle 聊天通知，群消息标题
 正是 `群名：发送者` —— 也就是这条反馈的形状，而模块作者日常只用它（不在白名单里，这个功能在本机上
@@ -473,6 +477,28 @@ reason=NO_CONTACTS` 一直重复，看起来像"功能没做"）。
 - [ ] `adb install -r` 之后：日志里有 `CONTACT_BAR_NOTIF_LISTENER_ATTACHED`，且它和
       `CONTACT_BAR_HOOKS_INSTALLED pipeline=true` 的线程号等于该进程的主线程号
 - [ ] 随后条上仍能出新消息（不是只有重启系统界面之后才行）
+
+### 联系人条与通知栏：窗帘拉开时让开（用户 2026-10-12）
+现象：下拉通知栏之后，联系人条叠在通知上面。
+
+为什么不是"把图层调低"：条的窗口类型是 2024（`TYPE_NAVIGATION_BAR_PANEL`），通知栏是
+`TYPE_STATUS_BAR`（2000）—— 而**系统窗口类型全部 ≥ 2000**（`FIRST_SYSTEM_WINDOW`），
+系统窗口里没有比通知栏更低的一层（唯一在下面的壁纸是特例），要更低只能用应用窗口（类型 1..99），
+那需要 activity/window token，模块没有。所以做成等价效果：**窗帘一拉开条就让开，收起来再回来**
+（窗帘是半透明的，真压下去反而会透出来）。
+
+信号来自 ROM 自己的展开监听：`com.android.systemui.shade.ShadeExpansionStateManager`
+（设备 dex 实测存在）+ `addExpansionListener`。监听器接口**从方法签名里取**
+（`add.parameterTypes[0]`，设备实测是顶层 `com.android.systemui.shade.ShadeExpansionListener`；
+用模块自己的 classloader `Class.forName` 会 ClassNotFoundException），实例是动态代理，
+展开比例读事件字段 `fraction`（字段反射，换 ROM 最坏情况是回调不触发 → 退回今天的行为）。
+拉开超过 1/3 屏（`EXPANDED_FRACTION`）才让开：小幅下拉只露屏幕顶部，不会盖住贴在窗口下沿的条。
+
+- [ ] 开着聊天小窗 → 下拉通知栏：条**消失**（日志 `CONTACT_BAR_HIDE reason=SHADE`）
+- [ ] 收起通知栏：条回来（日志 `CONTACT_BAR_SHOW …`）
+- [ ] 只轻轻下拉一点（不到 1/3）：条不动、不闪
+- [ ] 日志 `SHADE_STATE_HOOKS_INSTALLED manager=true` + `SHADE_STATE_LISTENER_ATTACHED
+      iface=com.android.systemui.shade.ShadeExpansionListener`（`adb install -r` 之后也要有）
 
 ## A20 小窗落点：横方向居中/触发侧，竖方向正中 + 上下滑杆
 用户 2026-10-11 的决定（原话）：「**竖屏时始终居中，横屏依旧按你的在那边打开就在哪边显示的逻辑**」、

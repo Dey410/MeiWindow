@@ -118,7 +118,8 @@ class ContactBarView(context: Context) : FrameLayout(context) {
         val dot = item.findViewById<View>(DOT_ID)
 
         avatar.setImageDrawable(conversation.icon?.takeIf { it.usable() } ?: fallback)
-        name.text = conversation.title
+        // 显示的是**人**（群消息的标题是 `群名：发送者`，45dp 的名字列只够放人名 —— 见 `Conversation.label`）
+        name.text = conversation.displayLabel
         name.setTextColor(nameColor())
         // Flyme hides the red dot once the notification behind the row is gone; our memory keeps the
         // row but the dot only shows while a notification is actually posted.
@@ -126,7 +127,10 @@ class ContactBarView(context: Context) : FrameLayout(context) {
 
         item.translationY = 0f
         item.alpha = 1f
-        item.contentDescription = conversation.title
+        // 无障碍读出来的也该是人和出处（`群名：人`），而不是只有被截断的那半截。
+        item.contentDescription =
+            if (conversation.displayLabel == conversation.title) conversation.title
+            else "${conversation.displayLabel}（${conversation.title}）"
         item.setOnTouchListener(SwipeTouchListener(item, onClick, onRemove, conversation))
     }
 
