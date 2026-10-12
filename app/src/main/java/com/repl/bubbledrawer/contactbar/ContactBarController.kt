@@ -620,7 +620,11 @@ class ContactBarController(
 
     /** Flyme falls back to the app icon when a notification carries no avatar. */
     private fun fallbackIcon() = runCatching {
-        host.packageManager.getApplicationIcon(currentPkg ?: return@runCatching null)
+        // 这张图同样必须复制（[ownIconCopy]）：`getApplicationIcon` 给的是 **ROM 图标缓存**里那张，
+        // HyperOS 会在自己的时机回收它 —— 直接交给 ImageView 就是
+        // `Canvas: trying to use a recycled bitmap`（`SlideIconView` 的注释里记着同一件事）。
+        val pkg = currentPkg ?: return@runCatching null
+        ownIconCopy(host, host.packageManager.getApplicationIcon(pkg))
     }.getOrNull()
 
     // ---------------------------------------------------------------- tap → conversation

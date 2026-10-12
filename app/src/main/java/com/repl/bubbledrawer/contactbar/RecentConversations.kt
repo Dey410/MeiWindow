@@ -18,8 +18,8 @@ import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
 import java.lang.reflect.Proxy
 
-/** 联系人头像的落地尺寸：小窗里是 36dp，520dpi 下 ≈117px，留足余量。 */
-private const val AVATAR_PX = 144
+/** 头像/图标自有副本的落地尺寸：小窗里是 36dp，520dpi 下 ≈117px，留足余量。 */
+const val AVATAR_PX = 144
 
 /** One recent conversation, rebuilt from a posted notification (Flyme's `C0653b` analogue). */
 data class Conversation(
@@ -358,6 +358,9 @@ class RecentConversations(
             cachedIcons[key] = ownAvatar(raw)
             // 指纹只从**通知真的带了头像**时取：没有头像的条目画的是应用图标，认它会把所有人并成一个。
             cachedPrints[key] = cachedIcons[key]?.let { printOf(it) }
+            // 带了头像却复制不出来 = 那张图交到我们手上时已经坏了（ROM 回收了它）。条上会退回应用图标，
+            // 但要留一行证据 —— 否则"这个人怎么没头像"永远查不出原因。
+            if (raw != null && cachedIcons[key] == null) logIconCopyFailed(pkg, key)
         }
         return Conversation(
             pkg = pkg,
@@ -394,50 +397,25 @@ class RecentConversations(
         avatarPrint(pixels, side)
     }.getOrNull()
 
+    /** The avatar we keep — see [ownIconCopy] for why it is a copy and never the source. */
+    private fun ownAvatar(source: Drawable?): Drawable? = ownIconCopy(context, source)
+
     /**
-     * The avatar we keep: a copy in a bitmap of our own.
-     *
-     * `Icon.loadDrawable()` answers with a `BitmapDrawable` that wraps the notification's bitmap **by
-     * reference**, and this class keeps conversations (avatar included) for up to [TTL_MS]. A bitmap
-     * owned by the notification pipeline / an icon cache can be recycled by whoever owns it — HyperOS
-     * does exactly that in its media stack (`Canvas: trying to use a recycled bitmap` inside
-     * `BitmapDrawable.draw`) — and drawing a foreign bitmap through a `BitmapShader` (what
-     * `CircleImageView` does) is just as fatal in our bar. Drawing it once into a small bitmap of ours
-     * removes the whole class of failure, and it also shrinks what we retain: a聊天头像是 512×512,
-     * our copy is [AVATAR_PX]².
+     * 头像复制失败的证据（见 `toConversation`）：这行出现说明**通知带的那张图在交给我们时就已经坏了**
+     * —— ROM 回收了它（图标缓存/媒体栈的常规行为）。条上退回应用图标，但原因从此可查。
      */
-    private fun ownAvatar(source: Drawable?): Drawable? {
-        source ?: return null
-        // Already dead when handed to us: nothing to copy, and the view must not see it.
-        if (source is BitmapDrawable && source.bitmap.isRecycled) return null
-        return runCatching {
-            val bitmap = Bitmap.createBitmap(AVATAR_PX, AVATAR_PX, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(bitmap)
-            val src = source as? BitmapDrawable
-            if (src != null) {
-                // Center-crop like the `CircleImageView` would have (CENTER_CROP of a non-square
-                // avatar must not turn into a stretch).
-                val bmp = src.bitmap
-                val side = minOf(bmp.width, bmp.height)
-                val left = (bmp.width - side) / 2
-                val top = (bmp.height - side) / 2
-                canvas.drawBitmap(
-                    bmp,
-                    Rect(left, top, left + side, top + side),
-                    Rect(0, 0, AVATAR_PX, AVATAR_PX),
-                    Paint(Paint.FILTER_BITMAP_FLAG),
-                )
-            } else {
-                source.setBounds(0, 0, AVATAR_PX, AVATAR_PX)
-                source.draw(canvas)
-            }
-            BitmapDrawable(context.resources, bitmap)
-        }.getOrElse { source }
+    private fun logIconCopyFailed(pkg: String, key: String) {
+        val line = "CONTACT_BAR_ICON_COPY_FAILED pkg=$pkg key=$key"
+        if (line == lastIconCopyFailed) return
+        lastIconCopyFailed = line
+        log(Log.WARN, line, null)
     }
 
+    @Volatile
+    private var lastIconCopyFailed: String? = null
+
     /** The notification's user, for `startActivityAsUser` (reflection: `getUserId`/`getUser` are hidden). */
-    private fun notificationUserId(sbn: StatusBarNotification): Int {        runCatching {
-            (sbn.javaClass.getMethod("getUserId").invoke(sbn) as? Number)?.let { return it.toInt() }
+    private fun notificationUserId(sbn: StatusBarNotification): Int {        runCatching {            (sbn.javaClass.getMethod("getUserId").invoke(sbn) as? Number)?.let { return it.toInt() }
         }
         runCatching {
             val user = sbn.javaClass.getMethod("getUser").invoke(sbn) ?: return@runCatching
@@ -768,8 +746,52 @@ class RecentConversations(
 // 一个联系人只占一条（纯算术，见 `ConversationDedupeTest`）
 // ---------------------------------------------------------------------------------------------
 
-/** 指纹的分辨率：16x16 足够认人，又小到可以逐字节比对。 */
+/** 头像指纹的分辨率：16x16 足够认人，又小到可以逐字节比对。 */
 const val AVATAR_PRINT_SIDE = 16
+
+/**
+ * 头像/图标的**自有副本**：把 [source] 画进一张我们自己的 [px]×[px] 位图。
+ *
+ * 为什么必须复制，而不是把 [source] 直接交给 View：
+ *  - `Icon.loadDrawable()` 给的 `BitmapDrawable` 是**按引用**包着通知里的那张位图，而本类会把它
+ *    留在记忆里十几个小时（[RecentConversations] 的 TTL）；
+ *  - 图标/封面位图的主人是 ROM —— 图标缓存、通知管线、媒体栈都会在自己的时机 `recycle()` 它们
+ *    （`SlideIconView.toBitmap` 的注释里记着同一件事），而画面里还有引用；
+ *  - 于是绘制那一刻就是 `Canvas: trying to use a recycled bitmap`，而且是在**画**的时候崩，
+ *    堆栈里只有 `BitmapDrawable.draw`（`ContactBarView` 里那张 2026-10-09 的 wrong-thread 崩溃
+ *    旁边就是这么一串）。经 `BitmapShader`（`CircleImageView`）画一张外来位图同样致命。
+ *
+ * 复制失败时返回 **null**（绝不回退成 [source]）：调用方会用备用图标，而"拷贝失败"最常见的原因
+ * 正是那张图已经不完整了 —— 把它交出去就是把崩溃从这一帧推迟到下一帧。
+ */
+fun ownIconCopy(context: Context, source: Drawable?, px: Int = AVATAR_PX): Drawable? {
+    source ?: return null
+    // Already dead when handed to us: nothing to copy, and the view must not see it.
+    if (source is BitmapDrawable && source.bitmap.isRecycled) return null
+    return runCatching {
+        val bitmap = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val src = source as? BitmapDrawable
+        if (src != null) {
+            // Center-crop like the `CircleImageView` would have (CENTER_CROP of a non-square
+            // avatar must not turn into a stretch).
+            val bmp = src.bitmap
+            val side = minOf(bmp.width, bmp.height)
+            val left = (bmp.width - side) / 2
+            val top = (bmp.height - side) / 2
+            canvas.drawBitmap(
+                bmp,
+                Rect(left, top, left + side, top + side),
+                Rect(0, 0, px, px),
+                Paint(Paint.FILTER_BITMAP_FLAG),
+            )
+        } else {
+            source.setBounds(0, 0, px, px)
+            source.draw(canvas)
+        }
+        BitmapDrawable(context.resources, bitmap)
+    }.getOrNull()
+}
 
 /**
  * 通知 key（`userId|pkg|id|tag|uid`）里白名单聊天应用的那个包名，没有就返回 null。

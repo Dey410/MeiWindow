@@ -205,8 +205,12 @@ class ContactBarView(context: Context) : FrameLayout(context) {
      * A `BitmapDrawable` whose bitmap has been recycled must never reach the view: drawing it throws
      * `Canvas: trying to use a recycled bitmap` (that is a real HyperOS fault — it happens inside
      * `BitmapDrawable.draw` when a crossfade keeps drawing artwork the ROM recycled). Our avatars are
-     * copies we own (see [RecentConversations.ownAvatar]), this is the belt-and-braces check for the
-     * fallback icon and for anything an icon cache hands us.
+     * copies we own (see [ownIconCopy]), the fallback icon is copied too ([ContactBarController]), so
+     * this is the belt-and-braces check.
+     *
+     * 它只认**顶层**的 `BitmapDrawable` —— 一个包着死位图的 `TransitionDrawable` / `LayerDrawable`
+     * 是查不出来的（那正是 2026-10-12 那次 SystemUI 崩溃的形态：`TransitionDrawable.draw` 里画一张
+     * 已回收的封面图）。所以真正的规矩不是"检查再交出去"，而是**永远不把外来 drawable 交给 View**。
      */
     private fun Drawable.usable(): Boolean = !(this is BitmapDrawable && bitmap.isRecycled)
 
