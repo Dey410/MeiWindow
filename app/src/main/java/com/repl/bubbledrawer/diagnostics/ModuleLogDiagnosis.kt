@@ -736,9 +736,22 @@ object ModuleLogDiagnosis {
         if (down != null) {
             val mode = Regex("mode=(\\S+)").find(down)?.groupValues?.get(1)
             val lat = Regex("lat=(-?\\d+)").find(down)?.groupValues?.get(1)?.toIntOrNull()
+            val recv = Regex("recv=(-?\\d+)").find(down)?.groupValues?.get(1)?.toIntOrNull()
+            val pil = Regex("pil=(-?\\d+)").find(down)?.groupValues?.get(1)?.toIntOrNull()
             val ime = Regex("ime=(\\d+)px").find(down)?.groupValues?.get(1)?.toIntOrNull()
             val observe = mode != null && mode != "pre-own"
             val slow = lat != null && lat > SLOW_PREOWN_MS
+            // 慢在哪一段：recv = dispatcher 投递到模块线程，pil = 模块自己的处理 + binder pilferPointers。
+            // 这个拆分是 2026-10-12 那次排查的关键（用户报「时灵时不灵」）：那次是 recv 大 ——
+            // 看门狗每 250ms 在输入线程上做两次 binder 调用，正好把偶尔一笔 DOWN 顶到 15ms。
+            val blame = when {
+                recv == null || pil == null -> ""
+                recv >= pil && recv > SLOW_PREOWN_MS / 2 ->
+                    "；慢在投递（${recv}ms）：模块的输入线程或系统当时忙"
+                pil > recv && pil > SLOW_PREOWN_MS / 2 ->
+                    "；慢在处理（${pil}ms）：抢指针流那一步本身慢了"
+                else -> ""
+            }
             add(
                 DiagnosisCheck(
                     id = "gesture.preown",
@@ -758,11 +771,12 @@ object ModuleLogDiagnosis {
                         observe ->
                             "只观察、没有抢：这一笔系统可以同时执行回桌面（扇面和桌面会一起出现）"
                         slow ->
-                            "抢下了，但触摸到抢占用时 ${lat}ms，偏慢（超过 ${SLOW_PREOWN_MS}ms 就有被 launcher 抢先的风险）"
+                            "抢下了，但触摸到抢占用时 ${lat}ms（投递 ${recv}ms + 处理 ${pil}ms），" +
+                                "偏慢（超过 ${SLOW_PREOWN_MS}ms 就有被 launcher 抢先的风险）$blame"
                         lat == null ->
                             "抢下了指针流（这一版还没记录用时）"
                         else ->
-                            "按下的 ${lat}ms 内抢下了指针流，够快"
+                            "按下的 ${lat}ms 内抢下了指针流，够快（投递 ${recv}ms + 处理 ${pil}ms）"
                     },
                     evidence = trimPrefix(down),
                 ),
@@ -775,6 +789,33 @@ object ModuleLogDiagnosis {
                     title = "最近一次角落按下有没有抢下指针流",
                     status = CheckStatus.INFO,
                     detail = "日志里还没有角落手势的记录（先划一次左右下角再看）",
+                ),
+            )
+        }
+
+        // 时延分布：单看"最近一笔"会被运气误导（一笔 15ms 可能只是恰好撞上系统忙），
+        // `MON_LAT n=… p50=… p90=… max=… slow(>8ms)=…` 是模块每 20 笔打一次的汇总。
+        val latSummary = lines.lastOrNull { it.contains("MON_LAT ") }
+        val latSlow = lines.lastOrNull { it.contains("MON_LAT_SLOW") }
+        val latLine = latSummary ?: latSlow
+        if (latLine != null) {
+            val slowCount = Regex("slow\\(>\\d+ms\\)=(\\d+)").find(latLine)?.groupValues?.get(1)?.toIntOrNull()
+            val p90 = Regex("p90=(\\d+)").find(latLine)?.groupValues?.get(1)?.toIntOrNull()
+            val max = Regex("max=(\\d+)").find(latLine)?.groupValues?.get(1)?.toIntOrNull()
+            val bad = (slowCount ?: 0) > 0
+            add(
+                DiagnosisCheck(
+                    id = "gesture.latency",
+                    group = CheckGroup.GESTURE,
+                    title = "角落按下的时延分布（抢指针流的余量）",
+                    status = if (bad) CheckStatus.WARN else CheckStatus.PASS,
+                    detail = if (bad) {
+                        "有 ${slowCount} 笔超过 ${SLOW_PREOWN_MS}ms（最好与最差差得多，就是用户说的「时灵时不灵」）；" +
+                            "p90=${p90}ms max=${max}ms —— 慢的那几笔看 `MON_LAT_SLOW` 的 recv/pil 拆分"
+                    } else {
+                        "全部都在 ${SLOW_PREOWN_MS}ms 以内：p90=${p90}ms max=${max}ms，抢指针流的余量充足"
+                    },
+                    evidence = trimPrefix(latLine),
                 ),
             )
         }

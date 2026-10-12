@@ -540,6 +540,40 @@ HyperOS 的这两个面板不是同一个窗口，靠"识别面板再躲"永远�
 3. **头像缓存无上限**：144×144 ARGB ≈ 83KB/条，以前只增不减。现在超过 40 条时只保留还有记忆引用的。
 4. **一次设置写入跑二十来遍 `applySettings`**（prefs 是逐 key 回调的）：合并成主线程上一轮
    （`scheduleApplySettings`），同一毫秒里二十行 `PREFS_APPLIED` 不会再出现。
+
+## A22 角落手势「时灵时不灵」：时延拆成 recv/pil，看门狗搬离输入线程
+用户 2026-10-12 反馈：**边角屏蔽手势时灵时不灵**，并提供了诊断日志。那一份里唯一的异常是
+
+```
+MON_DOWN side=RIGHT x=1307.0 y=3199.0 box=193.0 band=true ime=0px mode=pre-own lat=15 cur=1440x3200 …
+```
+
+`lat=15` = 手指按下到抢下指针流用了 15ms，而 MiuiHome 的原生识别器约 **8ms** 就认下 HOME、
+设备实测正常一笔是 **~2ms** —— 超出的那 13ms 就是被抢的原因。
+
+**成因（已定位并修掉）**：看门狗 `stateWatchdog` 当时**排在输入线程的 Looper 上**，每 250ms 跑一次，
+每次 `refreshState()` 两次 binder 往返（`PowerManager.isInteractive` / `KeyguardManager.isKeyguardLocked`）。
+Looper 要等当前消息跑完才会回到 `epoll_wait`，而输入通道的 fd 回调排在消息**后面** —— 手指正好落在这
+几毫秒里，DOWN 就要排队。所以它"大多数时候 2ms、偶尔 15ms"：正是「时灵时不灵」。
+（同一个类别的坑这个功能踩过两次：输入接收器早就从主线程搬到了自己的线程，看门狗被落下了。）
+
+改动：
+- 看门狗搬到**自己的线程** `bubbledrawer-corner-state`（`THREAD_PRIORITY_BACKGROUND`，懒建、随传输一起
+  销毁）。输入线程上**只许有输入回调**，这条规矩写在 `startMonitorTransport` 的注释里。
+- 时延**拆成两段**并留证：`MON_DOWN … lat=N recv=R pil=P` —— `recv` = dispatcher 投递到模块线程
+  （大了说明我们的 Looper 被挡 / 系统忙），`pil` = 我们的处理 + binder `pilferPointers`（大了说明是我们
+  自己慢）。`onMonitorEvent` 的第一行语句就是取 `recv` 的基准时刻。
+- 新增 `LatencyStats`（纯算术、有单测）：每笔都记，**超过 8ms 立刻打 `MON_LAT_SLOW`**（带 recv/pil 拆分），
+  每 20 笔打一行 `MON_LAT n=… p50=… p90=… max=… slow(>8ms)=…` 汇总。
+- 诊断报告新增一项「角落按下的时延分布」，并把 `recv`/`pil` 的归因直接写在"最近一次角落按下"里 ——
+  下次用户报告不用再猜是投递慢还是处理慢。
+- `MON_STATE_THREAD name=… input=…`：一眼确认两个线程是分开的。
+
+- [ ] 日志里 `MON_STATE_THREAD`：`name=bubbledrawer-corner-state`、`input=bubbledrawer-corner-input`（不同线程）
+- [ ] 划二十来次左右下角 → `MON_LAT p90=` 应在 2~4ms、`slow(>8ms)=0`
+- [ ] 若仍偶发：看那一笔 `MON_LAT_SLOW` 的 `recv`/`pil` —— `recv` 大 = 系统忙/投递慢（模块无法再优化），
+      `pil` 大 = 抢指针流那一步慢（binder 到 system_server）
+- [ ] 扇面照旧在角落滑出，系统不跟着回桌面（`MON_STROKE_END … claimed=true robbedAt=0`）
    顺带：同一个 pass 里 `NOT_IM_APP` + `NO_CONTACTS` 两行隐藏日志，现在只留信息量大的那一条。
 
 - [ ] 开一个**非**聊天应用的小窗（浏览器等）静止放置：不再每帧刷 `CONTACT_BAR_HIDE`

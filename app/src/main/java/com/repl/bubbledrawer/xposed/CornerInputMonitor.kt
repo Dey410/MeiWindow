@@ -188,7 +188,9 @@ class CornerInputMonitor(
     /** Returns true only if the display is interactive and the keyguard is NOT locked. */
     private fun isUnlockedAndInteractive(): Boolean = deviceInteractive && !keyguardLocked
 
-    /** Power/keyguard snapshot — binder calls, so it runs on the watchdog, never on a DOWN. */
+    /**
+     * 电源/锁屏状态快照 —— 两次 binder 调用，所以它**只能**跑在看门狗线程上，永远不许出现在 DOWN 路径里。
+     */
     private fun refreshState() {
         deviceInteractive = runCatching { powerManager?.isInteractive != false }.getOrDefault(true)
         keyguardLocked = runCatching { keyguardManager?.isKeyguardLocked == true }.getOrDefault(false)
@@ -364,6 +366,13 @@ class CornerInputMonitor(
     private var inputThread: HandlerThread? = null
     private var inputHandler: Handler? = null
 
+    /**
+     * 看门狗的线程 —— **和输入线程分开**（见 [stateWatchdog]：曾经它在输入 Looper 上，每 250ms 两次
+     * binder 调用，正好把偶尔一笔 DOWN 顶到 15ms，输给 launcher）。
+     */
+    private var stateThread: HandlerThread? = null
+    private var stateHandlerRef: Handler? = null
+
     /** set once the gesture-monitor transport has failed to come up for good (see [startMonitorTransport]) */
     @Volatile
     private var monitorTransportDisabled = false
@@ -372,6 +381,12 @@ class CornerInputMonitor(
 
     @Volatile
     private var stroke: Stroke? = null
+
+    /** 时延样本（`MON_LAT` / `MON_LAT_SLOW` 的来源，见 [LatencyStats]）。只在输入线程上读写。 */
+    private val latency = LatencyStats()
+
+    /** `onMonitorEvent` 的第一时刻：每个事件的投递时间。 */
+    private var downRecvUptime = 0L
 
     /**
      * OBSERVE-FIRST, CLAIM-ON-TRAVEL — WITH ONE DELIBERATE EXCEPTION AT DOWN.
@@ -732,6 +747,10 @@ class CornerInputMonitor(
             // for gesture handling: this callback is a deadline, not housekeeping — it has
             // milliseconds to pilfer the stream before MiuiHome's native recogniser owns the
             // gesture.
+            //
+            // **这条 Looper 上只许有输入回调**：Looper 要等当前消息跑完才回到 epoll，任何排在输入
+            // 通道 fd 前面的活都会变成 DOWN 的时延（看门狗就这样被挪走了，见 [stateWatchdog]）。
+            // 需要"顺便跑一下"的东西一律另开线程或发去主线程。
             val thread = HandlerThread(
                 "bubbledrawer-corner-input",
                 android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY,
@@ -776,7 +795,16 @@ class CornerInputMonitor(
                         null,
                     )
                     warmUp()
-                    handler.post(stateWatchdog)
+                    // 看门狗走自己的线程（曾经在输入线程上，见 [stateWatchdog]）——
+                    // 这一行是给用户日志留的证据：两个线程名必须是分开的。
+                    val state = stateHandler()
+                    logger(
+                        Log.INFO,
+                        "MON_STATE_THREAD name=${stateThread?.name} input=${thread.name} " +
+                            "every=${STATE_REFRESH_MS}ms",
+                        null,
+                    )
+                    state.post(stateWatchdog)
                 } catch (t: Throwable) {
                     // Recovery is a full restart of the transport (the receiver cannot be built
                     // twice on the same channel anyway), but it must not become a loop: after a
@@ -823,6 +851,16 @@ class CornerInputMonitor(
      * the real work at the transitions; the slow tick is only a safety net, so a broadcast that
      * never arrives cannot leave the gate stuck.
      */
+    /**
+     * 看门狗：刷新电源/锁屏快照 + 发现几何失效就回主线程重取。
+     *
+     * **它必须跑在自己的线程上，绝不能和输入接收器共用 Looper。** 这里每 [STATE_REFRESH_MS]（250ms）跑一次，
+     * 每次 `refreshState()` 都要两次 binder 往返（`PowerManager.isInteractive` / `isKeyguardLocked`）——
+     * 而 Looper 只有在消息跑完之后才会回到 `epoll_wait`，输入通道的 fd 回调是**排在消息后面**的：
+     * 手指正好落在这几毫秒里，DOWN 就要排队，`lat` 偶尔就到 15ms，输给 launcher 在 DOWN 后 ~8ms 认下的
+     * HOME —— 这正是用户 2026-10-12 反馈的「边角屏蔽手势时灵时不灵」。曾经它就在输入线程上（见
+     * `MON_DOWN` 的 `recv=`/`pil=` 拆分：那次是 `recv` 大，不是我们处理慢）。
+     */
     private val stateWatchdog = object : Runnable {
         override fun run() {
             refreshState()
@@ -833,11 +871,23 @@ class CornerInputMonitor(
             if (geometryIsStale()) {
                 mainHandler.post(::refreshGeometry)
             }
-            inputHandler?.postDelayed(
+            stateHandler().postDelayed(
                 this,
                 if (deviceInteractive) STATE_REFRESH_MS else STATE_REFRESH_SCREEN_OFF_MS,
             )
         }
+    }
+
+    /**
+     * 看门狗自己的线程（懒建）。优先级 `THREAD_PRIORITY_BACKGROUND`：它是纯家务，两次 binder 调用
+     * 慢一点没关系；关键是**别挡着输入**、也别占主线程（那样每秒四次 binder 卡的是 SystemUI 的 UI）。
+     */
+    private fun stateHandler(): Handler {
+        stateHandlerRef?.let { return it }
+        val thread = HandlerThread("bubbledrawer-corner-state", android.os.Process.THREAD_PRIORITY_BACKGROUND)
+        thread.start()
+        stateThread = thread
+        return Handler(thread.looper).also { stateHandlerRef = it }
     }
 
     /**
@@ -957,10 +1007,16 @@ class CornerInputMonitor(
         inputThread?.quitSafely()
         inputThread = null
         inputHandler = null
+        stateThread?.quitSafely()
+        stateThread = null
+        stateHandlerRef = null
     }
 
     /** One dispatcher event from the gesture monitor; returns whether WE claimed the stream. */
     private fun onMonitorEvent(event: InputEvent): Boolean {
+        // 这一行必须是**第一个**语句：它是"dispatcher 把事件投递到我们线程"的时刻，`MON_DOWN` 的
+        // `recv=` 就是它减去 `ev.downTime` —— 判断"是别人挡了我们的线程"还是"我们自己处理慢"全靠它。
+        downRecvUptime = SystemClock.uptimeMillis()
         val ev = event as? MotionEvent ?: return false
         if (outsideTapHandler?.invoke(ev) == true) {
             return true
@@ -1129,11 +1185,28 @@ class CornerInputMonitor(
         val imePx = imeVisibleHeightPx()
         val owned = imePx <= 0 && inPreOwnStrip && pilferMonitor()
         val now = SystemClock.uptimeMillis()
+        // 时延拆成两段：recv = dispatcher 投递到我们线程（大了说明我们的 Looper 被别的活挡住 / 系统忙），
+        // pil = 我们的处理 + binder `pilferPointers`（大了说明是我们自己慢）。lat 是这两段之和，
+        // 也是和 launcher 抢的那条线（它约 8ms 就认下 HOME）。
+        val recv = (downRecvUptime - ev.downTime).coerceAtLeast(0)
+        val pil = (now - downRecvUptime).coerceAtLeast(0)
+        val lat = recv + pil
+        latency.record(lat.toInt())
+        if (lat > latency.slowMs) {
+            logger(
+                Log.WARN,
+                "MON_LAT_SLOW side=$side lat=$lat recv=$recv pil=$pil owned=$owned band=$inPreOwnStrip " +
+                    "ime=${imePx}px " + latency.summary(),
+                null,
+            )
+        } else if (latency.dueForReport(LAT_REPORT_EVERY)) {
+            logger(Log.INFO, "MON_LAT " + latency.summary(), null)
+        }
         logger(
             Log.INFO,
             "MON_DOWN side=$side x=$x y=$y box=${cornerBoxPx()} band=$inPreOwnStrip " +
                 "ime=${imePx}px mode=${if (owned) "pre-own" else "observe"} " +
-                "lat=${now - ev.downTime} " + boundsForLog(),
+                "lat=$lat recv=$recv pil=$pil " + boundsForLog(),
             null,
         )
         val config = AdaptiveSpyGestureConfig.create(
@@ -1991,12 +2064,18 @@ class CornerInputMonitor(
         const val HOME_GESTURE_BAND_DP = 28f
 
         /**
-         * How often the power/keyguard snapshot is refreshed on the input thread while the
-         * display is ON (see [stateWatchdog]). It exists so the DOWN path never makes a binder
-         * call: 250 ms is far below the time it takes a user to lock the phone and reach for the
-         * corner, and screen on/off and keyguard changes also push an immediate refresh.
+         * How often the power/keyguard snapshot is refreshed (see [stateWatchdog]) while the
+         * display is ON. It exists so the DOWN path never makes a binder call: 250 ms is far below
+         * the time it takes a user to lock the phone and reach for the corner, and screen on/off
+         * and keyguard changes also push an immediate refresh.
+         *
+         * **它跑在看门狗自己的线程上**，不在输入线程上：每次刷新是两次 binder 往返，排在输入通道的
+         * fd 回调前面就是偶尔一笔 DOWN 的 15ms（2026-10-12 用户反馈的成因，见 [stateWatchdog]）。
          */
         const val STATE_REFRESH_MS = 250L
+
+        /** 每多少笔角落手势打一行 `MON_LAT` 汇总（偏慢的每一笔都会单独打 `MON_LAT_SLOW`）。 */
+        const val LAT_REPORT_EVERY = 20
 
         /**
          * …and while it is OFF, where nothing can be waiting for the answer: 20x fewer wakeups
