@@ -478,27 +478,35 @@ reason=NO_CONTACTS` 一直重复，看起来像"功能没做"）。
       `CONTACT_BAR_HOOKS_INSTALLED pipeline=true` 的线程号等于该进程的主线程号
 - [ ] 随后条上仍能出新消息（不是只有重启系统界面之后才行）
 
-### 联系人条与通知栏：窗帘拉开时让开（用户 2026-10-12）
-现象：下拉通知栏之后，联系人条叠在通知上面。
+### 联系人条与通知栏/控制中心：把图层真的调低（用户 2026-10-12）
+现象：下拉通知栏之后联系人条叠在通知上面；再试「躲开」的方案，通知中心不显示了，**控制中心还是显示** ——
+HyperOS 的这两个面板不是同一个窗口，靠"识别面板再躲"永远追不完。
 
-为什么不是"把图层调低"：条的窗口类型是 2024（`TYPE_NAVIGATION_BAR_PANEL`），通知栏是
-`TYPE_STATUS_BAR`（2000）—— 而**系统窗口类型全部 ≥ 2000**（`FIRST_SYSTEM_WINDOW`），
-系统窗口里没有比通知栏更低的一层（唯一在下面的壁纸是特例），要更低只能用应用窗口（类型 1..99），
-那需要 activity/window token，模块没有。所以做成等价效果：**窗帘一拉开条就让开，收起来再回来**
-（窗帘是半透明的，真压下去反而会透出来）。
+所以直接改窗口类型（`ContactBarController.barWindowType`）。设备实测
+（`dumpsys window windows` 的 `mBaseLayer`，控制中心打开时）：
 
-信号来自 ROM 自己的展开监听：`com.android.systemui.shade.ShadeExpansionStateManager`
-（设备 dex 实测存在）+ `addExpansionListener`。监听器接口**从方法签名里取**
-（`add.parameterTypes[0]`，设备实测是顶层 `com.android.systemui.shade.ShadeExpansionListener`；
-用模块自己的 classloader `Class.forName` 会 ClassNotFoundException），实例是动态代理，
-展开比例读事件字段 `fraction`（字段反射，换 ROM 最坏情况是回调不触发 → 退回今天的行为）。
-拉开超过 1/3 屏（`EXPANDED_FRACTION`）才让开：小幅下拉只露屏幕顶部，不会盖住贴在窗口下沿的条。
+```
+281000 NAVIGATION_BAR_PANEL  bubble contact bar      ← 原来的条（2024 + setTrustedOverlay）
+251000 NAVIGATION_BAR_PANEL  bubble slide ime probe  ← 同一个类型
+241000 SYSTEM_OVERLAY        AntiMistakeTouchView
+231000 STATUS_BAR_SUB_PANEL  NotificationModalWindowManager
+181000 NOTIFICATION_SHADE    NotificationShade      ← 通知中心
+171000 STATUS_BAR            StatusBar
+151000 APPLICATION_OVERLAY   ShellDropTarget        ← 同一个进程里的 APPLICATION_OVERLAY
+131000 BASE_APPLICATION      QQ（小窗）
+111000 INPUT_METHOD          InputMethod
+```
 
-- [ ] 开着聊天小窗 → 下拉通知栏：条**消失**（日志 `CONTACT_BAR_HIDE reason=SHADE`）
-- [ ] 收起通知栏：条回来（日志 `CONTACT_BAR_SHOW …`）
-- [ ] 只轻轻下拉一点（不到 1/3）：条不动、不闪
-- [ ] 日志 `SHADE_STATE_HOOKS_INSTALLED manager=true` + `SHADE_STATE_LISTENER_ATTACHED
-      iface=com.android.systemui.shade.ShadeExpansionListener`（`adb install -r` 之后也要有）
+`TYPE_APPLICATION_OVERLAY` 落在 **151000**：在通知中心（181000）、控制中心那几个面板（231000/241000）
+和导航栏之下，又在小窗（131000）与输入法（111000）之上 —— 该盖住它的都盖得住，该被它盖住的还盖得住。
+另外**不再设 `setTrustedOverlay`**（原来正是它把条提到窗帘之上：同类型的探针在 251000，条在 281000）。
+扇面/手势探针仍用原来的 2024 + trusted（它们只在手势出现的瞬间存在，没有这个问题）。
+
+- [ ] 开着聊天小窗 → 下拉通知中心：条**在下面**（不是消失，也不压住通知）
+- [ ] 右侧下拉出控制中心：条同样在下面
+- [ ] 收起任一面板：条照旧贴在小窗下沿（位置、点击、划掉都不受影响）
+- [ ] 条仍然盖在普通应用/桌面上（`APPLICATION_OVERLAY` 在应用窗口之上），输入法弹出时照旧让位
+- [ ] `dumpsys window windows`：`bubble contact bar` 的 `mBaseLayer=151000`、`ty=APPLICATION_OVERLAY`
 
 ## A20 小窗落点：横方向居中/触发侧，竖方向正中 + 上下滑杆
 用户 2026-10-11 的决定（原话）：「**竖屏时始终居中，横屏依旧按你的在那边打开就在哪边显示的逻辑**」、

@@ -130,17 +130,6 @@ class ContactBarController(
         onMain { mainChoreographer = Choreographer.getInstance() }
         // 窗口一动就切回逐帧跟随（ROM 的 `startGestureAnimation` hook 转发，见 [onFreeformWindowMotion]）。
         onFreeformWindowMotion = { onMain { kick() } }
-        // 通知栏一拉开就让开、收起来再回来（见 [ShadeState]：系统窗口里没有比窗帘更低的一层）。
-        ShadeState.onChanged = { expanded ->
-            onMain {
-                if (expanded) {
-                    detach("SHADE")
-                } else {
-                    hideReason = null
-                    scheduleFrame()
-                }
-            }
-        }
         RecentConversations.onChanged = {
             onMain {
                 // Capture first, then render: HyperOS cancels an app's notifications the moment the
@@ -353,12 +342,6 @@ class ContactBarController(
             if (added) detach("DISABLED")
             return
         }
-        // 通知栏拉开了：条会让开，否则它压在通知上面（用户 2026-10-12 的报告）。
-        // 事件回调是主路径，这一句是"回调没装上/漏了一次"时的兜底。
-        if (ShadeState.isExpanded()) {
-            detach("SHADE")
-            return
-        }
         val info = task ?: return
         frames++
 
@@ -509,21 +492,35 @@ class ContactBarController(
         capacityShown = v.capacityFor(rect.width())
         applyCorner(v, info)
         v.bind(items, capacityShown, fallbackIcon(), ::openConversation, ::onRemoveConversation)
-        runCatching {
-            wm.addView(v, params(rect))
-            added = true
-            hideReason = null
-            v.fadeIn()
-            log(Log.INFO, "CONTACT_BAR_SHOW rect=$rect items=${items.size} pkg=$currentPkg")
+        val shownType = runCatching {
+            wm.addView(v, params(rect, barWindowType))
+            barWindowType
+        }.recoverCatching { refusal ->
+            // ROM 不认 APPLICATION_OVERLAY（需要 SYSTEM_ALERT_WINDOW 的 app-op；SystemUI 的 uid 上没被
+            // 显式 allow 过的话就会被拒）—— 那就退回原来的类型 + trusted：图层回到老样子，但条还在。
+            // 宁可"又压住通知"，也不能让联系人条整个消失。
+            logger(Log.WARN, "CONTACT_BAR_ADD_RETRY type=$barWindowType", refusal)
+            val fallback = CornerInputMonitor.CORNER_WINDOW_TYPE
+            wm.addView(v, params(rect, fallback, trusted = true))
+            fallback
         }.onFailure {
             logger(Log.WARN, "CONTACT_BAR_ADD_FAILED rect=$rect", it)
-            added = false
-        }
+        }.getOrNull() ?: return
+        added = true
+        hideReason = null
+        v.fadeIn()
+        attachedType = shownType
+        attachedTrusted = shownType != barWindowType
+        log(
+            Log.INFO,
+            "CONTACT_BAR_SHOW rect=$rect items=${items.size} pkg=$currentPkg type=$shownType",
+        )
     }
 
     private fun update(info: Any, rect: Rect) {
         val v = view ?: return
-        runCatching { wm.updateViewLayout(v, params(rect)) }
+        // 用**当前真正生效的**类型更新（可能是退回后的 2024 + trusted）：换类型会让 updateViewLayout 抛异常。
+        runCatching { wm.updateViewLayout(v, params(rect, attachedType, attachedTrusted)) }
             .onFailure { logger(Log.WARN, "CONTACT_BAR_UPDATE_FAILED", it) }
         applyCorner(v, info)
         // A wider window fits more avatars — re-bind so a resize changes the visible set too.
@@ -563,10 +560,43 @@ class ContactBarController(
         hideReason = reason
     }
 
-    private fun params(rect: Rect) = WindowManager.LayoutParams(
+    /**
+     * 联系人条的窗口类型 —— **故意不是** `CornerInputMonitor.CORNER_WINDOW_TYPE`（2024 / trusted）。
+     *
+     * 用户 2026-10-12：「还是想办法调低图层吧，通知中心不显示了，控制中心还是显示」。
+     * 设备实测（`dumpsys window windows` 的 `mBaseLayer`，控制中心打开时）：
+     *
+     * ```
+     * 281000 NAVIGATION_BAR_PANEL  bubble contact bar      ← 原来的条（2024 + setTrustedOverlay）
+     * 251000 NAVIGATION_BAR_PANEL  bubble slide ime probe  ← 同一个类型，没有 trusted
+     * 241000 SYSTEM_OVERLAY        AntiMistakeTouchView
+     * 231000 STATUS_BAR_SUB_PANEL  NotificationModalWindowManager
+     * 181000 NOTIFICATION_SHADE    NotificationShade      ← 通知中心
+     * 171000 STATUS_BAR            StatusBar
+     * 151000 APPLICATION_OVERLAY   ShellDropTarget        ← 同一个进程里的 APPLICATION_OVERLAY
+     * 131000 BASE_APPLICATION      QQ（小窗）
+     * ```
+     *
+     * 也就是说：`setTrustedOverlay` 会把窗口提到窗帘**之上**（281000 vs 同类型的 251000），而
+     * `TYPE_APPLICATION_OVERLAY` 落在 **151000** —— 正好在通知中心（181000）、控制中心那几个面板
+     * （231000/241000）和导航栏之下，又在小窗（131000）与输入法（111000）之上：**该盖住它的都盖得住，
+     * 该被它盖住的还盖得住**。所以条改成这个类型，并且不再设 trusted（Panel 那套留着手势探针与扇面用）。
+     */
+    private val barWindowType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+
+    /** 实际生效的类型（`APPLICATION_OVERLAY` 被拒时退回 2024 + trusted，见 [attach]）。 */
+    private var attachedType = barWindowType
+
+    private var attachedTrusted = false
+
+    private fun params(
+        rect: Rect,
+        type: Int,
+        trusted: Boolean = false,
+    ) = WindowManager.LayoutParams(
         rect.width(),
         rect.height(),
-        CornerInputMonitor.CORNER_WINDOW_TYPE,
+        type,
         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
@@ -584,8 +614,10 @@ class ContactBarController(
         systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
             View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
         runCatching { setFitInsetsTypes(0) }
-        runCatching {
-            WindowManager.LayoutParams::class.java.getMethod("setTrustedOverlay").invoke(this)
+        if (trusted) {
+            runCatching {
+                WindowManager.LayoutParams::class.java.getMethod("setTrustedOverlay").invoke(this)
+            }
         }
     }
 
@@ -798,7 +830,6 @@ class ContactBarController(
     fun dispose() = onMain {
         runCatching { prefs.unregisterOnSharedPreferenceChangeListener(prefsListener) }
         if (RecentConversations.onChanged != null) RecentConversations.onChanged = null
-        ShadeState.onChanged = null
         main.removeCallbacks(idleTick)
         idleScheduled = false
         onFreeformWindowMotion = null

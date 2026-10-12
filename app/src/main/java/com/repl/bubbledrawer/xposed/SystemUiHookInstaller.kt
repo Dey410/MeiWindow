@@ -41,12 +41,6 @@ class SystemUiHookInstaller(
         }.onFailure {
             module.log(Log.WARN, TAG, "CONTACT_BAR_HOOKS_INSTALL_FAILED", it)
         }
-        // 通知栏的展开状态：联系人条在窗帘拉开时让开（contactbar/ShadeState）。
-        runCatching {
-            com.repl.bubbledrawer.contactbar.ShadeState.installHooks(module, classLoader)
-        }.onFailure {
-            module.log(Log.WARN, TAG, "SHADE_STATE_HOOKS_INSTALL_FAILED", it)
-        }
         // Which class creates the monitors that carry DO_NOT_PILFER (see the class docs) —
         // read-only, and installed before ours exists so creation order is visible too.
         MonitorCreationObserver(module) { priority, message, error ->
@@ -146,15 +140,6 @@ class SystemUiHookInstaller(
             )
         }.onFailure {
             module.log(Log.WARN, TAG, "CONTACT_BAR_HOOKS_REINSTALL_FAILED", it)
-        }
-        // 窗帘状态也属于"换代就没了"的那一半（监听挂在旧的 ROM 对象上）。
-        runCatching {
-            com.repl.bubbledrawer.contactbar.ShadeState.installHooks(
-                module,
-                appClassLoader ?: context.classLoader,
-            )
-        }.onFailure {
-            module.log(Log.WARN, TAG, "SHADE_STATE_HOOKS_REINSTALL_FAILED", it)
         }
     }
 
