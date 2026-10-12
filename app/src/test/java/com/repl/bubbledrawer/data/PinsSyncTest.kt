@@ -84,4 +84,49 @@ class PinsSyncTest {
         assertEquals(PinsSync.Source.REMOTE, coldStore.source)
         assertEquals(b, coldStore.value)
     }
+
+    // ------------------------------------------------------------------ 逐 key 回调（拉锯的现场）
+
+    /**
+     * 撕裂的一对：远程共享组是逐 key 镜像的，所以这边可能先看到**新值 + 旧戳**。
+     * 这一刻绝不能"把我的旧值推回去"——那正是 2026-10-12 用户报的「收藏自动反复添加/移除」。
+     * 规则：戳不小于本地就采纳（值先到、戳后到没关系，戳到了自然收敛）。
+     */
+    @Test
+    fun theTornPairAdoptsAndNeverFights() {
+        // 用户刚加了一项（值 = b），戳还没镜像过来（remoteRev == localRev）。
+        assertTrue(PinsSync.shouldAdoptOnKeyEvent(remoteRev = 100, localRev = 100))
+        // 戳更新：照常采纳。
+        assertTrue(PinsSync.shouldAdoptOnKeyEvent(remoteRev = 200, localRev = 100))
+        // 远端确实更旧：什么都不做（不采纳、也**不回推** —— 回推就是拉锯）。
+        assertFalse(PinsSync.shouldAdoptOnKeyEvent(remoteRev = 50, localRev = 100))
+    }
+
+    @Test
+    fun theOscillationStopsAfterTwoEvents() {
+        // 模拟：本地旧值旧戳 (a,100) ← 事件1 新值旧戳 (b,100) ← 事件2 新值新戳 (b,110)。
+        var localValue = a
+        var localRev = 100L
+        for ((value, rev) in listOf(b to 100L, b to 110L)) {
+            if (PinsSync.shouldAdoptOnKeyEvent(rev, localRev)) {
+                localValue = value
+                localRev = rev
+            }
+        }
+        assertEquals("拉锯最多两次事件就收敛，而且第二次之后再也不会有回推", b, localValue)
+        assertEquals(110L, localRev)
+    }
+
+    /**
+     * 对面主动推过来的一份：旧于本地的直接丢，绝不回推。
+     * （真正"我的落后了"的场景由对面的读路径修复，那里两个 key 都已落定。）
+     */
+    @Test
+    fun aPushWithAnOlderStampIsDroppedQuietly() {
+        assertFalse(PinsSync.shouldApplyPush(rev = 50, localRev = 100))
+        assertTrue(PinsSync.shouldApplyPush(rev = 100, localRev = 100))
+        assertTrue(PinsSync.shouldApplyPush(rev = 200, localRev = 100))
+        // rev 缺失 = 更老模块版本的投递，只能收下。
+        assertTrue(PinsSync.shouldApplyPush(rev = 0, localRev = 100))
+    }
 }

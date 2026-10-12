@@ -295,9 +295,23 @@ object SettingsStore {
      * Apply pins pushed here by the SystemUI panel, KEEPING the sender's stamp: re-stamping
      * with "now" would make a late/duplicate delivery look newer than a local edit made after
      * it. No broadcast back — the sender is the one that just wrote them.
+     *
+     * And a delivery that is *older* than what this side already has is dropped, not written:
+     * the same last-writer-wins the read path ([PinsSync.decide]) uses. Without this check a
+     * duplicate handoff could clobber an edit the user just made here — which is the app-side
+     * half of the "收藏自动反复添加/移除" oscillation (the panel side, `FanHost`, is guarded by
+     * the same [PinsSync.shouldApplyPush]).
      */
     fun applyPushedPins(context: Context, value: String, rev: Long) {
         val local = PrefsPinBackend(fallbackMirror(context))
+        val localRev = local.readRev()
+        if (!PinsSync.shouldApplyPush(rev, localRev)) {
+            android.util.Log.i(
+                "BubbleDrawer",
+                "PIN_PUSH_DROPPED rev=$rev localRev=$localRev len=${value.length}",
+            )
+            return
+        }
         local.write(value)
         local.writeRev(rev)
         RemoteBridge.remote?.let { r ->

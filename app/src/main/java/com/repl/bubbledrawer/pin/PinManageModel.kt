@@ -67,8 +67,20 @@ class PinManageModel(
         searchQuery = ""
     }
 
+    /**
+     * 这一页当前的收藏集合（`pkg#userId`）。
+     *
+     * 之前 [isPinned] 每格都调一次 `pinsOf()` —— 一次页面构建就是几百次**和解读**（每次都可能把
+     * 落后的一方写回共享组），把刚写下的编辑用旧值顶掉的机会也被放大几百倍（2026-10-12
+     * 「收藏自动反复添加/移除」）。收藏列表在一次构建里本来就是同一份，这里在 [rebuild] 时取一次。
+     *
+     * 还没构建过时（快照为 null）退回现读：那种状态下页面是空的，不会有人来问。
+     */
+    private var pinnedKeys: Set<String>? = null
+
     fun isPinned(app: BubbleApp): Boolean =
-        pinsOf().any { it.packageName == app.packageName && it.userId == app.userId }
+        (pinnedKeys ?: pinsOf().map { "${it.packageName}#${it.userId}" }.toSet())
+            .contains("${app.packageName}#${app.userId}")
 
     val displayedCells: List<Cell>
         get() {
@@ -174,7 +186,9 @@ class PinManageModel(
         val ref = PinnedRef(app.packageName, app.userId)
         if (!current.remove(ref)) current.add(ref)
         onOrderChange(current)
-        rebuild()
+        // 刚写下的这一份就是权威，**不要立刻再和解读一次**：写入值与戳分两个 key，同一毫秒的平票
+        // 可能把旧值读回来，表现就是「点了没动，再点别的才刷新」（用户 2026-10-12 报告）。
+        rebuild(pins = current)
     }
 
     /**
@@ -185,36 +199,59 @@ class PinManageModel(
     fun describe(tabText: String, headText: String): String =
         "texts=[$tabText,$headText] items=${cells.size} letters=${letters.size} manage=$manageMode"
 
-    private fun rebuild() {
+    /**
+     * Rebuild the cell list.
+     *
+     * @param pins 已知的收藏列表（[togglePin] 刚写下的那份）；null = 从存储现读。
+     *
+     * 两条纪律，都是用户 2026-10-12 那两条报告换来的：
+     *  1. **`pinnedKeys` 与 `cells` 必须来自同一次快照**。图标读 [isPinned]（`pinnedKeys`），
+     *     位置读 `cells` —— 一个同步落、一个在协程里晚一步落，就会"图标变了、位置没变，
+     *     再点别的才刷新"。
+     *  2. **旧的重建不许覆盖新的**（[rebuildGeneration]）：带推荐的那条路要跳一次 IO，
+     *     连续两次操作时先发起的那个可能后完成，用旧快照把刚刷好的列表盖回去。
+     */
+    private fun rebuild(pins: List<PinnedRef>? = null) {
+        val generation = ++rebuildGeneration
         val (enabled, count) = recommendConfig()
-        val currentPins = pinsOf()
-        val pinnedKeys = currentPins.map { "${it.packageName}#${it.userId}" }.toSet()
+        val currentPins = pins ?: pinsOf()
+        // 一次重建只读一次（缓存给 isPinned 用）：见上面的 `pinnedKeys`。
+        val pinned = currentPins.map { "${it.packageName}#${it.userId}" }.toSet()
         if (enabled && loadRecommendations != null && apps.isNotEmpty()) {
             scope.launch {
                 val recs = kotlinx.coroutines.withContext(Dispatchers.IO) {
-                    runCatching { loadRecommendations.invoke(apps, pinnedKeys, count) }.getOrDefault(emptyList())
+                    runCatching { loadRecommendations.invoke(apps, pinned, count) }.getOrDefault(emptyList())
                 }
-                cells = Sections.build(
-                    all = apps,
-                    pins = currentPins,
-                    recommend = enabled,
-                    recommendCount = count,
-                    recommendedApps = recs,
-                )
-                letters = (listOf("★") + Sections.labelsOf(cells)).distinct()
-                onContentChanged?.invoke()
+                if (generation != rebuildGeneration) return@launch
+                applyCells(currentPins, pinned, enabled, count, recs)
             }
         } else {
-            cells = Sections.build(
-                all = apps,
-                pins = currentPins,
-                recommend = enabled,
-                recommendCount = count,
-            )
-            letters = (listOf("★") + Sections.labelsOf(cells)).distinct()
-            onContentChanged?.invoke()
+            applyCells(currentPins, pinned, enabled, count, emptyList())
         }
     }
+
+    /** 唯一落地点：`pinnedKeys` 与 `cells` 一起更新，别处不要再单独改它们。 */
+    private fun applyCells(
+        pins: List<PinnedRef>,
+        pinned: Set<String>,
+        enabled: Boolean,
+        count: Int,
+        recommended: List<BubbleApp>,
+    ) {
+        pinnedKeys = pinned
+        cells = Sections.build(
+            all = apps,
+            pins = pins,
+            recommend = enabled,
+            recommendCount = count,
+            recommendedApps = recommended,
+        )
+        letters = (listOf("★") + Sections.labelsOf(cells)).distinct()
+        onContentChanged?.invoke()
+    }
+
+    /** 每次重建的序号：只有最新那次的异步结果可以落地（见 [rebuild]）。 */
+    private var rebuildGeneration = 0
 
     /** Detach from the (foreign, long-lived) host process. */
     fun release() {

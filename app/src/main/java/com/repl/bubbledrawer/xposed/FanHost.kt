@@ -307,25 +307,29 @@ class FanHost(
         // pins edits while the fan is open → live rebind (reference :85-96 watch pattern)
         pinsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
             if (key == PrefsPinBackend.KEY || key == PrefsPinBackend.KEY_REV) {
-                // The shared group moved: adopt it only when it is genuinely newer than our own
-                // copy. Blindly copying it here is what used to make the panel show the app's
-                // list and the app show the panel's, each depending on who wrote last.
+                // The shared group moved. Adopt it only when its stamp is not older than ours —
+                // and NEVER answer a difference by pushing our own copy back: the value and its
+                // rev are two keys that LSPosed mirrors one at a time, so this callback can
+                // legitimately see the NEW value with the OLD stamp. Pushing back then deletes
+                // the edit that just happened, the app re-applies it, and the two stores oscillate
+                // — which is exactly the "收藏自动反复添加/移除" report of 2026-10-12.
+                // Healing is the read path's job (`PinsSync.decide`'s pushBack), where both keys
+                // have landed. See [PinsSync.shouldAdoptOnKeyEvent].
                 val remoteBackend = PrefsPinBackend(prefs)
                 val remoteRev = runCatching { remoteBackend.readRev() }.getOrDefault(0L)
                 val remoteValue = runCatching { remoteBackend.read() }.getOrDefault("")
                 val localBackend = PrefsPinBackend(sysUiPrefs)
                 val localRev = localBackend.readRev()
-                if (remoteRev > localRev || (remoteRev == localRev && remoteValue == localBackend.read())) {
+                val adopted = PinsSync.shouldAdoptOnKeyEvent(remoteRev, localRev)
+                if (adopted) {
                     localBackend.write(remoteValue)
                     localBackend.writeRev(remoteRev)
                     pinsOverlay = null
-                } else if (remoteValue != localBackend.read()) {
-                    pushPinsToApp(localBackend.read(), localRev)
                 }
                 logger(
                     Log.INFO,
                     "PIN_REMOTE_CHANGED remoteRev=$remoteRev localRev=$localRev " +
-                        "pins=${PinCodec.decode(localBackend.read()).size}",
+                        "adopted=$adopted pins=${PinCodec.decode(localBackend.read()).size}",
                     null,
                 )
                 rebindFanIfBusy()
@@ -350,8 +354,7 @@ class FanHost(
                 val rev = intent.getLongExtra(PinSyncReceiver.EXTRA_REV, 0L)
                 val localBackend = PrefsPinBackend(sysUiPrefs)
                 val localRev = localBackend.readRev()
-                val localValue = localBackend.read()
-                if (rev <= 0L || rev >= localRev) {
+                if (PinsSync.shouldApplyPush(rev, localRev)) {
                     // The app's copy is at least as new: adopt it and drop our session overlay,
                     // so reads stop pinning this session's earlier edit.
                     localBackend.write(raw)
@@ -360,10 +363,12 @@ class FanHost(
                     rebindFanIfBusy()
                     logger(Log.INFO, "PIN_SYNC_FROM_APP_APPLIED len=${raw.length} rev=$rev", null)
                 } else {
-                    // A stale delivery (e.g. the app's pre-existing value arriving after a panel
-                    // edit): keep ours and hand it over again, otherwise the two lists diverge.
+                    // A stale delivery (a duplicate, or one produced by the handoff ping-pong):
+                    // drop it and DO NOT push ours back. The app finds out its copy is behind on
+                    // its next read — `PinsSync.decide` pushes the winner back there, where both
+                    // keys have already landed. Replying here is what made the two stores
+                    // oscillate. See [PinsSync.shouldApplyPush].
                     logger(Log.WARN, "PIN_SYNC_FROM_APP_STALE rev=$rev localRev=$localRev", null)
-                    if (localValue != raw) pushPinsToApp(localValue, localRev)
                 }
             }
         }
