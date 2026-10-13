@@ -31,6 +31,11 @@ interface SettingsActions {
     fun setFanAutoFillRecommend(enabled: Boolean)
     fun setFanPressurePageTurn(enabled: Boolean)
     fun setFanPressureSensitivity(sensitivity: Int)
+
+    /** 气压重按校准：开始 / 取消 / 清除（状态与采集见 SettingsStore 与 FanHost 的会话）。 */
+    fun startPressureCalibration()
+    fun cancelPressureCalibration()
+    fun clearPressureCalibration()
     fun setRecommendEnabled(enabled: Boolean)
     fun setRecommendCount(count: Int)
     fun setFlymeFreeformEnabled(enabled: Boolean)
@@ -75,6 +80,9 @@ class StoreSettingsActions(private val context: Context) : SettingsActions {
     override fun setFanAutoFillRecommend(enabled: Boolean) = SettingsStore.setFanAutoFillRecommend(context, enabled)
     override fun setFanPressurePageTurn(enabled: Boolean) = SettingsStore.setFanPressurePageTurn(context, enabled)
     override fun setFanPressureSensitivity(sensitivity: Int) = SettingsStore.setFanPressureSensitivity(context, sensitivity)
+    override fun startPressureCalibration() = SettingsStore.startPressureCalibration(context)
+    override fun cancelPressureCalibration() = SettingsStore.cancelPressureCalibration(context)
+    override fun clearPressureCalibration() = SettingsStore.clearPressureCalibration(context)
     override fun setRecommendEnabled(enabled: Boolean) = SettingsStore.setRecommendEnabled(context, enabled)
     override fun setRecommendCount(count: Int) = SettingsStore.setRecommendCount(context, count)
     override fun setFlymeFreeformEnabled(enabled: Boolean) = SettingsStore.setFlymeFreeformEnabled(context, enabled)

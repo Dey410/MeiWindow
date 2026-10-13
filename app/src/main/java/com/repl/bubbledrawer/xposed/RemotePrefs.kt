@@ -137,7 +137,7 @@ object RemotePrefs {
     const val KEY_FAN_PRESSURE_PAGE_TURN = "fan_pressure_page_turn"
     const val DEFAULT_FAN_PRESSURE_PAGE_TURN = true
 
-    /** 扇形重按灵敏度（0: 标准 1.2hPa, 1: 灵敏 0.8hPa, 2: 较重 1.8hPa） */
+    /** 扇形重按灵敏度（0: 标准 1.2hPa, 1: 灵敏 0.8hPa, 2: 较重 1.8hPa）—— 仅在**未校准**时生效 */
     const val KEY_FAN_PRESSURE_SENSITIVITY = "fan_pressure_sensitivity"
     const val DEFAULT_FAN_PRESSURE_SENSITIVITY = 0
 
@@ -146,6 +146,42 @@ object RemotePrefs {
         2 -> 1.8f
         else -> 1.2f
     }
+
+    /**
+     * 气压重按**校准**（参考实现 `com.oxohang.fanfreeform` 的「按压手势 → 气压校准」）。
+     *
+     * 灵敏度预设是「三档拍脑袋」，校准是「照着这台机器的实际按压幅度算」：实按
+     * [com.repl.bubbledrawer.bubble.PressureCalibration.REQUIRED_ATTEMPTS] 次，用样本的中位数与
+     * 最小值的中点当阈值。校准过以后 [KEY_FAN_PRESSURE_CALIBRATED_HPA] 优先，没校准过才回退到预设
+     * —— 见 [pressureThresholdFor]。
+     *
+     * 这些键跨进程共享（与其它设置同一套路）：`x` 系列由 App 写、SystemUI 读；`y` 系列由 SystemUI
+     * 通过广播交回 App 落盘（hook 进程写不了远程组，见 `PinSyncReceiver` 的注释）。
+     */
+    const val KEY_FAN_PRESSURE_CALIBRATED = "fan_pressure_calibrated"
+    const val DEFAULT_FAN_PRESSURE_CALIBRATED = false
+
+    /** 校准出的阈值（hPa）。0 表示没有可用值。 */
+    const val KEY_FAN_PRESSURE_CALIBRATED_HPA = "fan_pressure_calibrated_hpa"
+    const val DEFAULT_FAN_PRESSURE_CALIBRATED_HPA = 0f
+
+    /** 会话进行中：App 置 true 请求开始，SystemUI 结束后由结果事件写回 false。 */
+    const val KEY_FAN_PRESSURE_CALIBRATION_ACTIVE = "fan_pressure_calibration_active"
+
+    /** 本次会话已完成的按压次数（含无效样本）。 */
+    const val KEY_FAN_PRESSURE_CALIBRATION_ATTEMPTS = "fan_pressure_calibration_attempts"
+
+    /** 本次会话已收集的有效样本数。 */
+    const val KEY_FAN_PRESSURE_CALIBRATION_VALID_COUNT = "fan_pressure_calibration_valid_count"
+
+    /** 最近一次按压的峰值（hPa）。 */
+    const val KEY_FAN_PRESSURE_CALIBRATION_LAST_DELTA = "fan_pressure_calibration_last_delta"
+
+    /** 最近一次按压是否记为有效样本。 */
+    const val KEY_FAN_PRESSURE_CALIBRATION_LAST_VALID = "fan_pressure_calibration_last_valid"
+
+    /** 上一次会话的结果（[com.repl.bubbledrawer.bubble.PressureCalibration.Outcome]）。 */
+    const val KEY_FAN_PRESSURE_CALIBRATION_OUTCOME = "fan_pressure_calibration_outcome"
 
     /** 更多面板推荐应用开关与显示数量（4个为一组，最多20个） */
     const val KEY_RECOMMEND_ENABLED = "recommend_enabled"
@@ -257,6 +293,15 @@ object RemotePrefs {
         /** 扇形重按翻页开关与灵敏度 */
         val fanPressurePageTurn: Boolean = DEFAULT_FAN_PRESSURE_PAGE_TURN,
         val fanPressureSensitivity: Int = DEFAULT_FAN_PRESSURE_SENSITIVITY,
+        /** 气压重按校准：可用阈值 + 会话进度 + 上次结果 */
+        val fanPressureCalibrated: Boolean = DEFAULT_FAN_PRESSURE_CALIBRATED,
+        val fanPressureCalibratedHpa: Float = DEFAULT_FAN_PRESSURE_CALIBRATED_HPA,
+        val fanPressureCalibrationActive: Boolean = false,
+        val fanPressureCalibrationAttempts: Int = 0,
+        val fanPressureCalibrationValidCount: Int = 0,
+        val fanPressureCalibrationLastDelta: Float = 0f,
+        val fanPressureCalibrationLastValid: Boolean = false,
+        val fanPressureCalibrationOutcome: Int = com.repl.bubbledrawer.bubble.PressureCalibration.Outcome.NONE,
         /** 推荐应用开关与显示数量（4, 8, 12, 16, 20） */
         val recommendEnabled: Boolean = DEFAULT_RECOMMEND_ENABLED,
         val recommendCount: Int = DEFAULT_RECOMMEND_COUNT,
@@ -286,6 +331,20 @@ object RemotePrefs {
             com.repl.bubbledrawer.gesture.SpySide.RIGHT -> snap.right
         }
     }
+
+    /**
+     * 实际生效的重按阈值（hPa）：**校准值优先，没有校准过才用灵敏度预设**
+     * （[com.repl.bubbledrawer.bubble.PressureCalibration.effectiveThreshold]）。
+     *
+     * 收在这里是为了让 SystemUI 的三处赋值（初始化、设置变更、校准结束）读同一个来源 —— 之前
+     * 「按哪一份值」这种事散在三处，就是收藏那次拉锯的同款隐患。
+     */
+    fun pressureThresholdFor(snap: Snapshot): Float =
+        com.repl.bubbledrawer.bubble.PressureCalibration.effectiveThreshold(
+            calibrated = snap.fanPressureCalibrated,
+            calibratedHpa = snap.fanPressureCalibratedHpa,
+            presetHpa = sensitivityToThreshold(snap.fanPressureSensitivity),
+        )
 
     /** Pins share PrefsPinBackend.KEY so hooked and app processes use one key. */
     fun read(sp: SharedPreferences?): Snapshot {
@@ -322,6 +381,26 @@ object RemotePrefs {
             fanAutoFillRecommend = sp.getBoolean(KEY_FAN_AUTO_FILL_RECOMMEND, DEFAULT_FAN_AUTO_FILL_RECOMMEND),
             fanPressurePageTurn = sp.getBoolean(KEY_FAN_PRESSURE_PAGE_TURN, DEFAULT_FAN_PRESSURE_PAGE_TURN),
             fanPressureSensitivity = sp.getInt(KEY_FAN_PRESSURE_SENSITIVITY, DEFAULT_FAN_PRESSURE_SENSITIVITY).coerceIn(0, 2),
+            fanPressureCalibrated = sp.getBoolean(KEY_FAN_PRESSURE_CALIBRATED, DEFAULT_FAN_PRESSURE_CALIBRATED),
+            // 逐个字段都做一次「落到可解释区间」的清洗：老版本/半截写入留下的 0、NaN、越界值，
+            // 到了这里必须变成"没有校准值"，否则会算出一个永远触发不了的阈值。
+            fanPressureCalibratedHpa = sp.getFloat(KEY_FAN_PRESSURE_CALIBRATED_HPA, DEFAULT_FAN_PRESSURE_CALIBRATED_HPA)
+                .let { if (it.isFinite() && it > 0f) it else 0f },
+            fanPressureCalibrationActive = sp.getBoolean(KEY_FAN_PRESSURE_CALIBRATION_ACTIVE, false),
+            fanPressureCalibrationAttempts = sp.getInt(KEY_FAN_PRESSURE_CALIBRATION_ATTEMPTS, 0)
+                .coerceIn(0, com.repl.bubbledrawer.bubble.PressureCalibration.REQUIRED_ATTEMPTS),
+            fanPressureCalibrationValidCount = sp.getInt(KEY_FAN_PRESSURE_CALIBRATION_VALID_COUNT, 0)
+                .coerceIn(0, com.repl.bubbledrawer.bubble.PressureCalibration.REQUIRED_ATTEMPTS),
+            fanPressureCalibrationLastDelta = sp.getFloat(KEY_FAN_PRESSURE_CALIBRATION_LAST_DELTA, 0f)
+                .let { if (it.isFinite() && it > 0f) it else 0f },
+            fanPressureCalibrationLastValid = sp.getBoolean(KEY_FAN_PRESSURE_CALIBRATION_LAST_VALID, false),
+            fanPressureCalibrationOutcome = sp.getInt(
+                KEY_FAN_PRESSURE_CALIBRATION_OUTCOME,
+                com.repl.bubbledrawer.bubble.PressureCalibration.Outcome.NONE,
+            ).coerceIn(
+                com.repl.bubbledrawer.bubble.PressureCalibration.Outcome.NONE,
+                com.repl.bubbledrawer.bubble.PressureCalibration.Outcome.UNSUPPORTED,
+            ),
             recommendEnabled = sp.getBoolean(KEY_RECOMMEND_ENABLED, DEFAULT_RECOMMEND_ENABLED),
             recommendCount = snappedRecCount,
             flymeFreeformEnabled = sp.getBoolean(KEY_FLYME_FREEFORM_ENABLED, DEFAULT_FLYME_FREEFORM_ENABLED),

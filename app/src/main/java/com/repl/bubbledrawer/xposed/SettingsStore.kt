@@ -2,7 +2,9 @@ package com.repl.bubbledrawer.xposed
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
 import androidx.compose.runtime.Immutable
+import com.repl.bubbledrawer.bubble.PressureCalibrationState
 import com.repl.bubbledrawer.data.PinBackend
 import com.repl.bubbledrawer.data.PinCodec
 import com.repl.bubbledrawer.data.PinnedRef
@@ -39,6 +41,8 @@ data class SettingsUiState(
  * re-pushes everything on first bind).
  */
 object SettingsStore {
+
+    private const val TAG = "BubbleDrawer"
 
     /** trigger_pos semantics (kept from the old page): 0 both, 1 left, 2 right. */
     const val POS_BOTH = 0
@@ -146,6 +150,115 @@ object SettingsStore {
 
     fun setFanPressureSensitivity(context: Context, sensitivity: Int) =
         putInt(context, RemotePrefs.KEY_FAN_PRESSURE_SENSITIVITY, sensitivity.coerceIn(0, 2))
+
+    // ---------------- 气压重按校准（参考实现 com.oxohang.fanfreeform 的「按压手势 → 气压校准」） ----------------
+
+    /**
+     * 请求开始一次校准会话。只写一个 `active = true`（外加把上次的进度清零），真正的采集在
+     * SystemUI 的 [com.repl.bubbledrawer.xposed.FanHost] 里：它监听这个键，开一个会话，按满 5 次
+     * 后把结果经 [PressureCalibrationBridge] 广播回来。
+     *
+     * 为什么用「一个布尔键当请求」而不是广播：App → SystemUI 这条方向 prefs 是通的（本地写 + 远程
+     * 组镜像），而 hook 进程反过来写不了远程组（只读镜像）—— 两个方向各用自己能用的通道。
+     */
+    fun startPressureCalibration(context: Context) {
+        val next = PressureCalibrationState.applyEvent(
+            pressureCalibrationState(context),
+            PressureCalibrationState.Stage.STARTED,
+        )
+        writePressureCalibrationState(context, next)
+        Log.i(TAG, "PRESSURE_CALIBRATION_REQUESTED active=${next.active} calibrated=${next.calibrated}")
+    }
+
+    /** 取消会话（用户点「取消校准」/离开页面）：保留已经算出来的阈值，只是不再采集。 */
+    fun cancelPressureCalibration(context: Context) {
+        val current = pressureCalibrationState(context)
+        if (!current.active) return
+        writePressureCalibrationState(context, current.copy(active = false))
+        Log.i(TAG, "PRESSURE_CALIBRATION_CANCELLED calibrated=${current.calibrated}")
+    }
+
+    /** 清除校准结果：回到灵敏度预设（页面上写明了这一点）。 */
+    fun clearPressureCalibration(context: Context) {
+        writePressureCalibrationState(context, PressureCalibrationState.cleared())
+        Log.i(TAG, "PRESSURE_CALIBRATION_CLEARED")
+    }
+
+    /**
+     * 应用 SystemUI 报回来的一个校准事件（[PressureCalibrationReceiver] 的唯一入口）。
+     *
+     * 状态迁移全在纯函数 [PressureCalibrationState.applyEvent] 里（那条路径有单测），这里只做
+     * 「读当前 → 迁移 → 一次写完本地 + 远程」。**一次写完**这点是刻意的：八个字段分几次写，
+     * 中间任何一次被读走都会看到自相矛盾的状态 —— 收藏那次拉锯（值与戳分两个键）就是这么来的。
+     */
+    fun applyPressureCalibrationEvent(
+        context: Context,
+        stage: String,
+        attempts: Int = 0,
+        delta: Float = 0f,
+        valid: Boolean = false,
+        threshold: Float = 0f,
+        validCount: Int = 0,
+    ) {
+        val current = pressureCalibrationState(context)
+        val next = PressureCalibrationState.applyEvent(
+            state = current,
+            stage = stage,
+            attempts = attempts,
+            delta = delta,
+            valid = valid,
+            threshold = threshold,
+            validCount = validCount,
+        )
+        if (next == current) {
+            // 会话已结束之后迟到的按压、未知阶段、重复投递 —— 不动 prefs（否则页面会回跳）。
+            Log.i(TAG, "PRESSURE_CALIBRATION_EVENT_DROPPED stage=$stage active=${current.active}")
+            return
+        }
+        writePressureCalibrationState(context, next)
+        Log.i(
+            TAG,
+            "PRESSURE_CALIBRATION_EVENT stage=$stage attempts=${next.attempts}" +
+                "/${com.repl.bubbledrawer.bubble.PressureCalibration.REQUIRED_ATTEMPTS}" +
+                " validCount=${next.validCount} lastDelta=${next.lastDeltaHpa} lastValid=${next.lastValid}" +
+                " active=${next.active} calibrated=${next.calibrated} hpa=${next.calibratedHpa}" +
+                " outcome=${next.outcome}",
+        )
+    }
+
+    /**
+     * 当前校准状态。读**本地镜像**而不是远程组：App 是这些键的写入方（SystemUI 只读），所以本地
+     * 文件永远是较新的那一份；读远程组反而可能在 LSPosed 掉线/镜像延迟时拿回旧值。
+     */
+    private fun pressureCalibrationState(context: Context): PressureCalibrationState {
+        val snap = RemotePrefs.read(fallbackMirror(context))
+        return PressureCalibrationState(
+            active = snap.fanPressureCalibrationActive,
+            calibrated = snap.fanPressureCalibrated,
+            calibratedHpa = snap.fanPressureCalibratedHpa,
+            attempts = snap.fanPressureCalibrationAttempts,
+            validCount = snap.fanPressureCalibrationValidCount,
+            lastDeltaHpa = snap.fanPressureCalibrationLastDelta,
+            lastValid = snap.fanPressureCalibrationLastValid,
+            outcome = snap.fanPressureCalibrationOutcome,
+        )
+    }
+
+    /** 把校准状态整份写进「本地镜像 + 远程组」，两边看到的是同一份，绝不会只落一半。 */
+    private fun writePressureCalibrationState(context: Context, state: PressureCalibrationState) {
+        for (prefs in listOfNotNull(RemoteBridge.local(context), RemoteBridge.remote)) {
+            prefs.edit()
+                .putBoolean(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATED, state.calibrated)
+                .putFloat(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATED_HPA, state.calibratedHpa)
+                .putBoolean(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_ACTIVE, state.active)
+                .putInt(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_ATTEMPTS, state.attempts)
+                .putInt(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_VALID_COUNT, state.validCount)
+                .putFloat(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_LAST_DELTA, state.lastDeltaHpa)
+                .putBoolean(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_LAST_VALID, state.lastValid)
+                .putInt(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_OUTCOME, state.outcome)
+                .apply()
+        }
+    }
 
     /** 更多面板推荐应用开关与数量（4, 8, 12, 16, 20）。 */
     fun setRecommendEnabled(context: Context, enabled: Boolean) {

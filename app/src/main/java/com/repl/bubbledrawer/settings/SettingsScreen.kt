@@ -426,14 +426,49 @@ fun FanSettingsScreen(
                     add(CardItem("pressure_sensitivity") {
                         DropdownRow(
                             title = stringResource(R.string.fan_pressure_sensitivity),
+                            // 校准过以后预设不再生效（阈值以校准值为准，见 RemotePrefs.pressureThresholdFor），
+                            // 与其让用户改一个不起作用的下拉，不如把它灰掉并说清怎么回到预设。
+                            summary = if (snap.fanPressureCalibrated && snap.fanPressureCalibratedHpa > 0f) {
+                                stringResource(R.string.fan_pressure_sensitivity_summary_calibrated, snap.fanPressureCalibratedHpa)
+                            } else {
+                                null
+                            },
                             items = listOf(
                                 stringResource(R.string.fan_pressure_sensitivity_standard),
                                 stringResource(R.string.fan_pressure_sensitivity_sensitive),
                                 stringResource(R.string.fan_pressure_sensitivity_heavy),
                             ),
                             selectedIndex = snap.fanPressureSensitivity.coerceIn(0, 2),
-                            enabled = snap.fanPressurePageTurn,
+                            enabled = snap.fanPressurePageTurn && !snap.fanPressureCalibrated,
                             onSelect = actions::setFanPressureSensitivity,
+                        )
+                    })
+                    add(CardItem("pressure_calibrate") {
+                        ArrowRow(
+                            title = stringResource(
+                                when {
+                                    snap.fanPressureCalibrationActive -> R.string.fan_pressure_calibration_cancel
+                                    snap.fanPressureCalibrated -> R.string.fan_pressure_calibration_restart
+                                    else -> R.string.fan_pressure_calibration_start
+                                },
+                            ),
+                            summary = pressureCalibrationSummary(snap),
+                            enabled = snap.fanPressurePageTurn,
+                            onClick = {
+                                if (snap.fanPressureCalibrationActive) {
+                                    actions.cancelPressureCalibration()
+                                } else {
+                                    actions.startPressureCalibration()
+                                }
+                            },
+                        )
+                    })
+                    add(CardItem("pressure_calibrate_clear") {
+                        ArrowRow(
+                            title = stringResource(R.string.fan_pressure_calibration_clear),
+                            summary = stringResource(R.string.fan_pressure_calibration_clear_summary),
+                            enabled = snap.fanPressurePageTurn && snap.fanPressureCalibrated,
+                            onClick = actions::clearPressureCalibration,
                         )
                     })
                 },
@@ -813,5 +848,64 @@ fun ExperimentalSettingsScreen(
 
             item(key = "exp-bottom-spacer") { PageBottomSpacer() }
         }
+    }
+}
+
+/**
+ * 气压校准那一行的说明文字（就是页面上的「现在到底什么状态」）。
+ *
+ * 状态来自 [RemotePrefs.Snapshot] 的八个字段，取值组合有讲究 —— 会话进行中用进度，结束以后用
+ * 「上次结果」，而**上次失败不等于现在没有阈值**：失败只清了会话，上次算出来的校准值仍然生效
+ * （[com.repl.bubbledrawer.bubble.PressureCalibrationState.applyEvent] 的规则），所以失败时要把
+ * 仍在使用的那个值一并说出来，否则用户会以为重按坏了。
+ */
+@Composable
+private fun pressureCalibrationSummary(snap: RemotePrefs.Snapshot): String {
+    val total = com.repl.bubbledrawer.bubble.PressureCalibration.REQUIRED_ATTEMPTS
+    if (snap.fanPressureCalibrationActive) {
+        return if (snap.fanPressureCalibrationAttempts > 0 && snap.fanPressureCalibrationLastDelta > 0f) {
+            stringResource(
+                R.string.fan_pressure_calibration_status_running_sample,
+                snap.fanPressureCalibrationAttempts,
+                total,
+                snap.fanPressureCalibrationLastDelta,
+            )
+        } else {
+            stringResource(
+                R.string.fan_pressure_calibration_status_running,
+                snap.fanPressureCalibrationAttempts,
+                total,
+            )
+        }
+    }
+
+    val outcome = snap.fanPressureCalibrationOutcome
+    val base = when (outcome) {
+        com.repl.bubbledrawer.bubble.PressureCalibration.Outcome.UNSUPPORTED ->
+            stringResource(R.string.fan_pressure_calibration_status_unsupported)
+
+        com.repl.bubbledrawer.bubble.PressureCalibration.Outcome.TIMEOUT ->
+            stringResource(R.string.fan_pressure_calibration_status_timeout)
+
+        com.repl.bubbledrawer.bubble.PressureCalibration.Outcome.FEW_SAMPLES ->
+            stringResource(R.string.fan_pressure_calibration_status_few)
+
+        else -> if (snap.fanPressureCalibrated && snap.fanPressureCalibratedHpa > 0f) {
+            stringResource(
+                R.string.fan_pressure_calibration_status_ok,
+                snap.fanPressureCalibrationValidCount,
+                snap.fanPressureCalibratedHpa,
+            )
+        } else {
+            stringResource(R.string.fan_pressure_calibration_status_none)
+        }
+    }
+
+    val failed = outcome == com.repl.bubbledrawer.bubble.PressureCalibration.Outcome.TIMEOUT ||
+        outcome == com.repl.bubbledrawer.bubble.PressureCalibration.Outcome.FEW_SAMPLES
+    return if (failed && snap.fanPressureCalibrated && snap.fanPressureCalibratedHpa > 0f) {
+        base + stringResource(R.string.fan_pressure_calibration_status_kept, snap.fanPressureCalibratedHpa)
+    } else {
+        base
     }
 }

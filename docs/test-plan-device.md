@@ -603,5 +603,42 @@ Looper 要等当前消息跑完才会回到 `epoll_wait`，而输入通道的 fd
 - [ ] 拖动小窗：联系人条仍然贴着窗口底边（`per-frame` 出现，松手后回到 `idle`）
 - [ ] 放一首歌（进度通知一秒一条）：不再有通知驱动的重建（`CONTACT_BAR_DATA`/`CONTACT_BAR_LIST` 不刷屏）
 
+## A24 气压重按校准（实按 5 次算专属阈值）
+参考实现是 JADX 里那份 `com.oxohang.fanfreeform`（「按压手势 → 气压校准」）：
+`FanRuntime.handlePressureCalibrationMotion` 逐次记按压峰值 → `recordPressureCalibrationAttempt`
+满 5 次 → `PressureGesturePolicy.calibrate` 取「最小值与中位数的中点」当阈值，有效样本不足 3 个算失败；
+超时（`schedulePressureCalibrationTimeout` 的 120s，每记一次就重新计时）也会拿已收集的样本收尾。
+
+本模块的适配：
+- **采集在 SystemUI**（气压计和扇形都在那里），**落盘在 App**（hook 进程的远程组是只读镜像）：
+  App 写 `fan_pressure_calibration_active=true` 请求开始 → `FanHost` 开会话 → 每次按压/结果/超时经
+  `PressureCalibrationBridge` 广播回 App → `SettingsStore` 一次写完本地镜像 + 远程组。
+- 按压的切分不能再用 DOWN/UP：本模块的重按发生在**扇形展开期间**，划出扇形本身就按住不放。所以用
+  气压曲线切分（`PressurePressTracker`：越过 0.08 hPa 开始、跌回 40% 结束），一次划出里连按 5 次都算。
+- 校准期间**不翻页**（`FanPressureDetector.calibrationSink` 非空时只报按压），扇形顶部显示「气压校准 n/5」。
+- 阈值只有一个来源：`RemotePrefs.pressureThresholdFor`（校准值优先，否则灵敏度预设）。校准失败**不丢**
+  上一次的校准值（参考实现会把手势打回默认并失效，这里选择不破坏已有结果）。
+
+- [ ] 设置 → 扇形面板外观 → 「开始校准（实按 5 次）」→ 说明文字变成「校准中 0/5…」
+- [ ] 从屏幕下角划出扇形：顶部出现「气压校准 0/5 · 在扇形空白处重按」
+- [ ] 在扇形空白处重按一次：提示变成 1/5（不用抬手，同一次划出里可以连按 5 次）
+- [ ] 按满 5 次：扇形提示消失，回设置页看到「已校准：5 个有效样本，阈值 x.xxx hPa」
+- [ ] 此时「重按灵敏度」下拉变灰并提示已使用校准值；点「清除校准结果」后回到可选的预设
+- [ ] 校准后重按翻页仍然灵（阈值应当**低于**最轻的一次真实按压）
+- [ ] 中途取消：点「取消校准」后立刻停止采集（日志 `PRESSURE_CALIBRATION_CANCELLED reason=REQUEST`），
+      原有阈值不变
+- [ ] 无气压计机型：点开始后提示「本机没有可用的气压计」（日志 `PRESSURE_CALIBRATION_UNSUPPORTED`）
+- [ ] 诊断页会出现「气压重按校准」一项，成功 PASS、样本不足 WARN（读 `PRESSURE_CALIBRATION_FINISHED`）
+
+没有真人按压也能验完整条链路（adb，只收 shell/root）：
+```bash
+adb shell am broadcast -a com.repl.bubbledrawer.action.DEBUG_PRESSURE --es cmd start
+adb shell am broadcast -a com.repl.bubbledrawer.action.DEBUG_PRESSURE --es cmd sample --ef delta 0.42
+adb shell am broadcast -a com.repl.bubbledrawer.action.DEBUG_PRESSURE --es cmd finish
+adb logcat -s BubbleDrawer | findstr PRESSURE_CALIBRATION
+```
+日志里应当依次出现 `PRESSURE_CALIBRATION_STARTED` → `PRESSURE_CALIBRATION_SAMPLE` →
+`PRESSURE_CALIBRATION_FINISHED`，App 侧出现 `PRESSURE_CALIBRATION_EVENT stage=…`（八项 prefs 一次写完）。
+
 ## 贴边模式（可选，root）
 - [ ] 设置页"贴边模式"：无 su → toast 需要 root；有 su → inset=0，正上滑角落也能出扇

@@ -589,6 +589,18 @@ class CornerInputMonitor(
                 if (disposed) return
                 when (i?.action) {
                     ACTION_DEBUG_MORE -> mainHandler.post { ensureFan().toggleMorePanelForDebug() }
+                    ACTION_DEBUG_PRESSURE -> {
+                        // 只有 adb（shell/root）能驱动这条：它会写校准状态（进而改重按阈值），
+                        // 不能让它变成任何 App 都能按的按钮。`am broadcast` 的发送方是 shell。
+                        val uid = runCatching { sentFromUid }.getOrNull()
+                        if (uid == null || uid > android.os.Process.SHELL_UID) {
+                            logger(Log.WARN, "DEBUG_PRESSURE_REJECTED uid=$uid", null)
+                            return
+                        }
+                        val command = i.getStringExtra(EXTRA_DEBUG_PRESSURE_CMD).orEmpty()
+                        val delta = i.getFloatExtra(EXTRA_DEBUG_PRESSURE_DELTA, 0f)
+                        mainHandler.post { ensureFan().debugPressureCalibration(command, delta) }
+                    }
                     AppEnumProbe.ACTION -> Thread { runCatching { AppEnumProbe.run(context, logger, prefs = prefs) } }.start()
                 }
             }
@@ -598,6 +610,7 @@ class CornerInputMonitor(
                 r,
                 android.content.IntentFilter().apply {
                     addAction(ACTION_DEBUG_MORE)
+                    addAction(ACTION_DEBUG_PRESSURE)
                     addAction(AppEnumProbe.ACTION)
                 },
                 android.content.Context.RECEIVER_EXPORTED,
@@ -2015,6 +2028,21 @@ class CornerInputMonitor(
         const val CORNER_WINDOW_TYPE = 2024            // reference :364 (TYPE_ACCESSIBILITY_OVERLAY)
         /** adb hook for manual verification only (see [registerDebugReceiver]). */
         const val ACTION_DEBUG_MORE = "com.repl.bubbledrawer.action.DEBUG_MORE"
+
+        /**
+         * adb 驱动气压校准的钩子（只收 shell/root，见 [registerDebugReceiver]）：
+         *
+         *     adb shell am broadcast -a com.repl.bubbledrawer.action.DEBUG_PRESSURE \
+         *         --es cmd start
+         *     adb shell am broadcast -a com.repl.bubbledrawer.action.DEBUG_PRESSURE \
+         *         --es cmd sample --ef delta 0.42
+         *     adb shell am broadcast -a com.repl.bubbledrawer.action.DEBUG_PRESSURE --es cmd finish
+         *
+         * 有它才能在没有真人按压的情况下把整条链路（会话 → 采样 → 算阈值 → 广播 → App 落盘）跑通。
+         */
+        const val ACTION_DEBUG_PRESSURE = "com.repl.bubbledrawer.action.DEBUG_PRESSURE"
+        const val EXTRA_DEBUG_PRESSURE_CMD = "cmd"
+        const val EXTRA_DEBUG_PRESSURE_DELTA = "delta"
         const val CORNER_INPUT_CHANNEL_TITLE = "BubbleDrawer-corner-spy" // reference :365
 
         /**

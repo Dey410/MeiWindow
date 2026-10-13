@@ -23,10 +23,13 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.TextView
 import com.repl.bubbledrawer.R
 import com.repl.bubbledrawer.bubble.BubbleDockController
 import com.repl.bubbledrawer.bubble.FanPressureDetector
 import com.repl.bubbledrawer.bubble.GestureAppLauncher
+import com.repl.bubbledrawer.bubble.PressureCalibration
+import com.repl.bubbledrawer.bubble.PressureCalibrationState
 import com.repl.bubbledrawer.bubble.SlideGestureItemView
 import com.repl.bubbledrawer.bubble.SlideIconView
 import com.repl.bubbledrawer.data.AppRepository
@@ -259,6 +262,31 @@ class FanHost(
         onHeavyPressTriggered()
     }
 
+    // ---------------- 气压重按校准会话（参考实现 FanRuntime 的 pressureCalibration* 一族） ----------------
+    //
+    // 采集在这里（气压计和扇形都在 SystemUI），落盘在 App（hook 进程的远程组是只读镜像，见
+    // pushPinsToApp 的注释）：会话由 prefs 里 KEY_FAN_PRESSURE_CALIBRATION_ACTIVE 的一个 false→true
+    // 开启，每次按压、最终结果、超时经 [PressureCalibrationBridge] 广播回 App。
+
+    /** 会话进行中。 */
+    private var calibrating = false
+
+    /** 本次会话收集到的有效样本（按压峰值，hPa）。 */
+    private val calibrationDeltas = ArrayList<Float>(PressureCalibration.REQUIRED_ATTEMPTS)
+
+    /** 本次会话已完成的按压次数（含无效样本）。 */
+    private var calibrationAttempts = 0
+
+    /** 扇形里的进度提示「气压校准 n/5」；只在会话进行中且扇形开着时存在。 */
+    private var calibrationHint: TextView? = null
+
+    /**
+     * 超时收尾：参考实现 `schedulePressureCalibrationTimeout` 每次记到按压就重置 120s，超时后
+     * 仍然 `finishPressureCalibration()`（拿已经收集到的样本算一次）—— 用户按了 4 次就走开，
+     * 有 3 个有效样本就不该白按。
+     */
+    private val calibrationTimeout = Runnable { finishCalibration(PressureCalibrationState.Stage.TIMEOUT) }
+
     private var scrim: View? = null
     private var canvas: FrameLayout? = null
     private var fanWindowsUp = false
@@ -280,7 +308,9 @@ class FanHost(
         if (moduleContext == null) logger(Log.ERROR, "FAN_MODULE_CONTEXT_FAILED", null)
         val initialSnap = RemotePrefs.read(prefs)
         pressureDetector.isEnabled = initialSnap.fanPressurePageTurn
-        pressureDetector.thresholdHpa = RemotePrefs.sensitivityToThreshold(initialSnap.fanPressureSensitivity)
+        // 阈值只有一个来源：校准值优先、否则灵敏度预设（RemotePrefs.pressureThresholdFor）——
+        // 以前这里直接取 sensitivityToThreshold，加了校准以后再那样写就会把校准值盖掉。
+        pressureDetector.thresholdHpa = RemotePrefs.pressureThresholdFor(initialSnap)
         dock.onShownChanged = { shown ->
             if (shown) {
                 // 扇形「滑出来」的瞬间（expand 动画开始）振一下 —— 用户 2026-10-10 新增开关。
@@ -338,13 +368,28 @@ class FanHost(
                 key == RemotePrefs.KEY_FAN_ICON_SHAPE
             ) {
                 rebindFanIfBusy()
-            } else if (key == RemotePrefs.KEY_FAN_PRESSURE_PAGE_TURN || key == RemotePrefs.KEY_FAN_PRESSURE_SENSITIVITY) {
+            } else if (key == RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_ACTIVE) {
+                // App 点「开始/取消校准」→ 远程组这一个键变了：开一个会话 / 关掉会话。
+                if (RemotePrefs.read(prefs).fanPressureCalibrationActive) {
+                    startCalibration("REQUEST")
+                } else {
+                    cancelCalibration("REQUEST")
+                }
+            } else if (key == RemotePrefs.KEY_FAN_PRESSURE_PAGE_TURN ||
+                key == RemotePrefs.KEY_FAN_PRESSURE_SENSITIVITY ||
+                key == RemotePrefs.KEY_FAN_PRESSURE_CALIBRATED ||
+                key == RemotePrefs.KEY_FAN_PRESSURE_CALIBRATED_HPA
+            ) {
                 val snap = RemotePrefs.read(prefs)
                 pressureDetector.isEnabled = snap.fanPressurePageTurn
-                pressureDetector.thresholdHpa = RemotePrefs.sensitivityToThreshold(snap.fanPressureSensitivity)
+                pressureDetector.thresholdHpa = RemotePrefs.pressureThresholdFor(snap)
             }
         }
         runCatching { prefs.registerOnSharedPreferenceChangeListener(pinsListener) }
+
+        // 会话可能是「FanHost 还不存在」时请求的（它是首次手势才懒创建的），也可能跨了一次 SystemUI
+        // 重启：初始化时按 prefs 补一次。用户点了「开始校准」，不该等到下一次划出才有反应。
+        if (initialSnap.fanPressureCalibrationActive) startCalibration("INIT_RESUME")
 
         // Direct broadcast receiver from App (e.g. PinManageActivity in settings app)
         val syncFromApp = object : android.content.BroadcastReceiver() {
@@ -541,6 +586,232 @@ class FanHost(
         dock.forceRetract()
     }
 
+    // ---------------- 气压重按校准（会话本体） ----------------
+
+    /**
+     * 校准专用的 Handler。
+     *
+     * 与 [mainHandler] **分成两个实例**是必须的：`FanPressureDetector.stopListening()` 会
+     * `removeCallbacksAndMessages(null)` 清掉 `mainHandler` 队列（它自己也用那个 Handler 投递翻页），
+     * 而「手指抬起 → 结算最后一次按压」正好发生在那一瞬间 —— 用同一个实例的话，最后一次（往往就是
+     * 第 5 次）按压会被自己的清理删掉。两个 Handler 共享同一个 Looper 队列，所以顺序仍然是主线程的
+     * 事件顺序，只是清理互不影响。
+     */
+    private val calibrationHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * 开一个校准会话：采集按压峰值、广播进度，按满 [PressureCalibration.REQUIRED_ATTEMPTS] 次
+     * 或超时后算阈值。
+     */
+    private fun startCalibration(reason: String) {
+        if (calibrating) {
+            logger(Log.DEBUG, "PRESSURE_CALIBRATION_ALREADY_ACTIVE reason=$reason", null)
+            return
+        }
+        if (!pressureDetector.isSupported) {
+            logger(Log.WARN, "PRESSURE_CALIBRATION_UNSUPPORTED reason=$reason", null)
+            sendCalibrationEvent(PressureCalibrationBridge.intent(PressureCalibrationState.Stage.UNSUPPORTED))
+            return
+        }
+        calibrating = true
+        calibrationDeltas.clear()
+        calibrationAttempts = 0
+        // 校准期间 detector 只报按压、不翻页（见 FanPressureDetector.calibrationSink）。
+        pressureDetector.calibrationSink = { peak -> calibrationHandler.post { handleCalibrationPress(peak) } }
+        calibrationHandler.removeCallbacks(calibrationTimeout)
+        calibrationHandler.postDelayed(calibrationTimeout, PressureCalibration.SESSION_TIMEOUT_MS)
+        ensureCalibrationHint()
+        sendCalibrationEvent(PressureCalibrationBridge.intent(PressureCalibrationState.Stage.STARTED))
+        logger(
+            Log.INFO,
+            "PRESSURE_CALIBRATION_STARTED reason=$reason timeoutMs=${PressureCalibration.SESSION_TIMEOUT_MS} " +
+                "sensor=${pressureDetector.pressureSensor?.name} " +
+                "effective=${RemotePrefs.pressureThresholdFor(RemotePrefs.read(prefs))}",
+            null,
+        )
+    }
+
+    /** 一次按压结束（传感器线程经 [calibrationHandler] 转投递过来）。 */
+    private fun handleCalibrationPress(peak: Float) {
+        if (!calibrating) return
+        val delta = if (peak.isFinite() && peak > 0f) peak else 0f
+        val valid = delta > 0f
+        if (valid) calibrationDeltas.add(delta)
+        calibrationAttempts = minOf(PressureCalibration.REQUIRED_ATTEMPTS, calibrationAttempts + 1)
+        sendCalibrationEvent(
+            PressureCalibrationBridge.intent(
+                PressureCalibrationState.Stage.SAMPLE,
+                attempts = calibrationAttempts,
+                delta = delta,
+                valid = valid,
+                validCount = calibrationDeltas.size,
+            ),
+        )
+        updateCalibrationHint()
+        logger(
+            Log.INFO,
+            "PRESSURE_CALIBRATION_SAMPLE attempt=$calibrationAttempts " +
+                "valid=$valid delta=$delta validCount=${calibrationDeltas.size}",
+            null,
+        )
+        if (PressureCalibration.shouldFinish(calibrationAttempts)) {
+            finishCalibration(PressureCalibrationState.Stage.RESULT)
+        } else {
+            // 参考实现每记到一次按压就把 120s 的超时窗口重新计时（schedulePressureCalibrationTimeout）；
+            // 超时是「中途走开」的兜底，不是从点「开始」起的总时限。
+            calibrationHandler.removeCallbacks(calibrationTimeout)
+            calibrationHandler.postDelayed(calibrationTimeout, PressureCalibration.SESSION_TIMEOUT_MS)
+        }
+    }
+
+    /**
+     * 收尾并广播结果。[reason] 只在「样本不够」时决定报哪个阶段：按满 5 次但有效样本不足
+     * [PressureCalibration.MIN_VALID_SAMPLES] → `RESULT(valid=false)`；超时 → `TIMEOUT`。
+     * 超时同样会把已经收集到的样本算一次（参考实现 `onPressureCalibrationTimeout` →
+     * `finishPressureCalibration()`）：按了 4 次走开，有 3 个有效样本就不该白按。
+     */
+    private fun finishCalibration(reason: String) {
+        if (!calibrating) return
+        calibrating = false
+        pressureDetector.calibrationSink = null
+        calibrationHandler.removeCallbacks(calibrationTimeout)
+        removeCalibrationHint()
+        val result = PressureCalibration.calibrate(calibrationDeltas)
+        if (result.valid) {
+            // 立即生效：不等 App 落盘再经 prefs 回推（广播会把同一个值写进 prefs，两处必然一致）。
+            pressureDetector.thresholdHpa = result.thresholdHpa
+            sendCalibrationEvent(
+                PressureCalibrationBridge.intent(
+                    PressureCalibrationState.Stage.RESULT,
+                    attempts = calibrationAttempts,
+                    delta = calibrationDeltas.lastOrNull() ?: 0f,
+                    valid = true,
+                    threshold = result.thresholdHpa,
+                    validCount = result.validCount,
+                ),
+            )
+            logger(
+                Log.INFO,
+                "PRESSURE_CALIBRATION_FINISHED reason=$reason valid=true validCount=${result.validCount} " +
+                    "threshold=${result.thresholdHpa} clamped=${result.clamped} attempts=$calibrationAttempts",
+                null,
+            )
+        } else {
+            val stage = if (reason == PressureCalibrationState.Stage.TIMEOUT) {
+                PressureCalibrationState.Stage.TIMEOUT
+            } else {
+                PressureCalibrationState.Stage.RESULT
+            }
+            sendCalibrationEvent(
+                PressureCalibrationBridge.intent(
+                    stage,
+                    attempts = calibrationAttempts,
+                    valid = false,
+                    validCount = result.validCount,
+                ),
+            )
+            logger(
+                Log.INFO,
+                "PRESSURE_CALIBRATION_FINISHED reason=$reason valid=false " +
+                    "validCount=${result.validCount} attempts=$calibrationAttempts",
+                null,
+            )
+        }
+        calibrationDeltas.clear()
+        calibrationAttempts = 0
+    }
+
+    /** 用户取消 / 热重载：不算、不广播（取消本来就是 App 自己写下的请求）。 */
+    private fun cancelCalibration(reason: String) {
+        if (!calibrating) return
+        calibrating = false
+        pressureDetector.calibrationSink = null
+        calibrationHandler.removeCallbacks(calibrationTimeout)
+        removeCalibrationHint()
+        calibrationDeltas.clear()
+        calibrationAttempts = 0
+        logger(Log.INFO, "PRESSURE_CALIBRATION_CANCELLED reason=$reason", null)
+    }
+
+    /** 显式广播给 App（隐式广播在 API 26+ 有各种限制，收藏那条路也是显式 + setClassName）。 */
+    private fun sendCalibrationEvent(intent: Intent) {
+        val delivered = runCatching {
+            intent.setClassName(
+                ModuleResources.MODULE_PACKAGE,
+                "com.repl.bubbledrawer.xposed.PressureCalibrationReceiver",
+            )
+            host.sendBroadcast(intent)
+            true
+        }.getOrDefault(false)
+        if (!delivered) {
+            logger(
+                Log.WARN,
+                "PRESSURE_CALIBRATION_BROADCAST_FAILED " +
+                    "stage=${intent.getStringExtra(PressureCalibrationBridge.EXTRA_STAGE)}",
+                null,
+            )
+        }
+    }
+
+    /** 会话进行中且扇形开着时，在屏幕上方显示「气压校准 n/5」。 */
+    private fun ensureCalibrationHint() {
+        if (!calibrating) return
+        val canvasView = canvas ?: return
+        if (calibrationHint == null) {
+            val density = context.resources.displayMetrics.density
+            val hint = TextView(context).apply {
+                setTextColor(Color.WHITE)
+                textSize = 14f
+                val padH = (14 * density).toInt()
+                val padV = (8 * density).toInt()
+                setPadding(padH, padV, padH, padV)
+                background = GradientDrawable().apply {
+                    cornerRadius = 18f * density
+                    setColor(Color.parseColor("#CC101418"))
+                }
+                // 不消费触摸：非 clickable 的 View 在 dispatchTouchEvent 里一律返回 false，事件
+                // 照常落到 canvas —— 一行提示绝不能挡住扇形手势。
+                isClickable = false
+                isFocusable = false
+            }
+            val lp = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL,
+            )
+            lp.topMargin = (96 * density).toInt()
+            canvasView.addView(hint, lp)
+            calibrationHint = hint
+        }
+        updateCalibrationHint()
+    }
+
+    private fun updateCalibrationHint() {
+        val hint = calibrationHint ?: return
+        hint.text = context.getString(
+            R.string.fan_pressure_calibration_hint,
+            calibrationAttempts,
+            PressureCalibration.REQUIRED_ATTEMPTS,
+        )
+    }
+
+    private fun removeCalibrationHint() {
+        val hint = calibrationHint ?: return
+        calibrationHint = null
+        runCatching { canvas?.removeView(hint) }
+    }
+
+    /** adb 验证钩子（见 `CornerInputMonitor.registerDebugReceiver`）：不碰真机触摸也能走完整个会话。 */
+    fun debugPressureCalibration(command: String, delta: Float) {
+        when (command) {
+            "start" -> startCalibration("DEBUG")
+            "sample" -> calibrationHandler.post { handleCalibrationPress(delta) }
+            "finish" -> calibrationHandler.post { finishCalibration(PressureCalibrationState.Stage.RESULT) }
+            "cancel" -> cancelCalibration("DEBUG")
+            else -> logger(Log.WARN, "DEBUG_PRESSURE_UNKNOWN command=$command", null)
+        }
+    }
+
     private fun onHeavyPressTriggered() {
         if (!fanWindowsUp || !dock.isBusy) return
         if (!pressureDetector.isTouchActive) return
@@ -697,6 +968,8 @@ class FanHost(
         wm.addView(c, fullScreenParams("bubble slide gesture", touchable = true))
         canvas = c
         fanWindowsUp = true
+        // 校准会话进行中划出扇形 → 顶部的「n/5」提示跟着窗口一起上来。
+        ensureCalibrationHint()
     }
 
     private fun fadeOutFanWindows() {
@@ -715,6 +988,8 @@ class FanHost(
         scrim?.let { runCatching { wm.removeViewImmediate(it) } }
         canvas = null
         scrim = null
+        // 提示随 canvas 一起被移除了，只留引用没有意义（下次划出时 ensureCalibrationHint 会重建）。
+        calibrationHint = null
         fanWindowsUp = false
     }
 
@@ -1042,6 +1317,8 @@ class FanHost(
         pinsListener?.let { runCatching { prefs.unregisterOnSharedPreferenceChangeListener(it) } }
         pinsListener = null
         mainHandler.removeCallbacks(timeout)
+        // 校准会话属于这个实例：热重载时把采集停掉（App 那边的 active 由用户/超时收尾，这里不广播）。
+        cancelCalibration("DESTROY")
         pressureDetector.destroy()
         hideMorePanel(animated = false)
         tearFanWindowsNow()

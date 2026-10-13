@@ -36,6 +36,19 @@ class FanPressureDetector(
     @Volatile
     var thresholdHpa: Float = 1.2f
 
+    /**
+     * 校准会话的接收端：非 null 时进入「只记按压、不翻页」模式，每完成一次按压回一次峰值（hPa）。
+     *
+     * 回调在**传感器线程**上（跟传感器事件同一个线程，`FanPressureThread`）—— 接的一方自己负责
+     * 转投递。之所以不在这里 post 到主线程：`stopListening()` 会 `removeCallbacksAndMessages(null)`
+     * 清掉主线程队列，而「手指抬起时结算最后一次按压」正是走那条路，post 出去的那一下会被自己清掉。
+     */
+    @Volatile
+    var calibrationSink: ((Float) -> Unit)? = null
+
+    /** 把连续差值切成一次次按压（见 [PressurePressTracker]）；只在 [calibrationSink] 存在时使用。 */
+    private val pressTracker = PressurePressTracker()
+
     @Volatile
     private var isListening = false
 
@@ -96,6 +109,15 @@ class FanPressureDetector(
             }
 
             val delta = value - baseline
+
+            // 校准会话：只做按压分段 + 峰值上报，绝不触发翻页 —— 校准期间用户要连按 5 次，
+            // 每次都被当成翻页的话，扇形会一边校准一边翻页。
+            val sink = calibrationSink
+            if (sink != null) {
+                pressTracker.onDelta(delta)?.let(sink)
+                return
+            }
+
             val threshold = thresholdHpa
             val releaseThreshold = threshold * 0.4f
 
@@ -131,6 +153,7 @@ class FanPressureDetector(
         baselinePending = true
         isHeavyPressed = false
         minPressure = Float.MAX_VALUE
+        pressTracker.reset()
 
         if (isListening) return
 
@@ -164,6 +187,10 @@ class FanPressureDetector(
     }
 
     fun stopListening() {
+        // 抬手（或流被系统掐断）时把还按着的那一次按压结算掉：不 post 到主线程，因为下面的
+        // removeCallbacksAndMessages(null) 会把它清掉（见 calibrationSink 的注释）。
+        calibrationSink?.let { sink -> pressTracker.flush()?.let(sink) }
+        pressTracker.reset()
         isTouchActive = false
         mainHandler.removeCallbacksAndMessages(null)
         if (!isListening) return
@@ -180,6 +207,8 @@ class FanPressureDetector(
     }
 
     fun destroy() {
+        // 先摘掉校准接收端：拆机器（热重载）时不该再报一次按压。
+        calibrationSink = null
         stopListening()
         sensorThread?.quitSafely()
         sensorThread = null

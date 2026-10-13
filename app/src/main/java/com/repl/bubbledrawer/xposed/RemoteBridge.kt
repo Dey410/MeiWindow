@@ -158,6 +158,16 @@ object RemoteBridge {
             .putBoolean(RemotePrefs.KEY_FAN_AUTO_FILL_RECOMMEND, snap.fanAutoFillRecommend)
             .putBoolean(RemotePrefs.KEY_FAN_PRESSURE_PAGE_TURN, snap.fanPressurePageTurn)
             .putInt(RemotePrefs.KEY_FAN_PRESSURE_SENSITIVITY, snap.fanPressureSensitivity)
+            // 校准状态一起镜像：这些值平时由 SystemUI 广播回 App 落盘，但 App 的本地文件才是
+            // 「重启/重连后的真相」（syncLocal 会把本地整份推回去），漏掉它们就会把校准结果抹掉。
+            .putBoolean(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATED, snap.fanPressureCalibrated)
+            .putFloat(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATED_HPA, snap.fanPressureCalibratedHpa)
+            .putBoolean(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_ACTIVE, snap.fanPressureCalibrationActive)
+            .putInt(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_ATTEMPTS, snap.fanPressureCalibrationAttempts)
+            .putInt(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_VALID_COUNT, snap.fanPressureCalibrationValidCount)
+            .putFloat(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_LAST_DELTA, snap.fanPressureCalibrationLastDelta)
+            .putBoolean(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_LAST_VALID, snap.fanPressureCalibrationLastValid)
+            .putInt(RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_OUTCOME, snap.fanPressureCalibrationOutcome)
             .putInt(RemotePrefs.KEY_PANEL_DISMISS_OUTSIDE, snap.panelDismissOutside)
             .putBoolean(RemotePrefs.KEY_RECOMMEND_ENABLED, snap.recommendEnabled)
             .putInt(RemotePrefs.KEY_RECOMMEND_COUNT, snap.recommendCount)

@@ -354,4 +354,63 @@ class ModuleLogDiagnosisTest {
         assertTrue(diagnosis.checks.any { it.id == "behaviour.avoid" })
         assertTrue(diagnosis.toText().contains("魅窗诊断"))
     }
+
+    // ---------------------------------------------------------------------------------------
+    // 气压重按校准（用户报「重按不灵」时最先要看的一项）
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    fun aHealthyLogWithoutCalibrationSaysNothingAboutIt() {
+        assertTrue(checksOf(HEALTHY).none { it.id == "behaviour.pressure_calibration" })
+    }
+
+    @Test
+    fun aSuccessfulPressureCalibrationIsReportedWithItsSampleCountAndThreshold() {
+        val lines = HEALTHY + listOf(
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_STARTED reason=REQUEST timeoutMs=120000 " +
+                "sensor=Barometer effective=1.2",
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_SAMPLE attempt=1 valid=true delta=0.31 validCount=1",
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_SAMPLE attempt=5 valid=true delta=0.61 validCount=5",
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_FINISHED reason=result valid=true validCount=5 " +
+                "threshold=0.365 clamped=false attempts=5",
+        )
+        val check = checksOf(lines).firstOrNull { it.id == "behaviour.pressure_calibration" }
+        assertTrue("expected a check, got null", check != null)
+        assertEquals("expected PASS, got ${check!!.status} (${check.detail})", CheckStatus.PASS, check.status)
+        assertTrue(check.detail, check.detail.contains("5 个有效样本"))
+        assertTrue(check.detail, check.detail.contains("0.365 hPa"))
+    }
+
+    @Test
+    fun aCalibrationThatRanOutOfValidSamplesWarns() {
+        val lines = HEALTHY + listOf(
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_STARTED reason=REQUEST timeoutMs=120000",
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_FINISHED reason=result valid=false validCount=1 attempts=5",
+        )
+        val check = checksOf(lines).firstOrNull { it.id == "behaviour.pressure_calibration" }
+        assertTrue("expected a check, got null", check != null)
+        assertEquals("expected WARN, got ${check!!.status}", CheckStatus.WARN, check.status)
+        assertTrue(check.detail, check.detail.contains("有效样本不足 3 个"))
+    }
+
+    @Test
+    fun aTimedOutCalibrationThatStillProducedAThresholdPasses() {
+        val lines = HEALTHY + listOf(
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_FINISHED reason=timeout valid=true validCount=3 " +
+                "threshold=0.42 clamped=false attempts=4",
+        )
+        val check = checksOf(lines).firstOrNull { it.id == "behaviour.pressure_calibration" }
+        assertEquals(CheckStatus.PASS, check!!.status)
+        assertTrue(check.detail, check.detail.contains("超时后用已收集的样本收尾"))
+    }
+
+    @Test
+    fun aDeviceWithoutABarometerIsReportedAsUnavailable() {
+        val lines = HEALTHY + listOf(
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_UNSUPPORTED reason=REQUEST",
+        )
+        val check = checksOf(lines).firstOrNull { it.id == "behaviour.pressure_calibration" }
+        assertEquals(CheckStatus.INFO, check!!.status)
+        assertTrue(check.detail, check.detail.contains("气压计"))
+    }
 }

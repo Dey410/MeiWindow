@@ -53,5 +53,16 @@
                 <action android:name="com.repl.bubbledrawer.action.SYNC_PINS" />
             </intent-filter>
         </receiver>
+
+        <!-- 气压重按校准：按压采样与阈值计算都在 SystemUI（那里才有气压计和扇形），结果经这条
+             广播交回 App 落盘（hook 进程拿到的远程组是只读镜像，见上面的 SYNC_PINS）。接收者校验
+             发送方，只认 SystemUI / system / 自己。 -->
+        <receiver
+            android:name=".xposed.PressureCalibrationReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.repl.bubbledrawer.action.PRESSURE_CALIBRATION" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

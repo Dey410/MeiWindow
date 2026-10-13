@@ -676,9 +676,60 @@ object ModuleLogDiagnosis {
                 ),
             )
         }
+
+        // 气压重按校准：用户报「重按不灵」时，先看这里 —— 是没校准过、校准失败（样本不足），
+        // 还是校准过但阈值偏高。只有日志里真的出现过校准相关记录才出这一项（没碰过就不占位）。
+        val calibrationFinished = lines.lastOrNull { it.contains("PRESSURE_CALIBRATION_FINISHED") }
+        val calibrationSample = lines.lastOrNull { it.contains("PRESSURE_CALIBRATION_SAMPLE") }
+        val calibrationUnsupported = lines.lastOrNull { it.contains("PRESSURE_CALIBRATION_UNSUPPORTED") }
+        val calibrationEvidence = calibrationFinished ?: calibrationUnsupported ?: calibrationSample
+        if (calibrationEvidence != null) {
+            val succeeded = calibrationFinished?.contains("valid=true") == true
+            add(
+                DiagnosisCheck(
+                    id = "behaviour.pressure_calibration",
+                    group = CheckGroup.BEHAVIOUR,
+                    title = "气压重按校准",
+                    status = when {
+                        calibrationFinished == null -> CheckStatus.INFO
+                        succeeded -> CheckStatus.PASS
+                        else -> CheckStatus.WARN
+                    },
+                    detail = when {
+                        calibrationUnsupported != null && calibrationFinished == null ->
+                            "本机没有可用的气压计，重按翻页用不了"
+                        calibrationFinished == null ->
+                            "校准还没结束（最近一次按压：${trimPrefix(calibrationSample ?: calibrationEvidence)}）"
+                        succeeded -> buildString {
+                            append("校准成功：")
+                            append(markerInt(calibrationFinished, "validCount=") ?: 0)
+                            append(" 个有效样本，阈值 ")
+                            append(markerFloat(calibrationFinished, "threshold=") ?: 0f)
+                            append(" hPa")
+                            if (calibrationFinished.contains("reason=timeout")) {
+                                append("（超时后用已收集的样本收尾）")
+                            }
+                            if (calibrationFinished.contains("clamped=true")) {
+                                append("；原始结果超出可用区间，已夹到 0.15~4.0 hPa")
+                            }
+                        }
+                        else -> "本次校准没有成功：有效样本不足 3 个（按压没能让气压升高），阈值仍在用灵敏度预设或上一次的校准值"
+                    },
+                    evidence = trimPrefix(calibrationEvidence),
+                ),
+            )
+        }
     }
 
     private fun count(lines: List<String>, marker: String): Int = lines.count { it.contains(marker) }
+
+    /** 取 `marker=` 后面的整数（取不到返回 null；日志行里 marker 之后就是值本身）。 */
+    private fun markerInt(line: String, marker: String): Int? =
+        line.substringAfter(marker, "").trim().takeWhile { it.isDigit() || it == '-' }.toIntOrNull()
+
+    /** 取 `marker=` 后面的浮点数。 */
+    private fun markerFloat(line: String, marker: String): Float? =
+        line.substringAfter(marker, "").trim().takeWhile { it.isDigit() || it == '.' || it == '-' }.toFloatOrNull()
 
     // -----------------------------------------------------------------------------------------
     // 边角手势 —— 「扇形弹出来的时候，桌面是不是也跟着回了」
