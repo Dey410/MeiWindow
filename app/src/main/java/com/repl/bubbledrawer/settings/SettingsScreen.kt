@@ -453,7 +453,9 @@ fun FanSettingsScreen(
                                 },
                             ),
                             summary = pressureCalibrationSummary(snap),
-                            enabled = snap.fanPressurePageTurn,
+                            // 会话进行中必须一直可点（用来取消）：扇形的采集不受「翻页总开关」约束，
+                            // 中途把翻页关掉时如果这里跟着灰掉，用户就只能干等 120s 超时。
+                            enabled = snap.fanPressureCalibrationActive || snap.fanPressurePageTurn,
                             onClick = {
                                 if (snap.fanPressureCalibrationActive) {
                                     actions.cancelPressureCalibration()
@@ -863,15 +865,25 @@ fun ExperimentalSettingsScreen(
 private fun pressureCalibrationSummary(snap: RemotePrefs.Snapshot): String {
     val total = com.repl.bubbledrawer.bubble.PressureCalibration.REQUIRED_ATTEMPTS
     if (snap.fanPressureCalibrationActive) {
-        return if (snap.fanPressureCalibrationAttempts > 0 && snap.fanPressureCalibrationLastDelta > 0f) {
-            stringResource(
+        // 「太轻」要和「有效样本」分开说：低于 PressureCalibration.MIN_SAMPLE_HPA 的按压不算样本，
+        // 但次数照算 —— 不告诉用户，他会以为按了 5 次就该成功。
+        return when {
+            snap.fanPressureCalibrationAttempts > 0 && !snap.fanPressureCalibrationLastValid -> stringResource(
+                R.string.fan_pressure_calibration_status_running_light,
+                snap.fanPressureCalibrationAttempts,
+                total,
+                snap.fanPressureCalibrationLastDelta,
+                com.repl.bubbledrawer.bubble.PressureCalibration.MIN_SAMPLE_HPA,
+            )
+
+            snap.fanPressureCalibrationAttempts > 0 -> stringResource(
                 R.string.fan_pressure_calibration_status_running_sample,
                 snap.fanPressureCalibrationAttempts,
                 total,
                 snap.fanPressureCalibrationLastDelta,
             )
-        } else {
-            stringResource(
+
+            else -> stringResource(
                 R.string.fan_pressure_calibration_status_running,
                 snap.fanPressureCalibrationAttempts,
                 total,
@@ -891,11 +903,16 @@ private fun pressureCalibrationSummary(snap: RemotePrefs.Snapshot): String {
             stringResource(R.string.fan_pressure_calibration_status_few)
 
         else -> if (snap.fanPressureCalibrated && snap.fanPressureCalibratedHpa > 0f) {
-            stringResource(
-                R.string.fan_pressure_calibration_status_ok,
-                snap.fanPressureCalibrationValidCount,
-                snap.fanPressureCalibratedHpa,
-            )
+            if (snap.fanPressureCalibrationValidCount > 0) {
+                stringResource(
+                    R.string.fan_pressure_calibration_status_ok,
+                    snap.fanPressureCalibrationValidCount,
+                    snap.fanPressureCalibratedHpa,
+                )
+            } else {
+                // 没有样本数就别说「0 个有效样本」（人工写入/跨版本迁移可能留下这种组合）
+                stringResource(R.string.fan_pressure_calibration_status_ok_no_count, snap.fanPressureCalibratedHpa)
+            }
         } else {
             stringResource(R.string.fan_pressure_calibration_status_none)
         }

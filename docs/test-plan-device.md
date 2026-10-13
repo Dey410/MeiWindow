@@ -615,16 +615,34 @@ Looper 要等当前消息跑完才会回到 `epoll_wait`，而输入通道的 fd
   `PressureCalibrationBridge` 广播回 App → `SettingsStore` 一次写完本地镜像 + 远程组。
 - 按压的切分不能再用 DOWN/UP：本模块的重按发生在**扇形展开期间**，划出扇形本身就按住不放。所以用
   气压曲线切分（`PressurePressTracker`：越过 0.08 hPa 开始、跌回 40% 结束），一次划出里连按 5 次都算。
-- 校准期间**不翻页**（`FanPressureDetector.calibrationSink` 非空时只报按压），扇形顶部显示「气压校准 n/5」。
+- **越过分段门限 ≠ 有效样本**：样本另有下限 `MIN_SAMPLE_HPA = 0.2 hPa`。门限必须低于任何真实重按，
+  所以它必然低于噪声一个数量级；拿「越过门限」当样本，`(min+median)/2` 会把阈值钉到 0.2 hPa 以下，
+  打字/走路就能翻页且**没有任何失败提示**。达不到下限的按压照参考实现剔除（次数照算，页面提示
+  「这次太轻」），于是「有效样本不足 3 个」在真机上真的会发生（这是对的：宁可还用手动预设）。
+- 校准期间**不翻页**（`FanPressureDetector.calibrationSink` 非空时只报按压），扇形顶部显示「气压校准 n/5」；
+  这段时间气压计采样从 ≈15Hz 提到 ≈50Hz（15Hz 的 66ms 帧距会漏掉「点一下就走」的快按）。
 - 阈值只有一个来源：`RemotePrefs.pressureThresholdFor`（校准值优先，否则灵敏度预设）。校准失败**不丢**
   上一次的校准值（参考实现会把手势打回默认并失效，这里选择不破坏已有结果）。
+- **会话由 prefs 里的 `fan_pressure_calibration_active` 表示**，热重载/重启系统界面后会**自动接着采集**
+  （`FanHost` 的 INIT_RESUME + `CornerInputMonitor.applySettings` 的补建），不会卡在「校准中」。
+- **回程两条通道**（用户 2026-10-13 报「按满 5 次后页面仍显示取消校准」之后改的）：主通道是
+  `ContentResolver.call()` → `PressureCalibrationProvider`（同步、有回执，身份用 `Binder.getCallingUid()`
+  判定），广播降级为兜底（它的发送方身份 `sentFromUid/sentFromPackage` 在清单接收者上不保证有值，
+  拿不到就整条通道静默全拒 —— 那正是这次症状的来源）。终局事件送出后 2s 检查回执（App 会把
+  `active` 写成 false），没落地就重投一次；另外设置页打开时会自愈「已按满 5 次却还在会话中」的卡死。
+  诊断页会写明投递结果（`via=provider` / `via=none` / 已重投），日志关键字
+  `PRESSURE_CALIBRATION_SENT`、`PRESSURE_CALIBRATION_RESULT_RETRY`。
 
 - [ ] 设置 → 扇形面板外观 → 「开始校准（实按 5 次）」→ 说明文字变成「校准中 0/5…」
 - [ ] 从屏幕下角划出扇形：顶部出现「气压校准 0/5 · 在扇形空白处重按」
 - [ ] 在扇形空白处重按一次：提示变成 1/5（不用抬手，同一次划出里可以连按 5 次）
-- [ ] 按满 5 次：扇形提示消失，回设置页看到「已校准：5 个有效样本，阈值 x.xxx hPa」
+- [ ] 按满 5 次：扇形提示消失，回设置页看到「已校准：5 个有效样本，阈值 x.xxx hPa」**且按钮变成
+      「重新校准」**（不再是「取消校准」）；诊断页那一项要写着投递通道（`via=provider` 或 `via=broadcast`）
 - [ ] 此时「重按灵敏度」下拉变灰并提示已使用校准值；点「清除校准结果」后回到可选的预设
 - [ ] 校准后重按翻页仍然灵（阈值应当**低于**最轻的一次真实按压）
+- [ ] 故意轻点 5 次：页面出现「这次太轻（只升高 x.xxx hPa，至少要 0.2）」，最后报「有效样本不足 3 个」，
+      **不会**给出一个 0.2 hPa 以下的阈值（那种阈值下打字/走路都会翻页）
+- [ ] 校准中途 `adb install -r`（LSPosed 热重载）：会话自动接着采集，页面不会一直停在「校准中」
 - [ ] 中途取消：点「取消校准」后立刻停止采集（日志 `PRESSURE_CALIBRATION_CANCELLED reason=REQUEST`），
       原有阈值不变
 - [ ] 无气压计机型：点开始后提示「本机没有可用的气压计」（日志 `PRESSURE_CALIBRATION_UNSUPPORTED`）

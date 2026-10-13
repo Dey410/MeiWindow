@@ -66,6 +66,41 @@ class PressureCalibrationBridgeTest {
                 selfUid = 10999,
             ),
         )
+        // 系统没给出身份时是 -1（清单注册的接收者可能如此）——同样不可信，靠 provider 主通道兜住。
+        assertFalse(
+            PressureCalibrationBridge.isTrustedSender(
+                uid = -1,
+                packageName = PressureCalibrationBridge.SYSTEMUI_PACKAGE,
+                selfUid = 10999,
+            ),
+        )
+    }
+
+    /**
+     * provider 通道（主通道）的判定：拿 `Binder.getCallingUid()` 反问系统该 uid 装了哪些包 ——
+     * 这条一定拿得到，所以它不依赖广播那套可能缺失的发送方信息。
+     */
+    @Test
+    fun `the provider trusts only the uid that owns systemui`() {
+        assertTrue(
+            PressureCalibrationBridge.isTrustedUid(
+                uid = systemUiUid,
+                uidPackages = listOf(PressureCalibrationBridge.SYSTEMUI_PACKAGE),
+                selfUid = 10999,
+            ),
+        )
+        assertFalse(
+            PressureCalibrationBridge.isTrustedUid(
+                uid = otherAppUid,
+                uidPackages = listOf("com.evil.app"),
+                selfUid = 10999,
+            ),
+        )
+        // 查不到包（uid 已消失 / 查询失败）也不信任
+        assertFalse(PressureCalibrationBridge.isTrustedUid(uid = otherAppUid, uidPackages = null, selfUid = 10999))
+        // system 与自己照旧信任
+        assertTrue(PressureCalibrationBridge.isTrustedUid(uid = 1000, uidPackages = null, selfUid = 10999))
+        assertTrue(PressureCalibrationBridge.isTrustedUid(uid = 10999, uidPackages = null, selfUid = 10999))
     }
 
     @Test

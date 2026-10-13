@@ -10,18 +10,23 @@ package com.repl.bubbledrawer.bubble
  * 气压曲线本身划分：越过门限即开始、跌回门限的 [PressureCalibration.PRESS_RELEASE_FACTOR] 以下
  * 即结束。这样一次划出里连续重按 5 次也能全部记上，用户不必来回划 5 次。
  *
- * 纯逻辑、无 Android 依赖：`OnSensorChanged` 的线程与主线程都会调它，但内部只做标量比较。
+ * 纯逻辑、无 Android 依赖，但**是跨线程的**：`onDelta` 在传感器线程（`FanPressureDetector` 的
+ * `onSensorChanged`），`flush`/`reset` 在手势线程（`stopListening` 由主线程的 MOVE/UP 或热重载线程
+ * 调进来）。两者交错会把同一次按压结算两遍或整段漏掉 —— 所以三个方法都是同步方法：临界区只有几次
+ * 浮点比较，拿锁的代价远小于「样本算错、阈值静默出错」。
  */
 class PressurePressTracker(
     private val gateHpa: Float = PressureCalibration.PRESS_GATE_HPA,
     private val releaseFactor: Float = PressureCalibration.PRESS_RELEASE_FACTOR,
 ) {
     /** 当前是否处在一次按压之中（峰值还在累积）。 */
+    @Volatile
     var isPressed: Boolean = false
         private set
 
     private var peak = 0f
 
+    @Synchronized
     fun reset() {
         isPressed = false
         peak = 0f
@@ -32,6 +37,7 @@ class PressurePressTracker(
      *
      * @return 这一次按压**刚刚结束**时它的峰值（hPa）；还在按着或没越过门限时为 null
      */
+    @Synchronized
     fun onDelta(delta: Float): Float? {
         if (!delta.isFinite()) return null
         if (!isPressed) {
@@ -56,6 +62,7 @@ class PressurePressTracker(
      * 没有这一手，「按住不放再抬手」的按压永远等不到回落，会被整段丢掉 —— 而抬手正是最常见的
      * 收尾方式。
      */
+    @Synchronized
     fun flush(): Float? {
         if (!isPressed) return null
         isPressed = false

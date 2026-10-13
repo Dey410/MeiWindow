@@ -717,6 +717,10 @@ class CornerInputMonitor(
         // The SPY-view fallback only runs while the monitor transport is unavailable.
         updateSide(SpySide.LEFT, !monitorActive && wanted && settings.left)
         updateSide(SpySide.RIGHT, !monitorActive && wanted && settings.right)
+        // 气压校准的会话请求还在 → 保证 FanHost 存在。它是懒创建的，而「补上会话」只在 FanHost 的
+        // 构造函数里跑一次（INIT_RESUME）：热重载/重启系统界面之后，用户早就点过的「开始校准」不该
+        // 等到下一次划扇形才被受理 —— 否则设置页会一直停在「校准中」，看起来像功能坏了。
+        if (settings.fanPressureCalibrationActive) mainHandler.post { runCatching { ensureFan() } }
         // change-only trace (fires on remote preference notifications)
         logger(
             Log.INFO,

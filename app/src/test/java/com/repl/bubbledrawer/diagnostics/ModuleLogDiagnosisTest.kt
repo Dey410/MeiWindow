@@ -413,4 +413,35 @@ class ModuleLogDiagnosisTest {
         assertEquals(CheckStatus.INFO, check!!.status)
         assertTrue(check.detail, check.detail.contains("气压计"))
     }
+
+    /**
+     * 「算出了阈值」和「设置页看到了」是两件事：2026-10-13 用户报「按满 5 次页面仍显示取消校准」，
+     * SystemUI 那半边完全正常，坏的是投递。诊断要把投递结果单独说出来。
+     */
+    @Test
+    fun theDeliveryChannelIsReportedNextToTheResult() {
+        val withProvider = HEALTHY + listOf(
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_FINISHED reason=result valid=true validCount=5 threshold=0.365",
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_SENT via=provider stage=result attempts=5",
+        )
+        val viaProvider = checksOf(withProvider).first { it.id == "behaviour.pressure_calibration" }
+        assertEquals(CheckStatus.PASS, viaProvider.status)
+        assertTrue(viaProvider.detail, viaProvider.detail.contains("投递通道 provider"))
+
+        val withRetry = HEALTHY + listOf(
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_FINISHED reason=result valid=true validCount=5 threshold=0.365",
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_SENT via=none stage=result attempts=5",
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_RESULT_RETRY via=provider stage=result",
+        )
+        val retried = checksOf(withRetry).first { it.id == "behaviour.pressure_calibration" }
+        assertTrue(retried.detail, retried.detail.contains("自动重投"))
+
+        val notDelivered = HEALTHY + listOf(
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_FINISHED reason=result valid=true validCount=5 threshold=0.365",
+            "${LOGCAT_PREFIX}PRESSURE_CALIBRATION_SENT via=none stage=result attempts=5",
+        )
+        val lost = checksOf(notDelivered).first { it.id == "behaviour.pressure_calibration" }
+        assertEquals(CheckStatus.WARN, lost.status)
+        assertTrue(lost.detail, lost.detail.contains("没能送到设置应用"))
+    }
 }

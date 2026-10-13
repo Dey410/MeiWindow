@@ -165,11 +165,11 @@ class FanPressureDetector(
         }
 
         try {
-            // ~15Hz sampling rate (66667 us, balanced mode)
+            // 常规 ≈15Hz（66667us，省电）；校准会话期间提到 ≈50Hz，见 [sensorPeriodUs]。
             isListening = sensorManager?.registerListener(
                 sensorListener,
                 pressureSensor,
-                66667,
+                sensorPeriodUs,
                 sensorHandler,
             ) ?: false
         } catch (e: Throwable) {
@@ -177,6 +177,17 @@ class FanPressureDetector(
             Log.w("BubbleDrawer", "Failed to register pressure sensor", e)
         }
     }
+
+    /**
+     * 当前注册用的采样周期（µs）：校准会话期间用 [CALIBRATION_PERIOD_US]（≈50Hz），其余时候
+     * [NORMAL_PERIOD_US]（≈15Hz）。
+     *
+     * 为什么校准要更密：15Hz 的帧距是 66ms，一次「点一下就走」的快按可能整帧都没采到 —— 用户按了
+     * 5 次只记到 4 次（页面停在 4/5）。50Hz 是气压计的常规档位，而校准只持续几条手势，这点功耗
+     * 可以忽略；翻页判定维持 15Hz（那是常态，省电优先）。
+     */
+    val sensorPeriodUs: Int
+        get() = if (calibrationSink != null) CALIBRATION_PERIOD_US else NORMAL_PERIOD_US
 
     /**
      * Notify detector that the finger moved significantly (suppressing heavy press during fast slides).
@@ -187,8 +198,9 @@ class FanPressureDetector(
     }
 
     fun stopListening() {
-        // 抬手（或流被系统掐断）时把还按着的那一次按压结算掉：不 post 到主线程，因为下面的
-        // removeCallbacksAndMessages(null) 会把它清掉（见 calibrationSink 的注释）。
+        // 抬手（或流被系统掐断）时把还按着的那一次按压结算掉，而且必须**同步**结算：紧接着的
+        // pressTracker.reset() 会清掉按压状态，post 到任何 Handler 上都会排在 reset 之后、
+        // 一个已经结束的按压都拿不到（接的一方自己负责转线程，见 calibrationSink）。
         calibrationSink?.let { sink -> pressTracker.flush()?.let(sink) }
         pressTracker.reset()
         isTouchActive = false
@@ -213,5 +225,13 @@ class FanPressureDetector(
         sensorThread?.quitSafely()
         sensorThread = null
         sensorHandler = null
+    }
+
+    private companion object {
+        /** 常态采样周期：≈15Hz（与参考实现的「平衡」档同值）。 */
+        const val NORMAL_PERIOD_US = 66667
+
+        /** 校准期间的采样周期：≈50Hz（SENSOR_DELAY_GAME 量级），为了不漏掉快按的峰值。 */
+        const val CALIBRATION_PERIOD_US = 20000
     }
 }

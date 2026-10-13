@@ -682,15 +682,35 @@ object ModuleLogDiagnosis {
         val calibrationFinished = lines.lastOrNull { it.contains("PRESSURE_CALIBRATION_FINISHED") }
         val calibrationSample = lines.lastOrNull { it.contains("PRESSURE_CALIBRATION_SAMPLE") }
         val calibrationUnsupported = lines.lastOrNull { it.contains("PRESSURE_CALIBRATION_UNSUPPORTED") }
+        val calibrationSent = lines.lastOrNull { it.contains("PRESSURE_CALIBRATION_SENT") }
+        val calibrationRetry = lines.lastOrNull { it.contains("PRESSURE_CALIBRATION_RESULT_RETRY") }
         val calibrationEvidence = calibrationFinished ?: calibrationUnsupported ?: calibrationSample
         if (calibrationEvidence != null) {
             val succeeded = calibrationFinished?.contains("valid=true") == true
+            // 投递那一半单独说：「算出了阈值」和「设置页看到了」是两件事，2026-10-13 那次
+            // 「按满 5 次页面仍显示取消校准」就是后者坏了而前者正常。
+            val sentVia = calibrationSent?.let { markerWord(it, "via=") }
+            val retryVia = calibrationRetry?.let { markerWord(it, "via=") }
+            val delivered = when {
+                calibrationSent == null -> null
+                sentVia != null && sentVia != "none" -> true
+                // 第一次没落地、重投成功也算送到了（那正是重投存在的意义）
+                retryVia != null && retryVia != "none" -> true
+                else -> false
+            }
+            val delivery = when {
+                delivered == null -> ""
+                delivered && calibrationRetry == null -> "；投递通道 $sentVia"
+                delivered -> "；第一次投递没落地，已自动重投（via=$retryVia）"
+                else -> "；结果没能送到设置应用（App 被强停或未运行？），页面可能仍停在「校准中」"
+            }
             add(
                 DiagnosisCheck(
                     id = "behaviour.pressure_calibration",
                     group = CheckGroup.BEHAVIOUR,
                     title = "气压重按校准",
                     status = when {
+                        delivered == false -> CheckStatus.WARN
                         calibrationFinished == null -> CheckStatus.INFO
                         succeeded -> CheckStatus.PASS
                         else -> CheckStatus.WARN
@@ -712,8 +732,9 @@ object ModuleLogDiagnosis {
                             if (calibrationFinished.contains("clamped=true")) {
                                 append("；原始结果超出可用区间，已夹到 0.15~4.0 hPa")
                             }
+                            append(delivery)
                         }
-                        else -> "本次校准没有成功：有效样本不足 3 个（按压没能让气压升高），阈值仍在用灵敏度预设或上一次的校准值"
+                        else -> "本次校准没有成功：有效样本不足 3 个（按压没能让气压升高），阈值仍在用灵敏度预设或上一次的校准值" + delivery
                     },
                     evidence = trimPrefix(calibrationEvidence),
                 ),
@@ -730,6 +751,10 @@ object ModuleLogDiagnosis {
     /** 取 `marker=` 后面的浮点数。 */
     private fun markerFloat(line: String, marker: String): Float? =
         line.substringAfter(marker, "").trim().takeWhile { it.isDigit() || it == '.' || it == '-' }.toFloatOrNull()
+
+    /** 取 `marker=` 后面的一个「词」（到下个空格为止），例如 `via=provider`。 */
+    private fun markerWord(line: String, marker: String): String? =
+        line.substringAfter(marker, "").trim().substringBefore(' ').takeIf { it.isNotEmpty() }
 
     // -----------------------------------------------------------------------------------------
     // 边角手势 —— 「扇形弹出来的时候，桌面是不是也跟着回了」

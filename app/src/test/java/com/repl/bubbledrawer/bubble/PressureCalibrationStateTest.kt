@@ -21,17 +21,35 @@ class PressureCalibrationStateTest {
     )
 
     @Test
-    fun `starting a new session resets the counters but keeps the previous threshold`() {
+    fun `starting a new session resets the progress but keeps the previous result`() {
         val next = PressureCalibrationState.applyEvent(running(), PressureCalibrationState.Stage.STARTED)
         assertTrue(next.active)
         assertEquals(0, next.attempts)
-        assertEquals(0, next.validCount)
         assertEquals(0f, next.lastDeltaHpa, eps)
         assertFalse(next.lastValid)
         assertEquals(PressureCalibration.Outcome.NONE, next.outcome)
         // 关键：重新校准期间旧阈值必须继续可用
         assertTrue(next.calibrated)
         assertEquals(1.05f, next.calibratedHpa, eps)
+        // 样本数也不清：它是「上一次成功校准的结果」，页面就靠它说「已校准：N 个有效样本」。
+        // 清了就会出现「已校准：0 个有效样本」这种自相矛盾的话（点开始再点取消就能看到）。
+        assertEquals(3, next.validCount)
+    }
+
+    @Test
+    fun `starting and then cancelling a recalibration still shows the last result with its sample count`() {
+        val calibrated = PressureCalibrationState.applyEvent(
+            PressureCalibrationState(),
+            PressureCalibrationState.Stage.RESULT,
+            valid = true,
+            threshold = 0.365f,
+            validCount = 5,
+        )
+        val restarted = PressureCalibrationState.applyEvent(calibrated, PressureCalibrationState.Stage.STARTED)
+        val cancelled = restarted.copy(active = false) // SettingsStore.cancelPressureCalibration 只写这一个字段
+        assertTrue(cancelled.calibrated)
+        assertEquals(0.365f, cancelled.calibratedHpa, eps)
+        assertEquals(5, cancelled.validCount)
     }
 
     @Test

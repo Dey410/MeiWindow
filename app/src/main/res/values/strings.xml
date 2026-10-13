@@ -79,8 +79,10 @@
     <string name="fan_pressure_calibration_status_none">尚未校准：实按 5 次，算出这台机器的专属阈值</string>
     <string name="fan_pressure_calibration_status_running">校准中 %1$d/%2$d：从屏幕下角划出扇形，在空白处重按；再点一次可取消</string>
     <string name="fan_pressure_calibration_status_running_sample">校准中 %1$d/%2$d：上次气压升高 %3$.3f hPa，继续重按</string>
+    <string name="fan_pressure_calibration_status_running_light">校准中 %1$d/%2$d：这次太轻（只升高 %3$.3f hPa，至少要 %4$.1f），请按实一点</string>
     <string name="fan_pressure_calibration_status_ok">已校准：%1$d 个有效样本，阈值 %2$.3f hPa</string>
-    <string name="fan_pressure_calibration_status_few">本次校准失败：有效样本不足 3 个，请重试</string>
+    <string name="fan_pressure_calibration_status_ok_no_count">已校准：阈值 %1$.3f hPa</string>
+    <string name="fan_pressure_calibration_status_few">本次校准失败：有效样本不足 3 个（按得太轻或气压没有升高），请按实一点重试</string>
     <string name="fan_pressure_calibration_status_timeout">本次校准超时（2 分钟没按满 5 次），请重试</string>
     <string name="fan_pressure_calibration_status_unsupported">本机没有可用的气压计，无法校准</string>
     <string name="fan_pressure_calibration_status_kept">；仍在使用上次的校准值 %1$.3f hPa</string>

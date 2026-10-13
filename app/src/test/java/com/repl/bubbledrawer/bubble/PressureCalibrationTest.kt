@@ -85,6 +85,35 @@ class PressureCalibrationTest {
         assertEquals(5, PressureCalibration.REQUIRED_ATTEMPTS)
     }
 
+    /**
+     * 有效样本下限：越过 0.08 的分段门限**不算**样本（那只是"切出一次按压"）。没有这一层，
+     * 五次刚过门限的轻按也会算「校准成功」，`(min+median)/2` 把阈值钉到 0.2 以下 —— 噪声就能翻页。
+     */
+    @Test
+    fun `only a solid enough press counts as a sample`() {
+        assertFalse(PressureCalibration.isUsableSample(0.08f))
+        assertFalse(PressureCalibration.isUsableSample(0.19f))
+        assertTrue(PressureCalibration.isUsableSample(PressureCalibration.MIN_SAMPLE_HPA))
+        assertTrue(PressureCalibration.isUsableSample(0.42f))
+        assertFalse(PressureCalibration.isUsableSample(Float.NaN))
+        assertFalse(PressureCalibration.isUsableSample(-1f))
+    }
+
+    @Test
+    fun `samples that only just clear the gate cannot drag the threshold into the noise floor`() {
+        // 五次「刚过门限」的按压：在旧的 valid = delta > 0 规则下全算有效，阈值被夹到 0.15；
+        // 有了下限它们一个都不是样本，于是退回「有效样本不足」，用户仍用灵敏度预设。
+        val gateOnly = listOf(0.08f, 0.09f, 0.10f, 0.11f, 0.12f)
+            .filter { PressureCalibration.isUsableSample(it) }
+        assertTrue(gateOnly.isEmpty())
+        assertFalse(PressureCalibration.calibrate(gateOnly).valid)
+        // 真按下去的样本仍然算得出阈值
+        val real = listOf(0.31f, 0.42f, 0.55f, 0.38f, 0.61f)
+            .filter { PressureCalibration.isUsableSample(it) }
+        assertEquals(5, real.size)
+        assertTrue(PressureCalibration.calibrate(real).thresholdHpa >= PressureCalibration.MIN_SAMPLE_HPA)
+    }
+
     @Test
     fun `the calibrated threshold wins over the sensitivity preset`() {
         assertEquals(

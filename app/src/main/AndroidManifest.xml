@@ -64,5 +64,13 @@
                 <action android:name="com.repl.bubbledrawer.action.PRESSURE_CALIBRATION" />
             </intent-filter>
         </receiver>
+
+        <!-- 校准事件的主通道：ContentResolver.call（同步 + 回执 + Binder.getCallingUid 判定身份），
+             广播只作兜底。入口自己校验调用方 uid（system / 自己 / SystemUI 包）。 -->
+        <provider
+            android:name=".xposed.PressureCalibrationProvider"
+            android:authorities="com.repl.bubbledrawer.calibration"
+            android:exported="true"
+            android:grantUriPermissions="false" />
     </application>
 </manifest>

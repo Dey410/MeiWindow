@@ -185,12 +185,17 @@ object SettingsStore {
     }
 
     /**
-     * 应用 SystemUI 报回来的一个校准事件（[PressureCalibrationReceiver] 的唯一入口）。
+     * 应用 SystemUI 报回来的一个校准事件（[PressureCalibrationProvider] 与
+     * [PressureCalibrationReceiver] 两个入口都走这里）。
      *
      * 状态迁移全在纯函数 [PressureCalibrationState.applyEvent] 里（那条路径有单测），这里只做
      * 「读当前 → 迁移 → 一次写完本地 + 远程」。**一次写完**这点是刻意的：八个字段分几次写，
      * 中间任何一次被读走都会看到自相矛盾的状态 —— 收藏那次拉锯（值与戳分两个键）就是这么来的。
+     *
+     * `@Synchronized`：provider 的 `call()` 跑在 Binder 线程上，广播接收者在主线程 —— 两个入口
+     * 同时到达时，「读-改-写」必须串起来，否则后写的那次会基于旧快照把前一次盖掉。
      */
+    @Synchronized
     fun applyPressureCalibrationEvent(
         context: Context,
         stage: String,
@@ -199,6 +204,7 @@ object SettingsStore {
         valid: Boolean = false,
         threshold: Float = 0f,
         validCount: Int = 0,
+        via: String = "broadcast",
     ) {
         val current = pressureCalibrationState(context)
         val next = PressureCalibrationState.applyEvent(
@@ -212,17 +218,40 @@ object SettingsStore {
         )
         if (next == current) {
             // 会话已结束之后迟到的按压、未知阶段、重复投递 —— 不动 prefs（否则页面会回跳）。
-            Log.i(TAG, "PRESSURE_CALIBRATION_EVENT_DROPPED stage=$stage active=${current.active}")
+            Log.i(TAG, "PRESSURE_CALIBRATION_EVENT_DROPPED via=$via stage=$stage active=${current.active}")
             return
         }
         writePressureCalibrationState(context, next)
         Log.i(
             TAG,
-            "PRESSURE_CALIBRATION_EVENT stage=$stage attempts=${next.attempts}" +
+            "PRESSURE_CALIBRATION_EVENT via=$via stage=$stage attempts=${next.attempts}" +
                 "/${com.repl.bubbledrawer.bubble.PressureCalibration.REQUIRED_ATTEMPTS}" +
                 " validCount=${next.validCount} lastDelta=${next.lastDeltaHpa} lastValid=${next.lastValid}" +
                 " active=${next.active} calibrated=${next.calibrated} hpa=${next.calibratedHpa}" +
                 " outcome=${next.outcome}",
+        )
+    }
+
+    /**
+     * 打开设置页时的自愈：会话停在「已按满 5 次」却还标着进行中，只可能是**最后一次结果事件没到**
+     * （App 只有在收到第 5 次 SAMPLE 之后才会丢掉紧随其后的 RESULT）。
+     *
+     * 这一条是「投递通道出问题」的最后一道保险：那种情况下 App 手上没有任何样本，算不出阈值，所以
+     * 只能把会话收尾成「没成功」，让用户看到失败原因并重试 —— 总好过页面永远停在「取消校准」，
+     * 让用户以为功能坏了。旧阈值一律不动（照 [PressureCalibrationState] 的规则）。
+     */
+    fun recoverStuckPressureCalibration(context: Context) {
+        val current = pressureCalibrationState(context)
+        if (!current.active) return
+        if (current.attempts < com.repl.bubbledrawer.bubble.PressureCalibration.REQUIRED_ATTEMPTS) return
+        writePressureCalibrationState(
+            context,
+            current.copy(active = false, outcome = com.repl.bubbledrawer.bubble.PressureCalibration.Outcome.TIMEOUT),
+        )
+        Log.w(
+            TAG,
+            "PRESSURE_CALIBRATION_RECOVERED_STUCK attempts=${current.attempts} " +
+                "validCount=${current.validCount} calibrated=${current.calibrated}",
         )
     }
 
@@ -460,6 +489,10 @@ object SettingsStore {
      */
     fun observe(context: Context): Flow<SettingsUiState> = callbackFlow {
         val app = context.applicationContext
+        // 页面打开时先自愈一次「按满 5 次却还标着进行中」的卡死（结果事件没送到，见
+        // [recoverStuckPressureCalibration]）——必须赶在第一次 push() 之前，这样页面拿到的
+        // 第一帧就已经是收尾后的状态，不会先闪一下「校准中」。
+        runCatching { recoverStuckPressureCalibration(app) }
         val local = RemoteBridge.local(app)
 
         fun push() { trySend(currentState(app)) }

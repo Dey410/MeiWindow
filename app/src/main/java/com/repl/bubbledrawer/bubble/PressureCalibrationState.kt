@@ -21,7 +21,7 @@ data class PressureCalibrationState(
     val calibratedHpa: Float = 0f,
     /** 本次会话已完成的按压次数（含无效样本，最多 [PressureCalibration.REQUIRED_ATTEMPTS]）。 */
     val attempts: Int = 0,
-    /** 本次会话已收集到的有效样本数。 */
+    /** 本次会话已收集的有效样本数；会话之外则是**上一次成功校准**的样本数（页面文案要用）。 */
     val validCount: Int = 0,
     /** 最近一次按压的峰值（hPa），用于页面上「第 n/5 次有效，气压升高 x.xxx hPa」。 */
     val lastDeltaHpa: Float = 0f,
@@ -56,8 +56,8 @@ data class PressureCalibrationState(
          * 应用一个来自 SystemUI 的事件。
          *
          * 关键规则（每一条都有对应的单测）：
-         *  - `STARTED` 只清计数，**不动** [calibrated]/[calibratedHpa]：重新校准的整个过程里，旧阈值
-         *    必须一直可用，否则用户在「开始校准 → 按满 5 次」之间会突然失去重按功能；
+         *  - `STARTED` 只清计数，**不动** [calibrated]/[calibratedHpa]/[validCount]：重新校准的整个
+         *    过程里，旧阈值必须一直可用，否则用户在「开始校准 → 按满 5 次」之间会突然失去重按功能；
          *  - `RESULT` 只在 [valid] 时写入新阈值，失败（样本不足）保留旧值 —— 参考实现失败时会把手势
          *    连阈值一起打回默认值，这里选择不破坏已有的好结果；
          *  - `TIMEOUT`/`UNSUPPORTED` 只结束会话并记录原因，同样不碰已有阈值；
@@ -78,7 +78,9 @@ data class PressureCalibrationState(
             Stage.STARTED -> state.copy(
                 active = true,
                 attempts = 0,
-                validCount = 0,
+                // validCount **不**清零：它同时也是「上一次成功校准的样本数」，而 STARTED 明确保留
+                // 旧阈值（下面那条规则）。清零会做出「已校准：0 个有效样本」这种自相矛盾的话 ——
+                // 点「开始校准」再点「取消」就能看到。会话期间的样本数由 SAMPLE 事件逐个覆盖。
                 lastDeltaHpa = 0f,
                 lastValid = false,
                 outcome = PressureCalibration.Outcome.NONE,

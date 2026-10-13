@@ -25,11 +25,24 @@ object PressureCalibration {
     /** 有效样本下限：少于 3 个样本中位数没有意义（参考实现同值）。 */
     const val MIN_VALID_SAMPLES = 3
 
-    /** 校准阈值下限：再低就会踩到气压计噪声。 */
+    /** 校准阈值下限：再低就会踩到气压计噪声（有 [MIN_SAMPLE_HPA] 之后，正常算出的阈值本就不会低于 0.2，这一层是兜底）。 */
     const val MIN_THRESHOLD_HPA = 0.15f
 
     /** 校准阈值上限：超过这个值只能是「按不动」，等同于功能失效。 */
     const val MAX_THRESHOLD_HPA = 4.0f
+
+    /**
+     * 一个**有效样本**的下限。
+     *
+     * [PRESS_GATE_HPA] 只负责「把连续曲线切成一次按压」，它必须低于任何真实重按、也就必然低于
+     * 真正能用的阈值一个数量级；如果「越过门限」就算样本，`(最小值 + 中位数) / 2` 会把阈值压到
+     * 0.2 hPa 以下 —— 打字、走路、开关门都能触发翻页，比「还没校准」更糟，而且是静默的。
+     * 所以样本另外要够实：低于这个值的按压照参考实现的办法剔除（次数仍然算，页面提示「这次太轻」）。
+     *
+     * 0.2 hPa ≈ 最灵敏预设（0.8）的四分之一；实测这台设备的真实重按在 0.3~1.5 hPa，所以合格的重按
+     * 不会被误剔，而「只是碰了一下」不会变成样本。
+     */
+    const val MIN_SAMPLE_HPA = 0.2f
 
     /**
      * 按压分段门限：一次「按压」从 delta 越过它开始、跌回它的 [PRESS_RELEASE_FACTOR] 以下结束。
@@ -107,6 +120,9 @@ object PressureCalibration {
 
     /** 按满 [REQUIRED_ATTEMPTS] 次就结束会话（有效样本会被单独计数，无效的按压同样消耗次数）。 */
     fun shouldFinish(attempts: Int): Boolean = attempts >= REQUIRED_ATTEMPTS
+
+    /** 这一次按压能不能当样本用（见 [MIN_SAMPLE_HPA]）。 */
+    fun isUsableSample(delta: Float): Boolean = delta.isFinite() && delta >= MIN_SAMPLE_HPA
 
     /**
      * 实际生效的阈值：**校准值优先**，没有校准过才回退到灵敏度预设。
