@@ -131,19 +131,22 @@ class LightOpenSystemUi(
         val starterClass = runCatching {
             loadClass("com.android.systemui.statusbar.phone.StatusBarNotificationActivityStarter")
         }.getOrNull()
-        val entryClass = runCatching {
-            loadClass("com.android.systemui.statusbar.notification.collection.NotificationEntry")
-        }.getOrNull()
+        if (starterClass == null) {
+            module.log(Log.WARN, TAG, "LIGHT_OPEN_NOTIFICATION_ARM_TARGET_UNAVAILABLE class=false")
+            return
+        }
+        // 真机签名是老长一串（7 个参数）：
+        //   startNotificationIntentPublic(PendingIntent, Intent, NotificationEntry,
+        //                                 ExpandableNotificationRow, boolean, boolean, boolean)
+        // 所以按**名字 + 参数最多**去找，别写死参数表 —— 上一版写死 3 个参数就是这样
+        // 得到 `LIGHT_OPEN_NOTIFICATION_ARM_TARGET_UNAVAILABLE` 的。
         val method = runCatching {
-            starterClass?.getDeclaredMethod(
-                "startNotificationIntentPublic",
-                PendingIntent::class.java,
-                Intent::class.java,
-                entryClass,
-            )
+            starterClass.declaredMethods
+                .filter { it.name == "startNotificationIntentPublic" }
+                .maxByOrNull { it.parameterCount }
         }.getOrNull()
         if (method == null) {
-            module.log(Log.WARN, TAG, "LIGHT_OPEN_NOTIFICATION_ARM_TARGET_UNAVAILABLE")
+            module.log(Log.WARN, TAG, "LIGHT_OPEN_NOTIFICATION_ARM_TARGET_UNAVAILABLE method=false")
             return
         }
         module.hook(method)
@@ -164,7 +167,7 @@ class LightOpenSystemUi(
                     Log.INFO,
                     TAG,
                     "LIGHT_OPEN_NOTIFICATION_ARM_ENTER pkg=$packageName portrait=$portrait " +
-                        "decision=$decision entry=${chain.args.getOrNull(2) != null}",
+                        "decision=$decision entry=${chain.args.getOrNull(2) != null} ${settings.summary()}",
                 )
                 if (decision == LightOpenDecision.FORCE_FREEFORM && packageName != null && context != null) {
                     arm(
@@ -177,7 +180,7 @@ class LightOpenSystemUi(
                 }
                 chain.proceed()
             }
-        module.log(Log.INFO, TAG, "LIGHT_OPEN_NOTIFICATION_ARM_HOOK_INSTALLED")
+        module.log(Log.INFO, TAG, "LIGHT_OPEN_NOTIFICATION_ARM_HOOK_INSTALLED params=${method.parameterCount}")
     }
 
     // ------------------------------------------------------------------ 磁贴（含插件磁贴）
@@ -220,7 +223,8 @@ class LightOpenSystemUi(
                 module.log(
                     Log.INFO,
                     TAG,
-                    "LIGHT_OPEN_TILE_VIEW_ENTER tile=${tile?.javaClass?.simpleName} target=$target decision=$decision",
+                    "LIGHT_OPEN_TILE_VIEW_ENTER tile=${tile?.javaClass?.simpleName} target=$target " +
+                        "decision=$decision ${settings.summary()}",
                 )
                 if (decision == LightOpenDecision.FORCE_FREEFORM && target != null && context != null) {
                     arm(target, pendingIntentLaunch = false, source = "tileView", decision = decision, context = context)
@@ -445,7 +449,8 @@ class LightOpenSystemUi(
         module.log(
             Log.INFO,
             TAG,
-            "LIGHT_OPEN_ARM_INTENT_ENTER source=$source kind=$kind target=$target decision=$decision",
+            "LIGHT_OPEN_ARM_INTENT_ENTER source=$source kind=$kind target=$target " +
+                "decision=$decision ${settings.summary()}",
         )
         if (target == null || decision != LightOpenDecision.FORCE_FREEFORM) return
         arm(
@@ -584,6 +589,12 @@ class LightOpenSystemUi(
 
     private fun isPortrait(context: Context): Boolean =
         context.resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE
+
+    /** 配置快照摘要：判定不符合预期时，第一眼要看的就是"钩子当时看到的开关是什么"。 */
+    private fun com.repl.bubbledrawer.lightopen.LightOpenSettings.summary(): String =
+        "settings={enabled=$enabled notifP=$notificationPortrait notifL=$notificationLandscape " +
+            "cc=$controlCenter share=$shareToApp text=$textAction jump=$appJump mode=$jumpMode " +
+            "targets=$jumpTargetCount}"
 
     /** 目标包：优先 Intent 的显式组件，其次 `package`，最后交给 PackageManager 解析。 */
     private fun targetPackage(context: Context, intent: Intent): String? {
