@@ -343,6 +343,25 @@ class FanHost(
 
     private val dock = BubbleDockController(context, repo, pinStore, strategy, itemFactory)
 
+    /** 扇形里要显示的功能条目（见 [com.repl.bubbledrawer.shortcut.FunctionFanItems]）。 */
+    private fun fanFunctionEntries(): List<ShortcutItem> {
+        val keys = readFunctionPins()
+        if (keys.isEmpty()) return emptyList()
+        val details = readFunctionDetails()
+        val entries = com.repl.bubbledrawer.shortcut.FunctionFanItems.resolve(
+            keys = keys,
+            details = details,
+            cached = { key -> ShortcutRepository.peekCached(key) },
+        )
+        // 有认不出来的（枚举里没有，只能拿宿主应用图标顶）：后台补一次扫描，下一次划出扇形就有
+        // 真图标了。就地扫描是绝对不行的 —— 这里在**手势中间的主线程**上（见 peekCached 的注释）。
+        // 扫描自带 3s 最小间隔，所以连着划几次不会叠起来。
+        if (entries.any { it.iconBitmap == null && it.intentUri == null }) {
+            scanShortcuts("FAN_FUNCTIONS")
+        }
+        return entries
+    }
+
     private val pressureDetector = FanPressureDetector(host) {
         onHeavyPressTriggered()
     }
@@ -413,6 +432,13 @@ class FanHost(
         }
         // 更多 tile → overlay panel instead of the full-screen Activity (方案 B)
         dock.onMoreRequested = { showMorePanel() }
+        // 「已选功能」也进扇形：排在收藏应用之后，顺序 = 用户点选顺序。数据源见 fanFunctionEntries()。
+        dock.functionItems = { fanFunctionEntries() }
+        dock.onFunctionSelected = { item ->
+            // 快捷方式不是应用：走 ShortcutRepository（LauncherApps/Intent 两条路），小窗开关从远程组读
+            // —— 默认参数会去读 App 进程才有的设置，hook 进程读到的是系统界面自己的 cfg。
+            ShortcutRepository.launchShortcut(host, item, RemotePrefs.read(prefs).freeform)
+        }
         scope.launch {
             runCatching { repo.loadAll() }
             mainHandler.post {
@@ -1201,6 +1227,21 @@ class FanHost(
         }
         when (item) {
             is GestureAppLauncher.AdapterItem.AppItem -> icon.setImageDrawable(repo.icon(item.app, snap.cloneBadge))
+            is GestureAppLauncher.AdapterItem.FunctionItem -> {
+                // 扇形的 tile 没有文字，所以图标就是全部信息：优先用快捷方式自己的图标
+                // （最近一次枚举结果带回来的那张），没有才退回宿主应用图标。
+                val bmp = item.shortcut.iconBitmap
+                if (bmp != null && !bmp.isRecycled) {
+                    icon.setImageDrawable(android.graphics.drawable.BitmapDrawable(res, bmp))
+                } else {
+                    icon.setImageDrawable(
+                        repo.icon(
+                            com.repl.bubbledrawer.pinyin.BubbleApp(item.shortcut.packageName, item.shortcut.label),
+                            snap.cloneBadge,
+                        ),
+                    )
+                }
+            }
             GestureAppLauncher.AdapterItem.More ->
                 runCatching { icon.setImageResource(R.drawable.icon_gesture_more_app) }
         }

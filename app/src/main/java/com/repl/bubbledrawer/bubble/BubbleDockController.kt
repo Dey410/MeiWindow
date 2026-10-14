@@ -54,6 +54,23 @@ class BubbleDockController(
      */
     var onMoreRequested: (() -> Unit)? = null
 
+    /**
+     * 「已选功能」（快捷方式）—— 它们和收藏的应用一起进扇形，排在应用之后。
+     *
+     * 由宿主提供（SystemUI 里的 FanHost 从共享组读 App 发布的详情）；返回的**顺序就是扇形里的顺序**。
+     * 在 `buildPages` 里被调用，而那是手势中间的主线程 —— 实现必须是便宜的（不许在这里触发全量扫描）。
+     */
+    var functionItems: (() -> List<com.repl.bubbledrawer.shortcut.ShortcutItem>)? = null
+
+    /**
+     * 功能 tile 被选中：启动一条快捷方式。
+     *
+     * 与 [launchStrategy] 分开，因为快捷方式不是应用（要走 LauncherApps/Intent，还要带小窗参数）；
+     * SystemUI 侧的宿主必须给出实现 —— `ShortcutRepository.launchShortcut` 的默认参数会去读 App 进程
+     * 才有的设置（hook 进程读到的是系统界面自己的 cfg）。
+     */
+    var onFunctionSelected: ((com.repl.bubbledrawer.shortcut.ShortcutItem) -> Unit)? = null
+
     init {
         launcher.setCallback(object : GestureAppLauncher.Callback {
             override fun onItemSelected(item: GestureAppLauncher.AdapterItem, view: View, index: Int) {
@@ -62,6 +79,19 @@ class BubbleDockController(
                         launchStrategy.launch(context, item.app)
                         LaunchCountStore.increment(context, item.app.packageName, item.app.userId)
                         com.repl.bubbledrawer.data.predict.AppPredictor.recordLaunch(context, item.app.packageName, item.app.userId)
+                    }
+                    is GestureAppLauncher.AdapterItem.FunctionItem -> {
+                        // 快捷方式不是应用：不记进用量统计（那会让宿主应用看起来被"启动"了），
+                        // 只把它交给宿主的启动实现（SystemUI 侧会带小窗参数）。
+                        val launch = onFunctionSelected
+                        if (launch != null) {
+                            launch(item.shortcut)
+                        } else {
+                            runCatching {
+                                com.repl.bubbledrawer.shortcut.ShortcutRepository
+                                    .launchShortcut(context, item.shortcut)
+                            }
+                        }
                     }
                     GestureAppLauncher.AdapterItem.More -> {
                         // VERIFIED: original fan's trailing "更多" tile (C2821f.mo3456G
@@ -175,7 +205,7 @@ class BubbleDockController(
     /**
      * Builds pages of candidate apps.
      * Sequences:
-     * 1. Pinned apps
+     * 1. Pinned apps, then pinned functions (快捷方式)
      * 2. Recommended apps
      * Wraps each batch of [maxApps] items with a trailing "更多" tile.
      */
@@ -192,6 +222,12 @@ class BubbleDockController(
             }
         }
 
+        // 「已选功能」排在收藏应用之后（顺序由用户点选决定，见 FunctionFanItems）。
+        val pinnedFunctions = runCatching { functionItems?.invoke() }.getOrNull().orEmpty()
+        val pinned = ArrayList<GestureAppLauncher.AdapterItem>(pinnedApps.size + pinnedFunctions.size)
+        pinnedApps.forEach { pinned.add(GestureAppLauncher.AdapterItem.AppItem(it)) }
+        pinnedFunctions.forEach { pinned.add(GestureAppLauncher.AdapterItem.FunctionItem(it)) }
+
         val recCount = maxOf(15, maxApps * 3)
         val recommendations = com.repl.bubbledrawer.data.predict.AppPredictor.getRecommendations(
             context, all, pinnedKeys, recCount,
@@ -199,12 +235,12 @@ class BubbleDockController(
 
         val resultPages = ArrayList<List<GestureAppLauncher.AdapterItem>>()
 
-        if (pinnedApps.isEmpty() && recommendations.isEmpty()) {
+        if (pinned.isEmpty() && recommendations.isEmpty()) {
             resultPages.add(listOf(GestureAppLauncher.AdapterItem.More))
             return resultPages
         }
 
-        if (pinnedApps.isEmpty()) {
+        if (pinned.isEmpty()) {
             var idx = 0
             while (idx < recommendations.size) {
                 val chunk = recommendations.subList(idx, minOf(idx + maxApps, recommendations.size))
@@ -214,9 +250,9 @@ class BubbleDockController(
             return resultPages
         }
 
-        if (!autoFillRecommend && pinnedApps.size <= maxApps) {
-            // First page contains only the pinned apps without filling
-            resultPages.add(pinnedApps.map { GestureAppLauncher.AdapterItem.AppItem(it) } + GestureAppLauncher.AdapterItem.More)
+        if (!autoFillRecommend && pinned.size <= maxApps) {
+            // First page contains only the pinned items without filling
+            resultPages.add(pinned + GestureAppLauncher.AdapterItem.More)
             // Subsequent pages contain recommendations
             var rIdx = 0
             while (rIdx < recommendations.size) {
@@ -227,15 +263,15 @@ class BubbleDockController(
             return resultPages
         }
 
-        // Pinned apps + recommendations combined pool
-        val pool = ArrayList<com.repl.bubbledrawer.pinyin.BubbleApp>()
-        pool.addAll(pinnedApps)
-        pool.addAll(recommendations)
+        // Pinned items + recommendations combined pool
+        val pool = ArrayList<GestureAppLauncher.AdapterItem>(pinned.size + recommendations.size)
+        pool.addAll(pinned)
+        recommendations.forEach { pool.add(GestureAppLauncher.AdapterItem.AppItem(it)) }
 
         var idx = 0
         while (idx < pool.size) {
             val chunk = pool.subList(idx, minOf(idx + maxApps, pool.size))
-            resultPages.add(chunk.map { GestureAppLauncher.AdapterItem.AppItem(it) } + GestureAppLauncher.AdapterItem.More)
+            resultPages.add(chunk + GestureAppLauncher.AdapterItem.More)
             idx += maxApps
         }
         return resultPages
@@ -259,6 +295,20 @@ class BubbleDockController(
             icon.shape = snap.fanIconShape
             when (item) {
                 is GestureAppLauncher.AdapterItem.AppItem -> icon.setImageDrawable(repo.icon(item.app, snap.cloneBadge))
+                is GestureAppLauncher.AdapterItem.FunctionItem -> {
+                    // 快捷方式的图标；没有就退回宿主应用图标（扇形的 tile 没有文字，全靠图）。
+                    val bmp = item.shortcut.iconBitmap
+                    if (bmp != null && !bmp.isRecycled) {
+                        icon.setImageDrawable(android.graphics.drawable.BitmapDrawable(context.resources, bmp))
+                    } else {
+                        icon.setImageDrawable(
+                            repo.icon(
+                                com.repl.bubbledrawer.pinyin.BubbleApp(item.shortcut.packageName, item.shortcut.label),
+                                snap.cloneBadge,
+                            ),
+                        )
+                    }
+                }
                 GestureAppLauncher.AdapterItem.More -> icon.setImageResource(R.drawable.icon_gesture_more_app)
             }
         }

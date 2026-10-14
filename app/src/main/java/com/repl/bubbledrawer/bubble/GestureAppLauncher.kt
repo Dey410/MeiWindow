@@ -86,6 +86,15 @@ class GestureAppLauncher @JvmOverloads constructor(
 
     sealed class AdapterItem {
         data class AppItem(val app: BubbleApp) : AdapterItem()
+
+        /**
+         * 「已选功能」（快捷方式）也能进扇形 —— 一枚 tile 就是一条快捷方式，不是宿主应用。
+         *
+         * 单独一种 item 而不是拿 [AppItem] 加个标记：类型上分开了，编译器就会把每一处
+         * `when (item)` 都找出来（图标、启动、命中），不会出现"某条路径把它当成应用"的静默错误。
+         */
+        data class FunctionItem(val shortcut: com.repl.bubbledrawer.shortcut.ShortcutItem) : AdapterItem()
+
         data object More : AdapterItem()
     }
 

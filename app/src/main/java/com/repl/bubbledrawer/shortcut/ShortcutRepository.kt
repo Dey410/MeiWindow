@@ -284,6 +284,17 @@ object ShortcutRepository {
             (context.getSystemService(android.os.UserManager::class.java))?.isUserUnlocked == true
         }.getOrDefault(false)
 
+    /**
+     * 从**已经扫过**的结果里取一条，绝不触发新的扫描。
+     *
+     * 扇形的 tile 是在手势中间、主线程上构建的：那里调 [scanSystemUiShortcutsInternal] 可能真的去枚举
+     * 所有应用并渲染几百张图标（几百毫秒），划出扇形就会明显卡住。所以扇形只"顺便"用上一次的结果，
+     * 拿不到就用调用方自己的兜底（App 发布的详情 / 宿主应用图标）。
+     */
+    fun peekCached(pinKey: String): ShortcutItem? = synchronized(scanLock) {
+        lastScan.firstOrNull { it.pinKey == pinKey }
+    }
+
     /** 一次扫描 + 上报的结果，给 hook 侧记一行日志用（诊断页读的就是这些标记）。 */
     data class ScanReport(val items: Int, val result: ShortcutBridge.ReportResult)
 
