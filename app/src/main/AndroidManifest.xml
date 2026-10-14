@@ -1,6 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!--
+      功能页（快捷方式）不需要 QUERY_ALL_PACKAGES：真正要「看见所有应用」的那次全量枚举
+      （LauncherApps.getShortcuts + 逐个应用解析 shortcuts.xml）跑在 SystemUI 进程里，用的是
+      SystemUI 自己的授权；App 进程这边只做两件事 —— queryIntentActivities(MAIN/LAUNCHER)
+      与按包名取图标/标签，前者由下面这段 <queries> 兜住，后者针对的也是有启动图标的包。
+      多要一个敏感权限只会让应用列表与出问题时更难解释，所以这里保持最小权限。
+    -->
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
@@ -29,23 +36,20 @@
 
         <activity
             android:name=".pin.PinManageActivity"
-            android:exported="false"
+            android:exported="true"
             android:theme="@style/Theme.BubbleDrawer.NoActionBar"
             android:label="@string/slide_launch_app_settings_title" />
 
         <!-- Pin persistence handoff from the SystemUI overlay panel: the hook process
              cannot write the LSPosed remote group (read-only mirror there), so FanHost
-             startService()'s the encoded order here and the app-side backend writes it
-             (local mirror + remote group). Exported because SystemUI is another app; the
-             service itself rejects any caller except android (uid 1000). -->
-        <service
-            android:name=".xposed.PinSyncService"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="com.repl.bubbledrawer.action.SYNC_PINS" />
-            </intent-filter>
-        </service>
+             broadcasts the encoded order here and the app-side backend writes it (local
+             mirror + remote group). Exported because SystemUI is another app; the receiver
+             verifies the sender's identity and the payload grammar.
 
+             (There used to be a startService() twin. It was removed: a service's
+             onStartCommand runs in a plain Handler message, where Binder.getCallingUid()
+             reports the process's OWN uid — so its caller check admitted everyone, i.e. any
+             app could have posted pins="" and wiped both lists.) -->
         <receiver
             android:name=".xposed.PinSyncReceiver"
             android:exported="true">
@@ -70,6 +74,12 @@
         <provider
             android:name=".xposed.PressureCalibrationProvider"
             android:authorities="com.repl.bubbledrawer.calibration"
+            android:exported="true"
+            android:grantUriPermissions="false" />
+
+        <provider
+            android:name=".shortcut.ShortcutProvider"
+            android:authorities="com.repl.bubbledrawer.shortcuts"
             android:exported="true"
             android:grantUriPermissions="false" />
     </application>

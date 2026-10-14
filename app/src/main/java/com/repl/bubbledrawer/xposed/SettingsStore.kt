@@ -10,6 +10,7 @@ import com.repl.bubbledrawer.data.PinCodec
 import com.repl.bubbledrawer.data.PinnedRef
 import com.repl.bubbledrawer.data.PinsSync
 import com.repl.bubbledrawer.data.PrefsPinBackend
+import com.repl.bubbledrawer.shortcut.FunctionPinStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.awaitClose
@@ -390,16 +391,16 @@ object SettingsStore {
             )
             when (decision.source) {
                 PinsSync.Source.REMOTE -> {
-                    localBackend.write(decision.value)
-                    localBackend.writeRev(decision.rev)
+                    // 一次 commit：分两次写会让同一文件上的监听者读到「新值 + 旧戳」，
+                    // 而平戳时 [PinsSync.decide] 判给远端 —— 刚点的那一下就被顶掉了。
+                    localBackend.writeWithRev(decision.value, decision.rev)
                 }
                 PinsSync.Source.LOCAL -> if (decision.pushBack) {
                     // Our mirror is ahead of the shared group (a write landed while LSPosed was
                     // not connected): push it back so the hook process and the next app start
                     // see the same list.
                     runCatching {
-                        remoteBackend.write(decision.value)
-                        remoteBackend.writeRev(decision.rev)
+                        remoteBackend.writeWithRev(decision.value, decision.rev)
                     }
                 }
                 PinsSync.Source.NONE -> Unit
@@ -410,14 +411,11 @@ object SettingsStore {
         override fun write(value: String) {
             val rev = System.currentTimeMillis()
             val localBackend = local
-            localBackend.write(value)
-            localBackend.writeRev(rev)
+            localBackend.writeWithRev(value, rev)
             val r = RemoteBridge.remote
             if (r != null) {
                 runCatching {
-                    val remoteBackend = PrefsPinBackend(r)
-                    remoteBackend.write(value)
-                    remoteBackend.writeRev(rev)
+                    PrefsPinBackend(r).writeWithRev(value, rev)
                 }
             } else {
                 RemoteBridge.start(context)
@@ -430,6 +428,14 @@ object SettingsStore {
         override fun writeRev(rev: Long) {
             local.writeRev(rev)
             RemoteBridge.remote?.let { runCatching { PrefsPinBackend(it).writeRev(rev) } }
+        }
+
+        /** 见 [functionBackend] 里同名覆盖的说明：接口默认实现会重新盖戳，交接来的编辑不能被改戳。 */
+        override fun writeWithRev(value: String, rev: Long) {
+            local.writeWithRev(value, rev)
+            RemoteBridge.remote?.let { r ->
+                runCatching { PrefsPinBackend(r).writeWithRev(value, rev) }
+            }
         }
     }
 
@@ -454,14 +460,9 @@ object SettingsStore {
             )
             return
         }
-        local.write(value)
-        local.writeRev(rev)
+        local.writeWithRev(value, rev)
         RemoteBridge.remote?.let { r ->
-            runCatching {
-                val remote = PrefsPinBackend(r)
-                remote.write(value)
-                remote.writeRev(rev)
-            }
+            runCatching { PrefsPinBackend(r).writeWithRev(value, rev) }
         }
     }
 
@@ -469,9 +470,113 @@ object SettingsStore {
     fun broadcastPins(context: Context, value: String, rev: Long) {
         runCatching {
             val intent = android.content.Intent(PinSyncReceiver.ACTION_TO_SYSTEMUI)
+                // 只有系统界面需要它。不加 setPackage 的话，任何注册了这个 action 的应用都能
+                // **收到**用户的收藏列表（注入已由 FanHost 的发送方校验挡住，但没必要广而告之）。
+                .setPackage(PinSyncReceiver.SYSTEMUI_PACKAGE)
                 .putExtra(PinSyncReceiver.EXTRA_PINS, value)
                 .putExtra(PinSyncReceiver.EXTRA_REV, rev)
             context.sendBroadcast(intent)
+        }
+    }
+
+    /**
+     * 「已选功能」（快捷方式收藏）的后端 —— 与 [pinBackend] **逐行同构**，只是换了 key。
+     *
+     * 为什么必须同构：这份列表和收藏应用一样，被两个进程读写（设置页在 App 进程，扇形面板在
+     * SystemUI），而 hook 进程**写不了**远程组（只读镜像）。功能页第一版在 hook 侧直接写了
+     * `RemoteBridge.local(SystemUI 的 context)`，也就是 SystemUI 自己的 cfg 文件 —— App 永远
+     * 看不见，「在面板里选的功能设置页不显示，在设置页选的面板不显示」。所以：写的一方必须
+     * 落到 App 进程（广播/服务交接），读的一方按戳和解，一次丢手能自愈。
+     */
+    fun functionBackend(context: Context): PinBackend = object : PinBackend {
+        private val local get() = FunctionPinStore.backend(fallbackMirror(context))
+
+        override fun read(): String {
+            val localBackend = local
+            val remotePrefs = RemoteBridge.remote ?: return localBackend.read()
+            val remoteBackend = FunctionPinStore.backend(remotePrefs)
+
+            val decision = PinsSync.decide(
+                localValue = localBackend.read(),
+                localRev = localBackend.readRev(),
+                remoteValue = remoteBackend.read(),
+                remoteRev = remoteBackend.readRev(),
+            )
+            when (decision.source) {
+                PinsSync.Source.REMOTE -> {
+                    // 一次 commit，理由同 pinBackend：这是个被管理页监听的同一个文件。
+                    localBackend.writeWithRev(decision.value, decision.rev)
+                }
+                PinsSync.Source.LOCAL -> if (decision.pushBack) {
+                    runCatching { remoteBackend.writeWithRev(decision.value, decision.rev) }
+                }
+                PinsSync.Source.NONE -> Unit
+            }
+            return decision.value
+        }
+
+        override fun write(value: String) {
+            val rev = System.currentTimeMillis()
+            local.writeWithRev(value, rev)
+            val r = RemoteBridge.remote
+            if (r != null) {
+                runCatching { FunctionPinStore.backend(r).writeWithRev(value, rev) }
+            } else {
+                RemoteBridge.start(context)
+            }
+            broadcastFunctions(context, value, rev)
+        }
+
+        override fun readRev(): Long = local.readRev()
+
+        override fun writeRev(rev: Long) {
+            local.writeRev(rev)
+            RemoteBridge.remote?.let { runCatching { FunctionPinStore.backend(it).writeRev(rev) } }
+        }
+
+        /**
+         * 带上调用方的戳一次写完（本地 + 共享组）。
+         *
+         * 必须覆盖接口默认实现：默认是 `write(value)` + `writeRev(rev)`，而 `write` 会**重新盖戳**
+         * （`System.currentTimeMillis()`）—— 交接来的编辑会被改成「现在」，比对面刚写的那一笔看起来
+         * 更新，正是 [PinsSync.shouldApplyPush] 要防的事。
+         */
+        override fun writeWithRev(value: String, rev: Long) {
+            local.writeWithRev(value, rev)
+            RemoteBridge.remote?.let { r ->
+                runCatching { FunctionPinStore.backend(r).writeWithRev(value, rev) }
+            }
+        }
+    }
+
+    /** 面板可能正开着：把功能收藏直接推给 SystemUI（与 [broadcastPins] 同一通道、同一规则）。 */
+    fun broadcastFunctions(context: Context, value: String, rev: Long) {
+        runCatching {
+            val intent = android.content.Intent(PinSyncReceiver.ACTION_TO_SYSTEMUI)
+                .setPackage(PinSyncReceiver.SYSTEMUI_PACKAGE)
+                .putExtra(PinSyncReceiver.EXTRA_FUNCTIONS, value)
+                .putExtra(PinSyncReceiver.EXTRA_FUNCTIONS_REV, rev)
+            context.sendBroadcast(intent)
+        }
+    }
+
+    /**
+     * 功能收藏由 SystemUI 面板推过来时落盘：保留发送方的戳、比本地旧就丢（不回推）—— 规则与
+     * [applyPushedPins] 完全相同，理由见那里的注释。
+     */
+    fun applyPushedFunctions(context: Context, value: String, rev: Long) {
+        val local = FunctionPinStore.backend(fallbackMirror(context))
+        val localRev = local.readRev()
+        if (!PinsSync.shouldApplyPush(rev, localRev)) {
+            android.util.Log.i(
+                TAG,
+                "FUNCTION_PUSH_DROPPED rev=$rev localRev=$localRev len=${value.length}",
+            )
+            return
+        }
+        local.writeWithRev(value, rev)
+        RemoteBridge.remote?.let { r ->
+            runCatching { FunctionPinStore.backend(r).writeWithRev(value, rev) }
         }
     }
 

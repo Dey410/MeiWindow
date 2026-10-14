@@ -108,6 +108,9 @@ object ModuleLogDiagnosis {
         // MON_SYSTEM_CANCEL 是"这一笔被系统抢走"的唯一证据。
         "MON_DOWN", "MON_STROKE_END", "MON_ACTIVATE", "MON_SYSTEM_CANCEL", "MON_INPUT_READY",
         "MON_PILFER", "MON_WARMUP", "SYSTEMUI_CORNER_READY", "MON_IME_PROBE",
+        // 功能页（快捷方式）：扫没扫到、送没送到、面板里的编辑有没有交给 App。
+        "SHORTCUT_SCAN", "SHORTCUT_REFRESH_REJECTED", "FUNCTION_WRITE_HANDOFF",
+        "FUNCTION_REMOTE_CHANGED", "FUNCTION_SYNC_FROM_APP_",
     )
 
     fun moduleLines(lines: List<String>): List<String> =
@@ -737,6 +740,51 @@ object ModuleLogDiagnosis {
                         else -> "本次校准没有成功：有效样本不足 3 个（按压没能让气压升高），阈值仍在用灵敏度预设或上一次的校准值" + delivery
                     },
                     evidence = trimPrefix(calibrationEvidence),
+                ),
+            )
+        }
+
+        // 功能页（快捷方式）：功能列表是 SystemUI 扫出来、经 ContentProvider 交给 App 的，
+        // 「页面上什么都没有」可能是好几种完全不同的原因 —— 枚举不完整（LauncherApps 没答上来）、
+        // 扫到了但没送到、只是内容没变而跳过了重复上报、或者面板里的编辑没能交给 App 落盘。
+        val scan = lines.lastOrNull { it.contains("SHORTCUT_SCAN") }
+        val functionHandoff = lines.lastOrNull { it.contains("FUNCTION_WRITE_HANDOFF") }
+        val refreshRejected = lines.lastOrNull { it.contains("SHORTCUT_REFRESH_REJECTED") }
+        val shortcutEvidence = scan ?: functionHandoff ?: refreshRejected
+        if (shortcutEvidence != null) {
+            val result = scan?.let { markerWord(it, "result=") }
+            val items = scan?.let { markerInt(it, "items=") } ?: 0
+            // 广播只报「发出去了没有」：sendBroadcast 不告诉我们对面收没收下（那是 App 进程的事，
+            // 它的日志不在这份文件里）。所以措辞是「已发出」，不是「已送达」。
+            val handoffFailed = functionHandoff?.contains("broadcast=false") == true
+            add(
+                DiagnosisCheck(
+                    id = "behaviour.shortcuts",
+                    group = CheckGroup.BEHAVIOUR,
+                    title = "功能页（快捷方式）",
+                    status = when {
+                        handoffFailed -> CheckStatus.WARN
+                        result == "FAILED" -> CheckStatus.WARN
+                        result == "SENT" && items > 0 -> CheckStatus.PASS
+                        else -> CheckStatus.INFO
+                    },
+                    detail = when {
+                        scan == null -> "还没有扫描记录：SystemUI 侧一次都没枚举过功能列表"
+                        result == "INCOMPLETE" ->
+                            "这次枚举不完整（LauncherApps 没答上来或还没解锁），已按「不可信」处理：" +
+                                "**没有**用它覆盖设置应用里的列表（页面这时只显示静态兜底的那几条）"
+                        result == "FAILED" ->
+                            "扫到 $items 条但**没能交给设置应用**（分片没被确认），功能页会一直空着"
+                        result == "SENT" && items > 0 ->
+                            "最近一次枚举 $items 条，已交给设置应用" +
+                                // 注意用 " ms="：`items=137` 里也含 "ms="，裸 marker 会取到 137。
+                                (scan.let { markerInt(it, " ms=") }?.let { "（耗时 ${it}ms）" } ?: "")
+                        result == "UNCHANGED" -> "内容与上一次一致，跳过了重复上报（正常）"
+                        result == "EMPTY" -> "这次枚举到 0 条（真的没有可枚举的快捷方式），已通知设置应用清掉旧条目"
+                        items == 0 -> "枚举到 0 条功能"
+                        else -> "最近一次枚举 $items 条（result=${result ?: "?"}）"
+                    } + if (handoffFailed) "；另外面板里刚才那次功能收藏的编辑**没能发出去**（广播失败）" else "",
+                    evidence = trimPrefix(shortcutEvidence),
                 ),
             )
         }

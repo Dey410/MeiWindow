@@ -29,13 +29,13 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  */
 object TopBarBlurConfig {
     /** 模糊半径（dp），模糊最强处的强度 */
-    const val BlurRadius: Float = 15f
+    const val BlurRadius: Float = 20f
 
     /** 渐变曲线指数：1 = 线性；>1 让模糊更快衰减到清晰端 */
-    const val GradientCurve: Float = 10f
+    const val GradientCurve: Float = 2.0f
 
     /** 顶栏 surface 背景混合透明度（0~1），越大栏越实 */
-    const val SurfaceAlpha: Float = 0.3f
+    const val SurfaceAlpha: Float = 0.35f
 
     /**
      * 滚动渐显距离（dp）：内容下滑该距离内，模糊从透明渐显到完整。
@@ -95,7 +95,7 @@ fun BlurredBar(
                         drawRect(
                             brush = Brush.verticalGradient(
                                 0.0f to Color.Black,
-                                0.6f to Color.Black,
+                                0.5f to Color.Black,
                                 1.0f to Color.Transparent,
                             ),
                             blendMode = BlendMode.DstIn,
@@ -108,7 +108,13 @@ fun BlurredBar(
                         blurRadius = TopBarBlurConfig.BlurRadius,
                     )
                     .background(
-                        MiuixTheme.colorScheme.surface.copy(TopBarBlurConfig.SurfaceAlpha),
+                        brush = Brush.verticalGradient(
+                            0.0f to MiuixTheme.colorScheme.surface.copy(TopBarBlurConfig.SurfaceAlpha),
+                            0.7f to MiuixTheme.colorScheme.surface.copy(TopBarBlurConfig.SurfaceAlpha * 0.7f),
+                            // 透明端要用「同一个底色 + alpha=0」，不能用 Color.Transparent：那是
+                            // 黑色透明，渐变过程会把栏底压灰一圈。
+                            1.0f to MiuixTheme.colorScheme.surface.copy(alpha = 0f),
+                        ),
                     ),
             )
         }

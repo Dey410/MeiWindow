@@ -143,6 +143,11 @@ object PanelContentFactory {
         onLaunch: (com.repl.bubbledrawer.pinyin.BubbleApp) -> Unit,
         onClose: () -> Unit,
         onFocusChange: ((Boolean) -> Unit)? = null,
+        onLaunchShortcut: ((com.repl.bubbledrawer.shortcut.ShortcutItem) -> Unit)? = { item ->
+            com.repl.bubbledrawer.shortcut.ShortcutRepository.launchShortcut(context, item)
+            onClose()
+        },
+        onOpenManage: ((Int) -> Unit)? = null,
     ): ComposeView {
         val owners = OverlayComposeOwners()
         // Resume BEFORE the first composition: the recomposer reads the lifecycle state on
@@ -180,6 +185,8 @@ object PanelContentFactory {
                         onToggleManage = model::toggleManageMode,
                         manageLabel = manageLabelOf(model),
                         backdrop = backdrop,
+                        onLaunchShortcut = onLaunchShortcut,
+                        onOpenManage = onOpenManage,
                     )
                 }
             }

@@ -49,7 +49,11 @@ import com.repl.bubbledrawer.launch.FreeformTrigger
 import com.repl.bubbledrawer.launch.FullscreenLaunchStrategy
 import com.repl.bubbledrawer.launch.ILaunchStrategy
 import com.repl.bubbledrawer.pin.PanelContentFactory
+import com.repl.bubbledrawer.pin.PinManageActivity
 import com.repl.bubbledrawer.pin.PinManageModel
+import com.repl.bubbledrawer.shortcut.FunctionPinStore
+import com.repl.bubbledrawer.shortcut.ShortcutItem
+import com.repl.bubbledrawer.shortcut.ShortcutRepository
 import kotlinx.coroutines.launch
 
 /**
@@ -92,14 +96,13 @@ class FanHost(
      * do not exist on that object, and `XposedServiceHelper` does not deliver to
      * hook processes either — only to the module's own app process).
      *
-     * So the write path is a round-trip to the module APP process:
-     * [PinSyncService] (exported, guarded by a caller-uid check) applies the encoded
+     * So the write path is a round-trip to the module APP process: [PinSyncReceiver]
+     * (exported manifest receiver, guarded by a caller-identity check) applies the encoded
      * order through the ordinary app-side backend (local mirror + LSPosed remote group),
-     * which is exactly what the manage Activity writes. SystemUI runs as system (uid
-     * 1000), so `startService` from here is allowed to reach the module app even when it
-     * is not running. Until the round-trip lands, the in-memory overlay below keeps the
-     * FAN consistent within this SystemUI lifetime (the original ItemTouchHelper also
-     * only re-read on next show).
+     * which is exactly what the manage Activity writes. Explicit broadcasts to a manifest
+     * receiver cold-start the module app even when it is not running. Until the round-trip
+     * lands, the in-memory overlay below keeps the FAN consistent within this SystemUI
+     * lifetime (the original ItemTouchHelper also only re-read on next show).
      */
     @Volatile
     private var pinsOverlay: String? = null
@@ -134,8 +137,9 @@ class FanHost(
             )
             when (decision.source) {
                 PinsSync.Source.REMOTE -> {
-                    localBackend.write(decision.value)
-                    localBackend.writeRev(decision.rev)
+                    // 值与戳一次 commit（见 PinBackend.writeWithRev）：同一文件上的监听者若在两次
+                    // commit 之间读一次，看到的是「新值 + 旧戳」，平票会把旧值判给远端。
+                    localBackend.writeWithRev(decision.value, decision.rev)
                 }
                 PinsSync.Source.LOCAL -> if (decision.pushBack) {
                     // Our copy is newer than the shared group — the app never applied the
@@ -153,8 +157,7 @@ class FanHost(
             val rev = System.currentTimeMillis()
             pinsOverlay = value
             val localBackend = local
-            localBackend.write(value)
-            localBackend.writeRev(rev)
+            localBackend.writeWithRev(value, rev)
             pushPinsToApp(value, rev)
         }
 
@@ -164,6 +167,81 @@ class FanHost(
             local.writeRev(rev)
         }
     })
+
+    /**
+     * 「已选功能」（快捷方式收藏）在 SystemUI 侧的存储 —— 与 [pinStore] 同一套规则，只换了 key。
+     *
+     * 为什么不能直接用 [com.repl.bubbledrawer.shortcut.FunctionPinStore.getPins]：那个入口读的是
+     * `RemoteBridge.remote`，而它只在 App 进程被绑定过（hook 进程拿不到），于是会退到
+     * `RemoteBridge.local(context)` —— 那是 **SystemUI 自己的 cfg 文件**，App 永远读不到，
+     * 写进去也只有 SystemUI 自己看得见。功能页第一版正是如此：面板里选的功能设置页不显示，
+     * 设置页选的面板不显示。
+     *
+     * 现在与收藏应用逐条对齐：读 = 本会话覆盖 >（SystemUI 本地副本 与 远程镜像按戳和解，必要时把
+     * 赢家推回 App）；写 = 本会话覆盖 + SystemUI 本地副本（重启不丢）+ 交给 App 进程落盘
+     * （广播 + 服务，同一条交接通道）。
+     */
+    @Volatile
+    private var functionsOverlay: String? = null
+
+    private val functionsLocal get() = FunctionPinStore.backend(sysUiPrefs)
+    private val functionsRemote get() = FunctionPinStore.backend(prefs)
+
+    /** 面板读：[com.repl.bubbledrawer.shortcut.FunctionPinStore] 的键列表。 */
+    private fun readFunctionPins(): List<String> {
+        functionsOverlay?.let { return FunctionPinStore.decode(it) }
+        val local = functionsLocal
+        val remoteValue = runCatching { functionsRemote.read() }.getOrDefault("")
+        val remoteRev = runCatching { functionsRemote.readRev() }.getOrDefault(0L)
+        val decision = PinsSync.decide(
+            localValue = local.read(),
+            localRev = local.readRev(),
+            remoteValue = remoteValue,
+            remoteRev = remoteRev,
+        )
+        when (decision.source) {
+            PinsSync.Source.REMOTE -> {
+                local.writeWithRev(decision.value, decision.rev)
+                functionsOverlay = null
+            }
+            // 本地更新 = 上一次交接没落地（App 被 HyperOS 冻结、广播丢了…）：再交一次，
+            // 否则下一次 SystemUI 启动读的还是旧值（与 pinStore 的 pushBack 同因）。
+            PinsSync.Source.LOCAL -> if (decision.pushBack) {
+                pushFunctionsToApp(decision.value, decision.rev)
+            }
+            PinsSync.Source.NONE -> Unit
+        }
+        return FunctionPinStore.decode(decision.value)
+    }
+
+    /** 面板写：本地立刻一致（覆盖），落 SystemUI 本地副本，再交给 App 进程。 */
+    private fun writeFunctionPins(pins: List<String>) {
+        val value = FunctionPinStore.encode(pins)
+        val rev = System.currentTimeMillis()
+        functionsOverlay = value
+        val local = functionsLocal
+        local.writeWithRev(value, rev)
+        pushFunctionsToApp(value, rev)
+    }
+
+    private fun pushFunctionsToApp(value: String, rev: Long) {
+        val deliveredBroadcast = runCatching {
+            val intent = Intent(PinSyncReceiver.ACTION)
+                .setClassName(ModuleResources.MODULE_PACKAGE, "com.repl.bubbledrawer.xposed.PinSyncReceiver")
+                .putExtra(PinSyncReceiver.EXTRA_FUNCTIONS, value)
+                .putExtra(PinSyncReceiver.EXTRA_FUNCTIONS_REV, rev)
+            host.sendBroadcast(intent)
+            true
+        }.getOrDefault(false)
+
+        // 与 pushPinsToApp 同一条通道、同样的理由（那条 service 兜底腿因为身份校验形同虚设已删除）。
+        logger(
+            if (deliveredBroadcast) Log.INFO else Log.WARN,
+            "FUNCTION_WRITE_HANDOFF broadcast=$deliveredBroadcast " +
+                "rev=$rev valueLen=${value.length}",
+            null,
+        )
+    }
 
     /**
      * The pin store's read trace, THROTTLED.
@@ -215,19 +293,14 @@ class FanHost(
             true
         }.getOrDefault(false)
 
-        val deliveredService = runCatching {
-            val intent = Intent(PinSyncService.ACTION)
-                .setClassName(ModuleResources.MODULE_PACKAGE, "com.repl.bubbledrawer.xposed.PinSyncService")
-                .putExtra(PinSyncService.EXTRA_PINS, value)
-                .putExtra(PinSyncService.EXTRA_REV, rev)
-            context.startService(intent)
-            true
-        }.getOrDefault(false)
-
+        // 曾经还有一条 startService 的兜底腿，已删除。它**不是**安全边界：onStartCommand 跑在主线程的
+        // Handler 消息里，`Binder.getCallingUid()` 在没有「正在处理的 IPC 事务」时返回的是**本进程自己**
+        // 的 uid，于是那个 `callerUid == Process.myUid()` 分支对任何调用者都成立 —— 任何应用都能用它把
+        // 两份收藏写成空。而它作为兜底也不成立：跨应用后台 startService 在 Android 8+ 本就会被拦。
+        // 现在只剩广播这条腿（清单接收者会被系统拉起进程，设备上一直就是这样工作的）。
         logger(
-            if (deliveredBroadcast || deliveredService) Log.INFO else Log.WARN,
-            "PIN_WRITE_HANDOFF broadcast=$deliveredBroadcast service=$deliveredService " +
-                "rev=$rev valueLen=${value.length}",
+            if (deliveredBroadcast) Log.INFO else Log.WARN,
+            "PIN_WRITE_HANDOFF broadcast=$deliveredBroadcast rev=$rev valueLen=${value.length}",
             null,
         )
     }
@@ -302,6 +375,7 @@ class FanHost(
     private var screenOffReceiver: android.content.BroadcastReceiver? = null
     private var pinsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
     private var syncFromAppReceiver: android.content.BroadcastReceiver? = null
+    private var shortcutRequestReceiver: android.content.BroadcastReceiver? = null
 
     private val scope = kotlinx.coroutines.CoroutineScope(
         kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob(),
@@ -355,8 +429,7 @@ class FanHost(
                 val localRev = localBackend.readRev()
                 val adopted = PinsSync.shouldAdoptOnKeyEvent(remoteRev, localRev)
                 if (adopted) {
-                    localBackend.write(remoteValue)
-                    localBackend.writeRev(remoteRev)
+                    localBackend.writeWithRev(remoteValue, remoteRev)
                     pinsOverlay = null
                 }
                 logger(
@@ -366,6 +439,26 @@ class FanHost(
                     null,
                 )
                 rebindFanIfBusy()
+            } else if (key == FunctionPinStore.KEY_PINNED_FUNCTIONS || key == FunctionPinStore.PREFS_KEY_REV) {
+                // 功能收藏的同款逐 key 回调（为什么不回推见上面 PIN_REMOTE_CHANGED 那段）：
+                // 远端戳不小于本地就采纳，其余什么都不做，和解交给读路径。
+                val remoteRev = runCatching { functionsRemote.readRev() }.getOrDefault(0L)
+                val remoteValue = runCatching { functionsRemote.read() }.getOrDefault("")
+                val localBackend = functionsLocal
+                val localRev = localBackend.readRev()
+                val adopted = PinsSync.shouldAdoptOnKeyEvent(remoteRev, localRev)
+                if (adopted) {
+                    localBackend.writeWithRev(remoteValue, remoteRev)
+                    functionsOverlay = null
+                }
+                logger(
+                    Log.INFO,
+                    "FUNCTION_REMOTE_CHANGED remoteRev=$remoteRev localRev=$localRev adopted=$adopted " +
+                        "functions=${FunctionPinStore.decode(localBackend.read()).size}",
+                    null,
+                )
+                // 面板开着就顺手刷新（回调线程不保证是主线程，而这里是 Compose 状态）。
+                mainHandler.post { if (moreUp) moreContent?.refreshFunctionPins() }
             } else if (key == RemotePrefs.KEY_FAN_ICON_COUNT || key == RemotePrefs.KEY_FAN_RADIUS_DP ||
                 key == RemotePrefs.KEY_FAN_AUTO_FILL_RECOMMEND || key == RemotePrefs.KEY_FAN_ICON_DP ||
                 key == RemotePrefs.KEY_FAN_ICON_SHAPE
@@ -405,26 +498,57 @@ class FanHost(
         // Direct broadcast receiver from App (e.g. PinManageActivity in settings app)
         val syncFromApp = object : android.content.BroadcastReceiver() {
             override fun onReceive(c: Context?, intent: Intent?) {
-                val raw = intent?.getStringExtra(PinSyncReceiver.EXTRA_PINS) ?: return
-                if (!PinSyncReceiver.isPlausiblePinsValue(raw)) return
-                val rev = intent.getLongExtra(PinSyncReceiver.EXTRA_REV, 0L)
-                val localBackend = PrefsPinBackend(sysUiPrefs)
-                val localRev = localBackend.readRev()
-                if (PinsSync.shouldApplyPush(rev, localRev)) {
-                    // The app's copy is at least as new: adopt it and drop our session overlay,
-                    // so reads stop pinning this session's earlier edit.
-                    localBackend.write(raw)
-                    localBackend.writeRev(if (rev > 0L) rev else System.currentTimeMillis())
-                    pinsOverlay = null
-                    rebindFanIfBusy()
-                    logger(Log.INFO, "PIN_SYNC_FROM_APP_APPLIED len=${raw.length} rev=$rev", null)
-                } else {
-                    // A stale delivery (a duplicate, or one produced by the handoff ping-pong):
-                    // drop it and DO NOT push ours back. The app finds out its copy is behind on
-                    // its next read — `PinsSync.decide` pushes the winner back there, where both
-                    // keys have already landed. Replying here is what made the two stores
-                    // oscillate. See [PinsSync.shouldApplyPush].
-                    logger(Log.WARN, "PIN_SYNC_FROM_APP_STALE rev=$rev localRev=$localRev", null)
+                // 这个 action 是导出的：不验发送方，任何应用都能用 pins="" / functions="" 把用户的
+                // 收藏洗掉（先写进 SystemUI 本地副本，再被读路径当成"本地更新"推回 App，永久生效）。
+                // 合法的发送方只有模块自己的 App 进程（SettingsStore.broadcastPins / broadcastFunctions）。
+                if (!isFromModuleApp(this)) {
+                    logger(
+                        Log.WARN,
+                        "PIN_SYNC_REJECTED_SENDER uid=${runCatching { sentFromUid }.getOrNull()}",
+                        null,
+                    )
+                    return
+                }
+                val raw = intent?.getStringExtra(PinSyncReceiver.EXTRA_PINS)
+                if (raw != null && PinSyncReceiver.isPlausiblePinsValue(raw)) {
+                    val rev = intent.getLongExtra(PinSyncReceiver.EXTRA_REV, 0L)
+                    val localBackend = PrefsPinBackend(sysUiPrefs)
+                    val localRev = localBackend.readRev()
+                    if (PinsSync.shouldApplyPush(rev, localRev)) {
+                        // The app's copy is at least as new: adopt it and drop our session overlay,
+                        // so reads stop pinning this session's earlier edit.
+                        localBackend.writeWithRev(raw, if (rev > 0L) rev else System.currentTimeMillis())
+                        pinsOverlay = null
+                        rebindFanIfBusy()
+                        logger(Log.INFO, "PIN_SYNC_FROM_APP_APPLIED len=${raw.length} rev=$rev", null)
+                    } else {
+                        // A stale delivery (a duplicate, or one produced by the handoff ping-pong):
+                        // drop it and DO NOT push ours back. The app finds out its copy is behind on
+                        // its next read — `PinsSync.decide` pushes the winner back there, where both
+                        // keys have already landed. Replying here is what made the two stores
+                        // oscillate. See [PinsSync.shouldApplyPush].
+                        logger(Log.WARN, "PIN_SYNC_FROM_APP_STALE rev=$rev localRev=$localRev", null)
+                    }
+                }
+
+                // 「已选功能」走同一条广播，规则一模一样。
+                val functions = intent?.getStringExtra(PinSyncReceiver.EXTRA_FUNCTIONS)
+                if (functions != null && PinSyncReceiver.isPlausibleFunctionsValue(functions)) {
+                    val rev = intent.getLongExtra(PinSyncReceiver.EXTRA_FUNCTIONS_REV, 0L)
+                    val localBackend = functionsLocal
+                    val localRev = localBackend.readRev()
+                    if (PinsSync.shouldApplyPush(rev, localRev)) {
+                        localBackend.writeWithRev(functions, if (rev > 0L) rev else System.currentTimeMillis())
+                        functionsOverlay = null
+                        logger(
+                            Log.INFO,
+                            "FUNCTION_SYNC_FROM_APP_APPLIED len=${functions.length} rev=$rev",
+                            null,
+                        )
+                        mainHandler.post { if (moreUp) moreContent?.refreshFunctionPins() }
+                    } else {
+                        logger(Log.WARN, "FUNCTION_SYNC_FROM_APP_STALE rev=$rev localRev=$localRev", null)
+                    }
                 }
             }
         }
@@ -449,7 +573,62 @@ class FanHost(
             host.registerReceiver(r, IntentFilter(Intent.ACTION_SCREEN_OFF), Context.RECEIVER_NOT_EXPORTED)
         }.onSuccess { screenOffReceiver = r }
 
+        // 监听来自 App 端的快捷方式刷新请求广播
+        val shortcutReq = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context?, i: Intent?) {
+                // 这个接收者必须导出（发起方是模块自己的 App 进程），但一次全量扫描 + 几百张
+                // 图标的分片上报是实打实的开销 —— 不能谁发个广播都能按这个按钮。只认模块 App。
+                if (!isFromModuleApp(this)) {
+                    logger(
+                        Log.WARN,
+                        "SHORTCUT_REFRESH_REJECTED sender=${runCatching { sentFromUid }.getOrNull()}",
+                        null,
+                    )
+                    return
+                }
+                scanShortcuts("REQUEST", force = true)
+            }
+        }
+        runCatching {
+            host.registerReceiver(
+                shortcutReq,
+                IntentFilter(com.repl.bubbledrawer.shortcut.ShortcutBridge.ACTION_REQUEST_REFRESH),
+                Context.RECEIVER_EXPORTED,
+            )
+        }.onSuccess { shortcutRequestReceiver = shortcutReq }
+
+        // SystemUI 启动后延迟 2 秒在后台扫描全量快捷方式并上报给 App
+        scanShortcuts("INIT", force = true, delayMs = 2_000L)
     }
+
+    /**
+     * 枚举 → 上报快捷方式，只给 hook 侧用（App 进程没有 ACCESS_SHORTCUTS，读的是缓存）。
+     *
+     * 每次留一行 `SHORTCUT_SCAN`：功能页空着的时候，诊断页要能区分「SystemUI 没扫到」和
+     * 「扫到了但没送到 App」——没有这行标记就只能靠猜。
+     */
+    private fun scanShortcuts(reason: String, force: Boolean = false, delayMs: Long = 0L) {
+        scope.launch {
+            if (delayMs > 0L) kotlinx.coroutines.delay(delayMs)
+            val started = SystemClock.uptimeMillis()
+            val report = runCatching {
+                com.repl.bubbledrawer.shortcut.ShortcutRepository.scanAndReportFromSystemUi(host, force)
+            }.getOrNull()
+            logger(
+                Log.INFO,
+                "SHORTCUT_SCAN reason=$reason items=${report?.items ?: -1} " +
+                    "result=${report?.result?.name ?: "FAILED"} ms=${SystemClock.uptimeMillis() - started}",
+                null,
+            )
+        }
+    }
+
+    /** 广播是否来自模块自己的 App 进程（hook 进程问 PackageManager 要发送方 uid 的包名）。 */
+    private fun isFromModuleApp(receiver: android.content.BroadcastReceiver): Boolean = runCatching {
+        val uid = receiver.sentFromUid
+        if (uid == android.os.Process.myUid()) return@runCatching true
+        host.packageManager.getPackagesForUid(uid)?.contains(ModuleResources.MODULE_PACKAGE) == true
+    }.getOrDefault(false)
 
     // ---------------- app list freshness (the boot/locked-enumeration trap) ----------------
 
@@ -506,6 +685,7 @@ class FanHost(
                     dock.show(currentCorner(), screenW(), screenH(), snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend)
                 }
             }
+            scanShortcuts("APP_LIST_RELOAD")
         }
     }
 
@@ -1162,6 +1342,11 @@ class FanHost(
             },
             // 分身角标：面板里的图标与扇子同源（都按这次快照决定要不要叠角标）。
             cloneBadge = RemotePrefs.read(prefs).cloneBadge,
+            loadShortcuts = {
+                com.repl.bubbledrawer.shortcut.ShortcutRepository.loadShortcuts(host)
+            },
+            functionPinsOf = { readFunctionPins() },
+            onFunctionOrderChange = { writeFunctionPins(it) },
         )
         // Panel window root FIRST, then the Compose content inside it: the view-tree
         // owners must be tagged on the window root too (see PanelContentFactory.create
@@ -1206,6 +1391,21 @@ class FanHost(
                     lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                 }
                 runCatching { wm.updateViewLayout(panel, lp) }
+            },
+            onLaunchShortcut = { item ->
+                // 面板在 SystemUI 里：小窗开关必须从远程组读（见 ShortcutRepository.launchShortcut
+                // 的注释），启动后收起面板（与 PanelContentFactory 的默认行为一致）。
+                ShortcutRepository.launchShortcut(host, item, RemotePrefs.read(prefs).freeform)
+                hideMorePanel()
+            },
+            onOpenManage = { targetTab ->
+                hideMorePanel(animated = false)
+                val intent = Intent().apply {
+                    setClassName(ModuleResources.MODULE_PACKAGE, "com.repl.bubbledrawer.pin.PinManageActivity")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    putExtra(PinManageActivity.EXTRA_INITIAL_TAB, targetTab)
+                }
+                runCatching { host.startActivity(intent) }
             },
         )
         panel.addView(
@@ -1265,6 +1465,11 @@ class FanHost(
         moreContent?.cancelSearch()
         moreContent?.release()
         moreContent = null
+        // 会话覆盖只为一件事存在：同一次面板会话里读到的必须是用户刚点的那个值（交接还没落地时
+        // 也不能被旧值顶回去）。面板一关就没有「刚点的」了 —— 留着它反而会把读路径的自愈
+        // （PinsSync.decide 的 pushBack）挡在门外：那次交接如果没送到 App，就再也没人补。
+        pinsOverlay = null
+        functionsOverlay = null
         moreCatcher?.let { runCatching { wm.removeViewImmediate(it) } }
         moreCatcher = null
         val panel = morePanel
@@ -1394,6 +1599,8 @@ class FanHost(
         unlockReceiver = null
         syncFromAppReceiver?.let { runCatching { host.unregisterReceiver(it) } }
         syncFromAppReceiver = null
+        shortcutRequestReceiver?.let { runCatching { host.unregisterReceiver(it) } }
+        shortcutRequestReceiver = null
         pinsListener?.let { runCatching { prefs.unregisterOnSharedPreferenceChangeListener(it) } }
         pinsListener = null
         mainHandler.removeCallbacks(timeout)

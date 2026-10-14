@@ -22,6 +22,20 @@ interface PinBackend {
     fun write(value: String)
 
     /**
+     * 值与戳**一次**落盘。
+     *
+     * 默认实现是两次写（历史行为），但任何 prefs 后端都必须覆盖它：值与戳是两个 key，而
+     * `OnSharedPreferenceChangeListener` 会在**每一次 commit 之后**同步回调 —— 同一个文件上的
+     * 监听者（管理页、面板）在两次 commit 之间读到的就是「新值 + 旧戳」，[PinsSync.decide] 在
+     * 平戳时会判给远端（共享组是第三个进程会看到的那一份），于是刚点的那一下被旧值顶掉：
+     * 用户看到的是「第二次开始点了没反应」。一次 commit 里写完两个 key 就没有这个窗口。
+     */
+    fun writeWithRev(value: String, rev: Long) {
+        write(value)
+        writeRev(rev)
+    }
+
+    /**
      * Freshness stamp of [read]'s value — epoch millis of the write that produced it,
      * 0 when the backend never stamped one (legacy data).
      *
@@ -38,17 +52,35 @@ interface PinBackend {
     fun writeRev(rev: Long) {}
 }
 
-class PrefsPinBackend(private val prefs: android.content.SharedPreferences) : PinBackend {
-    override fun read(): String = prefs.getString(KEY, "").orEmpty()
+/**
+ * [PinBackend] over any pair of prefs keys — the pins use [PrefsPinBackend]'s names, the
+ * 收藏功能 (shortcuts) use `pinned_functions`, and both follow the same contract: the value and
+ * its stamp are TWO keys, so a reader reconciles them with [PinsSync] instead of trusting one
+ * store (see [PinBackend.readRev]).
+ */
+open class PrefsKeyBackend(
+    private val prefs: android.content.SharedPreferences,
+    private val key: String,
+    private val revKey: String,
+) : PinBackend {
+    override fun read(): String = prefs.getString(key, "").orEmpty()
     override fun write(value: String) {
-        prefs.edit().putString(KEY, value).commit()
+        prefs.edit().putString(key, value).commit()
     }
 
-    override fun readRev(): Long = prefs.getLong(KEY_REV, 0L)
+    override fun readRev(): Long = prefs.getLong(revKey, 0L)
     override fun writeRev(rev: Long) {
-        prefs.edit().putLong(KEY_REV, rev).commit()
+        prefs.edit().putLong(revKey, rev).commit()
     }
 
+    /** 一次 commit 写完值与戳（见 [PinBackend.writeWithRev] 的说明）。 */
+    override fun writeWithRev(value: String, rev: Long) {
+        prefs.edit().putString(key, value).putLong(revKey, rev).commit()
+    }
+}
+
+class PrefsPinBackend(prefs: android.content.SharedPreferences) :
+    PrefsKeyBackend(prefs, KEY, KEY_REV) {
     companion object {
         const val KEY = "long_press_app" // same key name as the original Global setting
         const val KEY_REV = "long_press_app_rev"

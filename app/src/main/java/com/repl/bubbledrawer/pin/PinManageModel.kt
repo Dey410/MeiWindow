@@ -38,7 +38,116 @@ class PinManageModel(
      * 那张，这一项只管要不要叠角标。
      */
     val cloneBadge: Boolean = com.repl.bubbledrawer.xposed.RemotePrefs.DEFAULT_CLONE_BADGE,
+    private val loadShortcuts: (suspend () -> Pair<List<com.repl.bubbledrawer.shortcut.ShortcutItem>, List<com.repl.bubbledrawer.shortcut.ShortcutItem>>)? = null,
+    initialTab: Int = 0,
+    private val functionPinsOf: () -> List<String> = { emptyList() },
+    private val onFunctionOrderChange: (List<String>) -> Unit = {},
 ) {
+    /** 0 = 应用 (Apps), 1 = 功能 (Shortcuts / Features) */
+    var selectedTab: Int by mutableStateOf(initialTab)
+        private set
+
+    fun selectTab(index: Int) {
+        if (selectedTab != index) {
+            selectedTab = index
+        }
+    }
+
+    var functionPins: List<String> by mutableStateOf(emptyList())
+        private set
+
+    fun refreshFunctionPins() {
+        functionPins = functionPinsOf()
+    }
+
+    fun isFunctionPinned(item: com.repl.bubbledrawer.shortcut.ShortcutItem): Boolean =
+        functionPins.contains(item.pinKey)
+
+    fun toggleFunctionPin(item: com.repl.bubbledrawer.shortcut.ShortcutItem) {
+        val key = item.pinKey
+        val next = if (functionPins.contains(key)) functionPins - key else functionPins + key
+        // 同 [togglePin]：刚写下的这一份就是权威。写入会同步触发 prefs 监听（值 + 戳两个 key 在
+        // 同一个文件里），监听者回头再读一次可能拿到撕裂的那一对，于是刚点的这一下被旧值顶掉 ——
+        // 用户看到的是「第二次开始点了没反应」。写回之后这里再断言一次，页面与手一致。
+        functionPins = next
+        onFunctionOrderChange(next)
+        functionPins = next
+    }
+
+    var appShortcuts: List<com.repl.bubbledrawer.shortcut.ShortcutItem> by mutableStateOf(emptyList())
+        private set
+
+    var desktopShortcuts: List<com.repl.bubbledrawer.shortcut.ShortcutItem> by mutableStateOf(emptyList())
+        private set
+
+    val allShortcuts: List<com.repl.bubbledrawer.shortcut.ShortcutItem>
+        get() {
+            val list = mutableListOf<com.repl.bubbledrawer.shortcut.ShortcutItem>()
+            val seen = mutableSetOf<String>()
+            for (item in appShortcuts + desktopShortcuts) {
+                if (seen.add(item.pinKey)) {
+                    list.add(item)
+                }
+            }
+            return list
+        }
+
+    /** 需求 3：从扇形面板打开的更多应用，只显示用户手动添加的功能 */
+    val pinnedFunctions: List<com.repl.bubbledrawer.shortcut.ShortcutItem>
+        get() {
+            val allMap = allShortcuts.associateBy { it.pinKey }
+            val list = functionPins.mapNotNull { allMap[it] }
+            if (!isSearching || searchQuery.isBlank()) return list
+            val q = searchQuery.trim()
+            return list.filter {
+                it.label.contains(q, ignoreCase = true) || it.subLabel?.contains(q, ignoreCase = true) == true
+            }
+        }
+
+    /**
+     * 拼音排序键缓存。
+     *
+     * 这些 getter 在一次组合里会被读好几遍（列表、字母条、空态判断…），而 `AppSortKey.of` 是
+     * 一次汉字→拼音转换 —— 不缓存就是同一个应用名反复转换；面板里那还是 SystemUI 的主线程。
+     */
+    private val functionSortKeys = HashMap<String, String>()
+
+    private fun functionSortKey(appName: String): String =
+        functionSortKeys.getOrPut(appName) { com.repl.bubbledrawer.pinyin.AppSortKey.of(appName) }
+
+    /** 需求 5：以应用名称为小标题作为分类，应用名称使用拼音排序 */
+    val groupedFunctions: List<AppFunctionGroup>
+        get() {
+            val query = if (isSearching) searchQuery.trim() else ""
+            val groups = mutableMapOf<String, MutableList<com.repl.bubbledrawer.shortcut.ShortcutItem>>()
+            for (item in allShortcuts) {
+                val appName = item.subLabel?.ifBlank { null } ?: item.label
+                if (query.isNotEmpty() && !item.label.contains(query, ignoreCase = true) && !appName.contains(query, ignoreCase = true)) {
+                    continue
+                }
+                groups.getOrPut(appName) { mutableListOf() }.add(item)
+            }
+            return groups.map { (appName, items) ->
+                AppFunctionGroup(
+                    appName = appName,
+                    sortKey = functionSortKey(appName),
+                    items = items,
+                )
+            }.sortedBy { it.sortKey }
+        }
+
+    val functionLetters: List<String>
+        get() {
+            val list = mutableListOf<String>()
+            list.add("★")
+            val lettersFromGroups = groupedFunctions.map { group ->
+                val ch = group.sortKey.firstOrNull()?.uppercaseChar() ?: '#'
+                if (ch in 'A'..'Z') ch.toString() else "#"
+            }.distinct()
+            list.addAll(lettersFromGroups)
+            return list.distinct()
+        }
+
     /** false = view mode (tap launches); true = edit mode (tap pins, long-press drags). */
     var manageMode: Boolean by mutableStateOf(false)
         private set
@@ -144,6 +253,31 @@ class PinManageModel(
         scope.launch {
             apps = loadApps()
             rebuild()
+            functionPins = functionPinsOf()
+            loadShortcuts?.let { loader ->
+                runCatching {
+                    val (appsList, desktopList) = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                        loader()
+                    }
+                    appShortcuts = appsList
+                    desktopShortcuts = desktopList
+                }
+            }
+        }
+    }
+
+    @MainThread
+    fun refreshShortcuts() {
+        scope.launch {
+            loadShortcuts?.let { loader ->
+                runCatching {
+                    val (appsList, desktopList) = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                        loader()
+                    }
+                    appShortcuts = appsList
+                    desktopShortcuts = desktopList
+                }
+            }
         }
     }
 
@@ -153,7 +287,10 @@ class PinManageModel(
      * pre-edit list on screen next to a panel that showed the new one.
      */
     @MainThread
-    fun refreshPins() = rebuild()
+    fun refreshPins() {
+        refreshFunctionPins()
+        rebuild()
+    }
 
     @MainThread
     fun toggleManageMode() {
@@ -258,3 +395,12 @@ class PinManageModel(
         scope.cancel()
     }
 }
+
+/**
+ * 需求 5：以应用名称为小标题分类的功能分组
+ */
+data class AppFunctionGroup(
+    val appName: String,
+    val sortKey: String,
+    val items: List<com.repl.bubbledrawer.shortcut.ShortcutItem>,
+)

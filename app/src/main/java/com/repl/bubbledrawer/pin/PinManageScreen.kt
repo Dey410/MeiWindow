@@ -2,16 +2,24 @@ package com.repl.bubbledrawer.pin
 
 import android.content.res.Configuration
 import android.graphics.drawable.Drawable
-import com.repl.bubbledrawer.data.AppIconCache
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -22,25 +30,37 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalConfiguration
@@ -49,25 +69,31 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.DpSize
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
+import top.yukonga.miuix.kmp.blur.LayerBackdrop
+import top.yukonga.miuix.kmp.blur.textureBlur
 import com.repl.bubbledrawer.R
-import com.repl.bubbledrawer.data.AppRepository
+import com.repl.bubbledrawer.data.AppIconCache
 import com.repl.bubbledrawer.pinyin.BubbleApp
+import com.repl.bubbledrawer.shortcut.ShortcutBridge
+import com.repl.bubbledrawer.shortcut.ShortcutItem
+import com.repl.bubbledrawer.shortcut.ShortcutRepository
 import com.repl.bubbledrawer.ui.theme.StatusColors
 import com.repl.bubbledrawer.ui.util.BlurredBar
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandHorizontally
-import androidx.compose.animation.shrinkHorizontally
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.ui.unit.DpSize
 import com.repl.bubbledrawer.ui.util.PageBottomSpacer
 import com.repl.bubbledrawer.ui.util.horizontalCutoutPadding
 import com.repl.bubbledrawer.ui.util.pageBackdrop
 import com.repl.bubbledrawer.ui.util.pageScroll
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.InputField
@@ -78,19 +104,14 @@ import top.yukonga.miuix.kmp.icon.extended.ListView
 import top.yukonga.miuix.kmp.icon.extended.Search
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
-/**
- * The 管理页 (`SlideLaunchAppSettings` 应用 tab slice) in Compose. ONE page serves both
- * hosts (方案 B): [Chrome.ACTIVITY] lets the Activity draw the miuix bar; [Chrome.PANEL]
- * draws the 56dp look-alike bar itself because the overlay window has no action bar.
- *
- * Grid: 4 columns (f10411g0 = 4, SlideLaunchAppSettings:87); head/label/empty rows take a
- * full span (LightWeightOpenSettings' SpanSizeLookup idiom :193-198). View-mode tap
- * launches (original AbstractC2806s.m9105e with start_windowmode=true); manage-mode tap
- * toggles the pin; long-press on a ★ cell starts the drag (ItemTouchHelper semantics).
- */
 enum class Chrome { ACTIVITY, PANEL }
 
 private const val GRID_SPAN = 4
+
+private sealed interface PinnedEntry {
+    data class App(val app: BubbleApp) : PinnedEntry
+    data class Function(val item: ShortcutItem) : PinnedEntry
+}
 
 @Composable
 fun PinManageScreen(
@@ -102,101 +123,443 @@ fun PinManageScreen(
     onClose: (() -> Unit)?,
     onToggleManage: () -> Unit,
     manageLabel: String,
-    topPadding: androidx.compose.foundation.layout.PaddingValues = androidx.compose.foundation.layout.PaddingValues(0.dp),
+    topPadding: PaddingValues = PaddingValues(0.dp),
     backdrop: top.yukonga.miuix.kmp.blur.LayerBackdrop? = null,
     scrollBehavior: top.yukonga.miuix.kmp.basic.ScrollBehavior? = null,
+    onLaunchShortcut: ((ShortcutItem) -> Unit)? = null,
+    onOpenManage: ((Int) -> Unit)? = null,
 ) {
-    val gridState = rememberLazyGridState()
+    val appsGridState = rememberLazyGridState()
+    val fnsGridState = rememberLazyGridState()
     val drag = remember(model) { PinDragState(model) }
     val title = stringResource(R.string.slide_launch_app_settings_title)
-    val tabText = stringResource(R.string.slide_launcher_tab_all_app)
-    val headText = stringResource(R.string.slide_launch_app_has_selected)
-    val emptyText = stringResource(R.string.settings_tips_click_to_add_app)
-
-    // The page ALWAYS opens at the very top (收藏 head). Without this, a reused
-    // composition (panel reopened, or the first `reload()` landing after layout) can
-    // restore/keep a mid-list position — the original Activity always started at 0.
-    LaunchedEffect(Unit) { gridState.scrollToItem(0) }
-    LaunchedEffect(model.cells.isNotEmpty()) {
-        if (model.cells.isNotEmpty()) gridState.scrollToItem(0)
+    // 顶部共用收藏区在功能页上装的是「已选功能」，提示语跟着换 —— 否则功能页写着「暂无收藏应用」。
+    val headText = if (model.selectedTab == 1) {
+        stringResource(R.string.pinned_functions_title)
+    } else {
+        stringResource(R.string.slide_launch_app_has_selected)
     }
-    LaunchedEffect(model.searchQuery) {
-        if (model.isSearching) gridState.scrollToItem(0)
+    val emptyText = if (model.selectedTab == 1) {
+        stringResource(R.string.pinned_functions_empty)
+    } else {
+        stringResource(R.string.settings_tips_click_to_add_app)
+    }
+
+    val coroutineScope = rememberCoroutineScope()
+    val pagerState = rememberPagerState(initialPage = model.selectedTab) { 2 }
+
+    // 页面与 Tab 状态同步：Pager 滑动或动画结束后更新 model.selectedTab
+    LaunchedEffect(pagerState.currentPage) {
+        if (model.selectedTab != pagerState.currentPage) {
+            model.selectTab(pagerState.currentPage)
+        }
+    }
+    LaunchedEffect(model.selectedTab) {
+        if (pagerState.currentPage != model.selectedTab && !pagerState.isScrollInProgress) {
+            pagerState.scrollToPage(model.selectedTab)
+        }
+    }
+
+    // 数据就绪时重置在最顶部，杜绝冷启动时锚定到底部的 Bug
+    var appsHasScrolledToTop by remember { mutableStateOf(false) }
+    LaunchedEffect(model.cells.isNotEmpty()) {
+        if (!appsHasScrolledToTop && model.cells.isNotEmpty()) {
+            appsHasScrolledToTop = true
+            appsGridState.scrollToItem(0)
+        }
+    }
+    var fnsHasScrolledToTop by remember { mutableStateOf(false) }
+    LaunchedEffect(model.groupedFunctions.isNotEmpty()) {
+        if (!fnsHasScrolledToTop && model.groupedFunctions.isNotEmpty()) {
+            fnsHasScrolledToTop = true
+            fnsGridState.scrollToItem(0)
+        }
+    }
+
+    // 搜索：结果列表与整页共用同一个 LazyGridState，从列表深处进入搜索（或改关键词）时必须回顶，
+    // 否则用户看到的是命中结果里靠后的那几条 —— 看起来就像"没搜到"。
+    LaunchedEffect(model.isSearching, model.searchQuery, model.selectedTab) {
+        if (model.isSearching) {
+            runCatching { (if (model.selectedTab == 0) appsGridState else fnsGridState).scrollToItem(0) }
+        }
     }
 
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     val gridSpan = if (isLandscape) 6 else 4
 
-    Box(Modifier.fillMaxSize()) {
-        val topContentPadding = if (chrome == Chrome.PANEL) 56.dp else topPadding.calculateTopPadding()
-        LazyVerticalGrid(
-            columns = GridCells.Fixed(gridSpan),
-            state = gridState,
-            modifier = Modifier
-                .fillMaxSize()
-                .horizontalCutoutPadding()
-                .pageBackdrop(backdrop)
-                .pageScroll(scrollBehavior),
-            contentPadding = PaddingValues(
-                start = 14.dp,
-                end = 14.dp,
-                top = topContentPadding,
-                bottom = 16.dp,
-            ),
-        ) {
-            itemsIndexed(
-                items = model.displayedCells,
-                key = { _, cell -> cellKey(cell) },
-                contentType = { _, cell ->
-                    when (cell) {
-                        is Cell.PinHead -> 0
-                        is Cell.EmptyHint -> 1
-                        is Cell.Label -> 2
-                        is Cell.Pin -> 3
-                        is Cell.App -> 4
-                    }
-                },
-                span = { _, cell ->
-                    if (cell is Cell.Pin || cell is Cell.App) GridItemSpan(1) else GridItemSpan(gridSpan)
-                },
-            ) { index, cell ->
-                val cellModifier = if (model.manageMode) Modifier.animateItem() else Modifier
-                when (cell) {
-                    is Cell.PinHead -> HeadRow(headText)
-                    is Cell.EmptyHint -> EmptyHintRow(emptyText)
-                    is Cell.Label -> LabelRow(cell.text)
-                    is Cell.Pin -> PinCell(
-                        app = cell.app,
-                        model = model,
-                        drag = drag,
-                        manageMode = model.manageMode,
-                        iconDp = iconDp,
-                        textSp = textSp,
-                        onTap = { if (model.manageMode) model.togglePin(cell.app) else onLaunch(cell.app) },
-                        modifier = cellModifier,
-                    )
-                    is Cell.App -> AppCell(
-                        app = cell.app,
-                        manageMode = model.manageMode,
-                        pinned = model.isPinned(cell.app),
-                        iconDp = iconDp,
-                        textSp = textSp,
-                        cloneBadge = model.cloneBadge,
-                        onTap = { if (model.manageMode) model.togglePin(cell.app) else onLaunch(cell.app) },
-                        modifier = cellModifier,
-                    )
+    val density = LocalDensity.current
+    val topContentPadding = if (chrome == Chrome.PANEL) 56.dp else topPadding.calculateTopPadding()
+    val topContentPaddingPx = with(density) { topContentPadding.toPx() }
+
+    // 估算收藏区域高度，确保首帧布局零抖动
+    val pinnedAppsCount = remember(model.cells) {
+        model.cells.takeWhile { it !is Cell.Label }.count { it is Cell.Pin }
+    }
+    val pinnedFnsCount = model.pinnedFunctions.size
+    val totalPinned = pinnedAppsCount + pinnedFnsCount
+    val estimatedHeightPx = with(density) {
+        val rows = if (totalPinned == 0) 0 else (totalPinned + gridSpan - 1) / gridSpan
+        (44.dp + if (totalPinned == 0) 110.dp else (rows * 88).dp).toPx()
+    }
+    var sharedPinsContentHeightPx by remember { mutableFloatStateOf(estimatedHeightPx) }
+    var headerOffsetPx by remember { mutableFloatStateOf(0f) }
+
+    // NestedScroll 实现：手势上滑时连续平滑折叠收藏区域，绝不提前突变吸顶；
+    // 列表滑到顶端后再下拉时平滑展开收藏区域
+    val nestedScrollConnection = remember(sharedPinsContentHeightPx) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                val delta = available.y
+                val minOffset = -sharedPinsContentHeightPx
+                return if (delta < 0 && headerOffsetPx > minOffset && minOffset < 0f) {
+                    val newOffset = (headerOffsetPx + delta).coerceIn(minOffset, 0f)
+                    val consumed = newOffset - headerOffsetPx
+                    headerOffsetPx = newOffset
+                    Offset(0f, consumed)
+                } else {
+                    Offset.Zero
                 }
             }
-            item(key = "bottom", span = { GridItemSpan(gridSpan) }) { PageBottomSpacer() }
+
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                val delta = available.y
+                val minOffset = -sharedPinsContentHeightPx
+                return if (delta > 0 && headerOffsetPx < 0f) {
+                    val newOffset = (headerOffsetPx + delta).coerceIn(minOffset, 0f)
+                    val consumed = newOffset - headerOffsetPx
+                    headerOffsetPx = newOffset
+                    Offset(0f, consumed)
+                } else {
+                    Offset.Zero
+                }
+            }
+        }
+    }
+
+    val tabRowHeightDp = 52.dp
+    val tabRowHeightPx = with(density) { tabRowHeightDp.toPx() }
+    val tabRowY = (topContentPaddingPx + sharedPinsContentHeightPx + headerOffsetPx)
+        .coerceAtLeast(topContentPaddingPx)
+    val pinsY = topContentPaddingPx + headerOffsetPx
+    val pinsAlpha = if (sharedPinsContentHeightPx > 0f) {
+        (1f + headerOffsetPx / sharedPinsContentHeightPx).coerceIn(0f, 1f)
+    } else 1f
+    val pagerY = (sharedPinsContentHeightPx + headerOffsetPx).coerceAtLeast(0f)
+
+    // 需求 10：切换页面时回顶，但回的是不含收藏的顶，应用/功能在平移的时候自己平移到上面（不含收藏的顶），收藏不跟着平移！
+    val switchTab: (Int) -> Unit = { targetPage ->
+        if (pagerState.currentPage != targetPage || model.selectedTab != targetPage) {
+            model.selectTab(targetPage)
+            coroutineScope.launch {
+                // 1. 如果当前处于展开收藏状态，平滑折叠收藏区域至 TabRow 吸顶（回不含收藏的顶）
+                if (sharedPinsContentHeightPx > 0f && headerOffsetPx > -sharedPinsContentHeightPx) {
+                    launch {
+                        Animatable(headerOffsetPx).animateTo(-sharedPinsContentHeightPx) {
+                            headerOffsetPx = value
+                        }
+                    }
+                }
+                // 2. 目标网格回滚到第 0 项（无需等待，放子协程非阻塞执行）
+                launch {
+                    runCatching {
+                        if (targetPage == 0) {
+                            appsGridState.scrollToItem(0)
+                        } else {
+                            fnsGridState.scrollToItem(0)
+                        }
+                    }
+                }
+                // 3. 执行平移动画切换 Pager
+                pagerState.animateScrollToPage(targetPage)
+            }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .nestedScroll(nestedScrollConnection),
+    ) {
+        if (model.isSearching) {
+            // 搜索模式：直接展示当前 Tab 的搜索结果，不显示 TabRow 与 Pager
+            val searchGridState = if (model.selectedTab == 0) appsGridState else fnsGridState
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(gridSpan),
+                state = searchGridState,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pageBackdrop(backdrop)
+                    .horizontalCutoutPadding()
+                    .pageScroll(scrollBehavior),
+                contentPadding = PaddingValues(
+                    start = 14.dp,
+                    end = 14.dp,
+                    top = topContentPadding + 8.dp,
+                    bottom = 16.dp,
+                ),
+            ) {
+                if (model.selectedTab == 0) {
+                    itemsIndexed(
+                        items = model.displayedCells,
+                        key = { _, cell -> cellKey(cell) },
+                        contentType = { _, cell ->
+                            when (cell) {
+                                is Cell.PinHead -> 0
+                                is Cell.EmptyHint -> 1
+                                is Cell.Label -> 2
+                                is Cell.Pin -> 3
+                                is Cell.App -> 4
+                            }
+                        },
+                        span = { _, cell ->
+                            if (cell is Cell.Pin || cell is Cell.App) GridItemSpan(1) else GridItemSpan(gridSpan)
+                        },
+                    ) { _, cell ->
+                        val cellModifier = if (model.manageMode) Modifier.animateItem() else Modifier
+                        when (cell) {
+                            is Cell.PinHead -> HeadRow(headText)
+                            is Cell.EmptyHint -> EmptyHintRow(emptyText)
+                            is Cell.Label -> LabelRow(cell.text)
+                            is Cell.Pin -> PinCell(
+                                app = cell.app,
+                                model = model,
+                                drag = drag,
+                                manageMode = model.manageMode,
+                                iconDp = iconDp,
+                                textSp = textSp,
+                                onTap = { if (model.manageMode) model.togglePin(cell.app) else onLaunch(cell.app) },
+                                modifier = cellModifier,
+                            )
+                            is Cell.App -> AppCell(
+                                app = cell.app,
+                                manageMode = model.manageMode,
+                                pinned = model.isPinned(cell.app),
+                                iconDp = iconDp,
+                                textSp = textSp,
+                                cloneBadge = model.cloneBadge,
+                                onTap = { if (model.manageMode) model.togglePin(cell.app) else onLaunch(cell.app) },
+                                modifier = cellModifier,
+                            )
+                        }
+                    }
+                } else {
+                    if (model.groupedFunctions.isEmpty()) {
+                        item(key = "shortcut_search_empty", span = { GridItemSpan(gridSpan) }) {
+                            LabelRow(stringResource(R.string.search_no_result))
+                        }
+                    } else {
+                        model.groupedFunctions.forEach { group ->
+                            item(key = "search_fn_group_${group.appName}", span = { GridItemSpan(gridSpan) }) {
+                                LabelRow(group.appName)
+                            }
+                            items(
+                                items = group.items,
+                                key = { "search_fn_${group.appName}_${it.pinKey}" },
+                                span = { GridItemSpan(1) },
+                            ) { item ->
+                                ShortcutCell(
+                                    item = item,
+                                    iconDp = iconDp,
+                                    textSp = textSp,
+                                    onTap = {
+                                        if (model.manageMode) {
+                                            model.toggleFunctionPin(item)
+                                        } else {
+                                            onLaunchShortcut?.invoke(item)
+                                        }
+                                    },
+                                    showAppBadge = false,
+                                    showBadge = model.manageMode,
+                                    isPinned = model.isFunctionPinned(item),
+                                )
+                            }
+                        }
+                    }
+                }
+                item(key = "bottom_search", span = { GridItemSpan(gridSpan) }) { PageBottomSpacer() }
+            }
+        } else {
+            // LAYER 1: Background content (PRODUCER)
+            // HorizontalPager + SharedPinsSection 都在 pageBackdrop 内部，被顶栏和 TabRow 作为模糊源进行采样
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pageBackdrop(backdrop),
+            ) {
+                // 1. HorizontalPager 全屏展开，初始伴随收藏高度下移；上滑时平滑吸顶至 y = 0
+                // 滚动项向上平滑穿透至 TabRow 背后与 TopBar 背后，完美激活局部磨砂模糊与顶部渐进模糊！
+                HorizontalPager(
+                    state = pagerState,
+                    userScrollEnabled = false,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .offset { IntOffset(0, pagerY.toInt()) },
+                ) { page ->
+                    if (page == 0) {
+                        // 应用页：推荐与 A-Z 应用列表
+                        LazyVerticalGrid(
+                            columns = GridCells.Fixed(gridSpan),
+                            state = appsGridState,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .horizontalCutoutPadding()
+                                .pageScroll(scrollBehavior),
+                            contentPadding = PaddingValues(
+                                start = 14.dp,
+                                end = 14.dp,
+                                top = topContentPadding + tabRowHeightDp,
+                                bottom = topContentPadding + 16.dp,
+                            ),
+                        ) {
+                            val unpinnedSection = model.cells.dropWhile { it !is Cell.Label }
+                            itemsIndexed(
+                                items = unpinnedSection,
+                                key = { _, cell -> cellKey(cell) },
+                                contentType = { _, cell ->
+                                    when (cell) {
+                                        is Cell.Label -> 2
+                                        is Cell.App -> 4
+                                        else -> 0
+                                    }
+                                },
+                                span = { _, cell ->
+                                    if (cell is Cell.App) GridItemSpan(1) else GridItemSpan(gridSpan)
+                                },
+                            ) { _, cell ->
+                                val cellModifier = if (model.manageMode) Modifier.animateItem() else Modifier
+                                when (cell) {
+                                    is Cell.Label -> LabelRow(cell.text)
+                                    is Cell.App -> AppCell(
+                                        app = cell.app,
+                                        manageMode = model.manageMode,
+                                        pinned = model.isPinned(cell.app),
+                                        iconDp = iconDp,
+                                        textSp = textSp,
+                                        cloneBadge = model.cloneBadge,
+                                        onTap = {
+                                            if (model.manageMode) model.togglePin(cell.app)
+                                            else onLaunch(cell.app)
+                                        },
+                                        modifier = cellModifier,
+                                    )
+                                    else -> {}
+                                }
+                            }
+                            if (unpinnedSection.isNotEmpty()) {
+                                item(key = "bottom_apps", span = { GridItemSpan(gridSpan) }) { PageBottomSpacer() }
+                            }
+                        }
+                    } else {
+                        // 功能页：以应用名称为小标题作为分类，应用名称使用拼音排序 (小标题样式与 A-Z 一致)
+                        LazyVerticalGrid(
+                            columns = GridCells.Fixed(gridSpan),
+                            state = fnsGridState,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .horizontalCutoutPadding()
+                                .pageScroll(scrollBehavior),
+                            contentPadding = PaddingValues(
+                                start = 14.dp,
+                                end = 14.dp,
+                                top = topContentPadding + tabRowHeightDp,
+                                bottom = topContentPadding + 16.dp,
+                            ),
+                        ) {
+                            // 功能页原本没有任何空态：读不到快捷方式时整页是白的，连"在加载"都看不出来。
+                            if (model.groupedFunctions.isEmpty()) {
+                                item(key = "functions_empty", span = { GridItemSpan(gridSpan) }) {
+                                    EmptyHintRow(stringResource(R.string.functions_catalog_empty))
+                                }
+                            }
+                            model.groupedFunctions.forEach { group ->
+                                item(key = "group_header_${group.appName}", span = { GridItemSpan(gridSpan) }) {
+                                    LabelRow(group.appName)
+                                }
+                                items(
+                                    items = group.items,
+                                    key = { "group_fn_${group.appName}_${it.pinKey}" },
+                                    span = { GridItemSpan(1) },
+                                ) { item ->
+                                    ShortcutCell(
+                                        item = item,
+                                        iconDp = iconDp,
+                                        textSp = textSp,
+                                        onTap = {
+                                            if (model.manageMode) {
+                                                model.toggleFunctionPin(item)
+                                            } else {
+                                                onLaunchShortcut?.invoke(item)
+                                            }
+                                        },
+                                        showAppBadge = false,
+                                        showBadge = model.manageMode,
+                                        isPinned = model.isFunctionPinned(item),
+                                    )
+                                }
+                            }
+                            if (model.groupedFunctions.isNotEmpty()) {
+                                item(key = "bottom_fns", span = { GridItemSpan(gridSpan) }) { PageBottomSpacer() }
+                            }
+                        }
+                    }
+                }
+
+                // 2. 顶部共用收藏区域 (应用 + 功能)：独立于 Pager 外部，平移动画时收藏绝不跟着平移！
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .offset { IntOffset(0, pinsY.toInt()) }
+                        .graphicsLayer { alpha = pinsAlpha },
+                ) {
+                    MeasuredHeader(
+                        onMeasuredHeight = { h ->
+                            if (h != sharedPinsContentHeightPx) {
+                                sharedPinsContentHeightPx = h
+                            }
+                        },
+                    ) {
+                        SharedPinsSection(
+                            model = model,
+                            drag = drag,
+                            gridSpan = gridSpan,
+                            headText = headText,
+                            emptyText = emptyText,
+                            iconDp = iconDp,
+                            textSp = textSp,
+                            onLaunch = onLaunch,
+                            onLaunchShortcut = onLaunchShortcut,
+                        )
+                    }
+                }
+            }
+
+            // LAYER 2: 居中胶囊样式的 TabRow (CONSUMER 1)
+            // 独立于 pageBackdrop 外部作为同级 Sibling，严防死锁！仅在胶囊本身范围应用局部 textureBlur 磨砂模糊！
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(tabRowHeightDp)
+                    .offset { IntOffset(0, tabRowY.toInt()) }
+                    .zIndex(1.5f),
+                contentAlignment = Alignment.Center,
+            ) {
+                CapsuleTabRow(
+                    selectedTabIndex = model.selectedTab,
+                    onTabSelected = switchTab,
+                    backdrop = backdrop,
+                )
+            }
         }
 
+        // LAYER 3: Panel 顶栏 (CONSUMER 2，仅在 Chrome.PANEL 时绘制，独立于 pageBackdrop 外部)
         if (chrome == Chrome.PANEL) {
             BlurredBar(
                 backdrop = backdrop,
                 modifier = Modifier
                     .align(Alignment.TopCenter)
-                    .fillMaxWidth(),
+                    .fillMaxWidth()
+                    .zIndex(2f),
             ) {
                 PanelBar(
                     title = title,
@@ -204,19 +567,217 @@ fun PinManageScreen(
                     manageMode = model.manageMode,
                     onToggleManage = onToggleManage,
                     model = model,
+                    onOpenManage = onOpenManage,
                 )
             }
         }
 
+        // 5. 右侧快速字母条浮层：在应用页显示应用字母，在功能页显示功能分组首字母，两端完全一致
         if (!model.isSearching) {
-            LetterBarOverlay(
-                letters = model.letters,
-                gridState = gridState,
-                cells = model.cells,
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .padding(top = if (chrome == Chrome.PANEL) 56.dp else 20.dp),
-            )
+            if (pagerState.currentPage == 0) {
+                val unpinnedSection = remember(model.cells) {
+                    model.cells.dropWhile { it !is Cell.Label }
+                }
+                val visibleLetter by remember(unpinnedSection) {
+                    derivedStateOf {
+                        val first = appsGridState.firstVisibleItemIndex
+                        var cur: String? = null
+                        for (i in first downTo 0) {
+                            val c = unpinnedSection.getOrNull(i)
+                            if (c is Cell.Label) { cur = c.text; break }
+                        }
+                        cur ?: PINNED_GLYPH
+                    }
+                }
+                GenericLetterBarOverlay(
+                    letters = model.letters,
+                    currentLetter = visibleLetter,
+                    onLetterSelected = { letter ->
+                        if (letter == PINNED_GLYPH) {
+                            coroutineScope.launch {
+                                Animatable(headerOffsetPx).animateTo(0f) { headerOffsetPx = value }
+                                appsGridState.scrollToItem(0)
+                            }
+                        } else {
+                            coroutineScope.launch {
+                                if (headerOffsetPx > -sharedPinsContentHeightPx) {
+                                    Animatable(headerOffsetPx).animateTo(-sharedPinsContentHeightPx) {
+                                        headerOffsetPx = value
+                                    }
+                                }
+                                jumpTo(appsGridState, unpinnedSection, letter, -(topContentPaddingPx + tabRowHeightPx).toInt())
+                            }
+                        }
+                    },
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(top = topContentPadding + 10.dp)
+                        .zIndex(3f),
+                )
+            } else if (model.groupedFunctions.isNotEmpty()) {
+                val fnsVisibleLetter by remember(model.groupedFunctions) {
+                    derivedStateOf {
+                        val first = fnsGridState.firstVisibleItemIndex
+                        var curIndex = 0
+                        var matched = PINNED_GLYPH
+                        for (group in model.groupedFunctions) {
+                            val groupCount = 1 + group.items.size
+                            if (first in curIndex until (curIndex + groupCount)) {
+                                val ch = group.sortKey.firstOrNull()?.uppercaseChar() ?: '#'
+                                matched = if (ch in 'A'..'Z') ch.toString() else "#"
+                                break
+                            }
+                            curIndex += groupCount
+                        }
+                        matched
+                    }
+                }
+                GenericLetterBarOverlay(
+                    letters = model.functionLetters,
+                    currentLetter = fnsVisibleLetter,
+                    onLetterSelected = { letter ->
+                        if (letter == PINNED_GLYPH) {
+                            coroutineScope.launch {
+                                Animatable(headerOffsetPx).animateTo(0f) { headerOffsetPx = value }
+                                fnsGridState.scrollToItem(0)
+                            }
+                        } else {
+                            coroutineScope.launch {
+                                if (headerOffsetPx > -sharedPinsContentHeightPx) {
+                                    Animatable(headerOffsetPx).animateTo(-sharedPinsContentHeightPx) {
+                                        headerOffsetPx = value
+                                    }
+                                }
+                                jumpToFunction(fnsGridState, model, letter, -(topContentPaddingPx + tabRowHeightPx).toInt())
+                            }
+                        }
+                    },
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(top = topContentPadding + 10.dp)
+                        .zIndex(3f),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 测量 Header 高度容器：
+ * 采用 Layout 内部宽松高度约束（minHeight=0, maxHeight=Infinity）自然测量子组件完整高度，
+ * 并立即通过 onMeasuredHeight 回调同步高度。
+ */
+@Composable
+private fun MeasuredHeader(
+    onMeasuredHeight: (Float) -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    androidx.compose.ui.layout.Layout(
+        content = content,
+        modifier = modifier.fillMaxWidth(),
+    ) { measurables, constraints ->
+        val looseConstraints = constraints.copy(minHeight = 0, maxHeight = androidx.compose.ui.unit.Constraints.Infinity)
+        val placeable = measurables.firstOrNull()?.measure(looseConstraints)
+        val measuredHeight = placeable?.height ?: 0
+        if (measuredHeight > 0) {
+            onMeasuredHeight(measuredHeight.toFloat())
+        }
+        layout(constraints.maxWidth, measuredHeight) {
+            placeable?.placeRelative(0, 0)
+        }
+    }
+}
+
+/**
+ * 顶部全局共用的收藏区域渲染 (应用 + 功能)
+ * 采用 Row + Column 分行布局，完全独立于 HorizontalPager，滑动 Tab 时保持原地不动。
+ */
+@Composable
+private fun SharedPinsSection(
+    model: PinManageModel,
+    drag: PinDragState,
+    gridSpan: Int,
+    headText: String,
+    emptyText: String,
+    iconDp: Int,
+    textSp: Int,
+    onLaunch: (BubbleApp) -> Unit,
+    onLaunchShortcut: ((ShortcutItem) -> Unit)?,
+) {
+    var sectionCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    val pinnedApps = remember(model.cells) {
+        model.cells.takeWhile { it !is Cell.Label }.filterIsInstance<Cell.Pin>()
+    }
+    val pinnedFns = model.pinnedFunctions
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .onGloballyPositioned { sectionCoordinates = it }
+            .padding(horizontal = 14.dp),
+    ) {
+        HeadRow(headText)
+
+        if (pinnedApps.isEmpty() && pinnedFns.isEmpty()) {
+            EmptyHintRow(emptyText)
+        } else {
+            val entries = remember(pinnedApps, pinnedFns) {
+                pinnedApps.map { PinnedEntry.App(it.app) } +
+                    pinnedFns.map { PinnedEntry.Function(it) }
+            }
+            val rows = entries.chunked(gridSpan)
+            rows.forEach { row ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Start,
+                ) {
+                    for (i in 0 until gridSpan) {
+                        val entry = row.getOrNull(i)
+                        Box(
+                            modifier = Modifier.weight(1f),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            if (entry != null) {
+                                when (entry) {
+                                    is PinnedEntry.App -> {
+                                        PinCell(
+                                            app = entry.app,
+                                            model = model,
+                                            drag = drag,
+                                            manageMode = model.manageMode,
+                                            iconDp = iconDp,
+                                            textSp = textSp,
+                                            onTap = {
+                                                if (model.manageMode) model.togglePin(entry.app)
+                                                else onLaunch(entry.app)
+                                            },
+                                            sectionCoordinates = sectionCoordinates,
+                                        )
+                                    }
+                                    is PinnedEntry.Function -> {
+                                        ShortcutCell(
+                                            item = entry.item,
+                                            iconDp = iconDp,
+                                            textSp = textSp,
+                                            onTap = {
+                                                if (model.manageMode) {
+                                                    model.toggleFunctionPin(entry.item)
+                                                } else {
+                                                    onLaunchShortcut?.invoke(entry.item)
+                                                }
+                                            },
+                                            showAppBadge = true, // 需求 6: 收藏的功能左下角显示所属应用图标
+                                            showBadge = model.manageMode,
+                                            isPinned = true,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -226,18 +787,11 @@ private fun cellKey(cell: Cell): String = when (cell) {
     is Cell.EmptyHint -> "empty"
     is Cell.Label -> "label:${cell.text}"
     is Cell.Pin -> "pin:${cell.app.packageName}#${cell.app.userId}"
-    // Same app legitimately appears in BOTH 推荐 and its A–Z group; the owning section
-    // disambiguates. (Lazy keys must be unique; the old RecyclerView never needed keys.)
     is Cell.App -> "app:${cell.app.packageName}#${cell.app.userId}@${cell.section}"
 }
 
 /**
- * The overlay panel's 56dp look-alike bar: title left, search + listview icon buttons right.
- * When search is activated, expands into Miuix SearchBar with a circular grey Close button on the right.
- */
-/**
- * Miuix SearchBar container: lays out the Miuix [InputField] and [outsideEndAction]
- * with smooth enter/exit transitions, without coupling to Navigation 3's NavigationBackHandler.
+ * Miuix SearchBar container
  */
 @Composable
 fun MiuixSearchBar(
@@ -270,7 +824,6 @@ fun MiuixSearchBar(
 
 /**
  * The overlay panel's 56dp look-alike bar: title left, search + listview icon buttons right.
- * When search is activated, expands into Miuix SearchBar with a circular grey Close button on the right.
  */
 @Composable
 private fun PanelBar(
@@ -279,6 +832,7 @@ private fun PanelBar(
     manageMode: Boolean,
     onToggleManage: () -> Unit,
     model: PinManageModel,
+    onOpenManage: ((Int) -> Unit)? = null,
 ) {
     if (model.isSearching) {
         MiuixSearchBar(
@@ -335,6 +889,17 @@ private fun PanelBar(
                     tint = if (manageMode) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurface,
                 )
             }
+            // 加号只出现在「功能」页，而且只有面板宿主给得出（管理页自己就是目的地，传 null）。
+            // 面板里的功能页能直接点选添加，加号只是把人送到整页的搜索/列表去。
+            if (onOpenManage != null && model.selectedTab == 1) {
+                IconButton(onClick = { onOpenManage(1) }) {
+                    Image(
+                        painter = painterResource(R.drawable.app_launcher_item_add_icon),
+                        contentDescription = stringResource(R.string.add),
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+            }
         }
     }
 }
@@ -369,7 +934,7 @@ fun SearchCloseButton(
     }
 }
 
-/** 收藏 header (原 已添加 + 长按拖动图标以排序，长按拖动提示已删掉). */
+/** 收藏 header */
 @Composable
 private fun HeadRow(headText: String) {
     Row(
@@ -388,7 +953,7 @@ private fun HeadRow(headText: String) {
     }
 }
 
-/** 暂无已添加应用 — keeps the original empty-area height (minHeight 78dp). */
+/** 暂无已添加应用 */
 @Composable
 private fun EmptyHintRow(text: String) {
     Box(
@@ -407,7 +972,7 @@ private fun EmptyHintRow(text: String) {
     }
 }
 
-/** A..Z / 推荐 section label — app_settings_item_all_header verbatim paddings. */
+/** A..Z / 推荐 section label */
 @Composable
 private fun LabelRow(text: String) {
     Text(
@@ -421,9 +986,7 @@ private fun LabelRow(text: String) {
 }
 
 /**
- * ★ pinned cell: same tile as [AppCell] plus the long-press drag handle. While dragging,
- * the tile lifts (scale + shadow via graphicsLayer, read at draw time) and follows the
- * finger horizontally within its row; crossing a neighbour's half-width reorders live.
+ * ★ pinned cell: same tile as [AppCell] plus the long-press drag handle.
  */
 @Composable
 private fun PinCell(
@@ -435,6 +998,7 @@ private fun PinCell(
     textSp: Int,
     onTap: () -> Unit,
     modifier: Modifier = Modifier,
+    sectionCoordinates: LayoutCoordinates? = null,
 ) {
     val key = "pin:${app.packageName}#${app.userId}"
     val isDragging = drag.draggingKey == key
@@ -445,7 +1009,12 @@ private fun PinCell(
             .zIndex(if (isDragging) 1f else 0f)
             .onGloballyPositioned { coords ->
                 if (!drag.isDragging) {
-                    centerInParent = coords.positionInParent() + Offset(coords.size.width / 2f, coords.size.height / 2f)
+                    val rootPos = if (sectionCoordinates != null && sectionCoordinates.isAttached && coords.isAttached) {
+                        sectionCoordinates.localPositionOf(coords, Offset.Zero)
+                    } else {
+                        coords.positionInParent()
+                    }
+                    centerInParent = rootPos + Offset(coords.size.width / 2f, coords.size.height / 2f)
                     drag.register(key, centerInParent)
                 }
             }
@@ -482,7 +1051,7 @@ private fun PinCell(
     }
 }
 
-/** Regular (unpinned) cell: identical tile, no drag handle. */
+/** Regular (unpinned) cell */
 @Composable
 private fun AppCell(
     app: BubbleApp,
@@ -507,12 +1076,6 @@ private fun AppCell(
     }
 }
 
-/**
- * launcher_app_item.xml as a composable: 50dp circular icon (panel override via
- * [iconDp]), 12sp medium title (panel override via [textSp]), 24dp add/remove badge at
- * the top-end in manage mode. The icon clip is a plain circle (the original is a
- * CircleImageView); squircle modifiers are reserved for hand-drawn containers.
- */
 @Composable
 private fun AppTile(
     app: BubbleApp,
@@ -540,12 +1103,6 @@ private fun AppTile(
         Box {
             AppIcon(app = app, size = iconSize, cloneBadge = cloneBadge)
             if (manageMode) {
-                // ORIGINAL badge assets (app_launcher_item_add/remove_icon.png, decompiled
-                // res) — the miuix vector detour read wrong at 24dp; the tile is a replica,
-                // so the badge is a replica too. 24dp, pinned into the icon's top-end
-                // corner with a small break-out (the decompiled RelativeLayout anchored it
-                // to the icon box's outer corner, which sits a bit further out/up than a
-                // plain TopEnd inside the padded tile).
                 Image(
                     painter = painterResource(
                         if (pinned) R.drawable.app_launcher_item_remove_icon
@@ -569,21 +1126,12 @@ private fun AppTile(
     }
 }
 
-/**
- * Drawable → ImageBitmap for a launcher icon. `remember(app.packageName)` keeps the
- * decode per cell; a recomposition re-uses it, a rebind decodes once.
- *
- * [cloneBadge] is part of the key: for a 分身 the same app#user renders as the main-space
- * artwork either with or without the corner mark, and the switch can change between two
- * visits to this page.
- */
 @Composable
-private fun AppIcon(app: BubbleApp, size: androidx.compose.ui.unit.Dp, cloneBadge: Boolean) {
+private fun AppIcon(app: BubbleApp, size: Dp, cloneBadge: Boolean) {
     val context = LocalContext.current
     val density = LocalDensity.current
     val px = with(density) { size.roundToPx() }
 
-    // Instant memory-cache hit (0 latency, 0 main-thread I/O)
     var imageBitmap by remember(app.packageName, app.userId, px, cloneBadge) {
         mutableStateOf(AppIconCache.get(app.packageName, app.userId, px, cloneBadge))
     }
@@ -615,11 +1163,6 @@ private fun AppIcon(app: BubbleApp, size: androidx.compose.ui.unit.Dp, cloneBadg
     }
 }
 
-/**
- * ★ drag coordinator. Cell centers land in a PLAIN map — gesture callbacks read it, no
- * composition ever does. Continuous 2D slot-based tracking keeps translation stable and
- * eliminates jumping.
- */
 private class PinDragState(private val model: PinManageModel) {
 
     var draggingKey: String? by mutableStateOf(null)
@@ -667,7 +1210,6 @@ private class PinDragState(private val model: PinManageModel) {
         totalDrag += amount
         val fingerPos = initialCenter + totalDrag
 
-        // Hysteresis prevents flickering between adjacent slots
         val hysteresisSq = 400f
         var bestSlot = currentSlot
         var bestDistSq = (fingerPos - initialSlots[currentSlot]).getDistanceSquared() - hysteresisSq
@@ -708,48 +1250,19 @@ private class PinDragState(private val model: PinManageModel) {
 }
 
 /**
- * Right-edge letter index (★ / ♥ / A–Z / #) as an AndroidView island: the View port is a
- * faithful port of `com.meizu.common.fastscrollletter` with constant-level fidelity, and
- * embedding it keeps that geometry byte-for-byte. Colors are injected from the theme so
- * the island follows Monet/dark with the rest of the page.
- *
- * Section-symbol mapping: the bar shows SINGLE GLYPHS. The 推荐 group header keeps its
- * word in the grid but maps to ♥ on the bar; `jumpTo`/scroll-sync translate both ways.
- * The bar is vertically CENTERED and, when the letters don't fit, draws every Nth glyph
- * (A C E …) while touch still maps 1:1 onto the full list — the bubble always shows the
- * real target letter (meizu original shrinks pitch instead; the sampled bar is the MIUI
- * launcher behaviour and reads better on a short panel).
- *
- * Selection → jump: `scrollToItem` on the LABEL row of that letter. Scroll → highlight:
- * derived from `firstVisibleItemIndex` (a DISCRETE read in composition — allowed; the
- * banned pattern is per-frame floats).
+ * 通用字母快速索引条浮层，支持应用页与功能页复用。
  */
 @Composable
-private fun LetterBarOverlay(
+private fun GenericLetterBarOverlay(
     letters: List<String>,
-    gridState: androidx.compose.foundation.lazy.grid.LazyGridState,
-    cells: List<Cell>,
+    currentLetter: String,
+    onLetterSelected: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     if (letters.isEmpty()) return
     val density = LocalDensity.current
     val barLetters = remember(letters) { letters.map { barGlyph(it) } }
 
-    // Discrete derived state: recomposes only when the top section actually changes.
-    val visibleLetter by remember(cells) {
-        derivedStateOf {
-            val first = gridState.firstVisibleItemIndex
-            var cur: String? = null
-            for (i in first downTo 0) {
-                val c = cells.getOrNull(i)
-                if (c is Cell.Label) { cur = c.text; break }
-            }
-            cur ?: PINNED_GLYPH
-        }
-    }
-
-    // Resolve theme colors in composition; the AndroidView update block is NOT a
-    // composable context and must only receive plain values.
     val normalColor = MiuixTheme.colorScheme.onSurfaceVariantSummary.toArgb()
     val currentTextColor = MiuixTheme.colorScheme.onPrimary.toArgb()
     val selectedBgColor = normalColor
@@ -758,15 +1271,14 @@ private fun LetterBarOverlay(
         modifier = modifier,
         factory = { context ->
             LetterIndexBar(context).apply {
-                onLetterSelected = { letter -> jumpTo(gridState, cells, letter) }
+                this.onLetterSelected = onLetterSelected
             }
         },
         update = { bar ->
             val w = with(density) { 28.dp.roundToPx() }
             bar.minimumWidth = w
-            // Bar wants single glyphs; translate section labels (推荐 → ♥) and CENTER it.
             bar.letters = barLetters
-            bar.currentLetter = barGlyph(visibleLetter)
+            bar.currentLetter = barGlyph(currentLetter)
             bar.centerVertically = true
             bar.allowSampledDisplay = true
             bar.refreshColors(
@@ -778,13 +1290,9 @@ private fun LetterBarOverlay(
     )
 }
 
-/** The glyph that marks the ★ pinned area on the index bar. */
 private const val PINNED_GLYPH = "★"
-
-/** The glyph that marks the 推荐 section on the index bar. */
 private const val RECOMMEND_GLYPH = "♥"
 
-/** Section label → single glyph for the bar (identity for A–Z and #). */
 private fun barGlyph(section: String): String = when (section) {
     "★" -> PINNED_GLYPH
     "推荐" -> RECOMMEND_GLYPH
@@ -792,12 +1300,302 @@ private fun barGlyph(section: String): String = when (section) {
 }
 
 private fun jumpTo(
-    gridState: androidx.compose.foundation.lazy.grid.LazyGridState,
+    gridState: LazyGridState,
     cells: List<Cell>,
     letter: String,
+    headerOffsetPx: Int = 0,
 ) {
-    val index = if (letter == PINNED_GLYPH) 0
-    else cells.indexOfFirst { it is Cell.Label && barGlyph(it.text) == letter }
-    if (index >= 0) gridState.requestScrollToItem(index)
+    val index = cells.indexOfFirst { it is Cell.Label && barGlyph(it.text) == letter }
+    if (index >= 0) gridState.requestScrollToItem(index, headerOffsetPx)
 }
 
+private fun jumpToFunction(
+    gridState: LazyGridState,
+    model: PinManageModel,
+    letter: String,
+    headerOffsetPx: Int = 0,
+) {
+    var targetIndex = 0
+    for (group in model.groupedFunctions) {
+        val ch = group.sortKey.firstOrNull()?.uppercaseChar() ?: '#'
+        val groupLetter = if (ch in 'A'..'Z') ch.toString() else "#"
+        if (groupLetter == letter) {
+            gridState.requestScrollToItem(targetIndex, headerOffsetPx)
+            return
+        }
+        targetIndex += (1 + group.items.size)
+    }
+}
+
+/**
+ * 需求 1 & 10：自定义样式的胶囊 TabRow，缩短居中，圆角改为胶囊，
+ * 并支持局部 textureBlur（仅限 TabRow 胶囊那一小块）与微透磨砂玻璃效果。
+ */
+@Composable
+fun CapsuleTabRow(
+    selectedTabIndex: Int,
+    onTabSelected: (Int) -> Unit,
+    backdrop: top.yukonga.miuix.kmp.blur.LayerBackdrop? = null,
+    modifier: Modifier = Modifier,
+) {
+    val tabs = listOf(
+        stringResource(R.string.slide_launcher_tab_all_app),
+        stringResource(R.string.slide_launcher_tab_all_shortcut),
+    )
+    Box(
+        modifier = modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(
+            modifier = Modifier
+                .then(
+                    if (backdrop != null) {
+                        Modifier.textureBlur(
+                            backdrop = backdrop,
+                            shape = CircleShape,
+                            blurRadius = 20f,
+                        )
+                    } else {
+                        Modifier
+                    }
+                )
+                .clip(CircleShape)
+                .background(
+                    if (backdrop != null) {
+                        MiuixTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+                    } else {
+                        MiuixTheme.colorScheme.surfaceVariant.copy(alpha = 0.85f)
+                    }
+                )
+                .border(
+                    width = 0.5.dp,
+                    color = MiuixTheme.colorScheme.outline.copy(alpha = 0.2f),
+                    shape = CircleShape,
+                )
+                .padding(3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            tabs.forEachIndexed { index, title ->
+                val selected = selectedTabIndex == index
+                Box(
+                    modifier = Modifier
+                        .height(34.dp)
+                        .defaultMinSize(minWidth = 84.dp)
+                        .clip(CircleShape)
+                        .background(if (selected) MiuixTheme.colorScheme.primary else Color.Transparent)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = { onTabSelected(index) },
+                        )
+                        .padding(horizontal = 18.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = title,
+                        color = if (selected) MiuixTheme.colorScheme.onPrimary else MiuixTheme.colorScheme.onSurface,
+                        fontSize = 13.sp,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 快捷方式/功能单元格：图标、单行文字、点击启动或点击勾选/取消。
+ */
+@Composable
+private fun ShortcutCell(
+    item: ShortcutItem,
+    iconDp: Int,
+    textSp: Int,
+    onTap: () -> Unit,
+    modifier: Modifier = Modifier,
+    showAppBadge: Boolean = false,
+    showBadge: Boolean = false,
+    isPinned: Boolean = false,
+) {
+    val iconSize = (if (iconDp > 0) iconDp else 50).dp
+    val titleSp = if (textSp > 0) textSp else 12
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onTap,
+            )
+            .padding(vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Box {
+            ShortcutIcon(
+                item = item,
+                size = iconSize,
+                showAppBadge = showAppBadge,
+            )
+            if (showBadge) {
+                Image(
+                    painter = painterResource(
+                        if (isPinned) R.drawable.app_launcher_item_remove_icon
+                        else R.drawable.app_launcher_item_add_icon,
+                    ),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .offset(x = 3.dp, y = (-3).dp)
+                        .size(24.dp),
+                )
+            }
+        }
+        Text(
+            text = item.label,
+            modifier = Modifier.padding(top = 10.dp),
+            color = MiuixTheme.colorScheme.onSurface,
+            fontSize = titleSp.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun ShortcutIcon(
+    item: ShortcutItem,
+    size: Dp,
+    showAppBadge: Boolean = false,
+) {
+    val context = LocalContext.current
+    var fallbackBmp by remember(item.packageName, item.id) { mutableStateOf<android.graphics.Bitmap?>(null) }
+
+    val rawBmp = item.iconBitmap
+    val rawDrawable = item.iconDrawable
+
+    // 如果未拿到快捷方式自带图标，异步尝试从宿主应用加载应用图标作为兜底，彻底杜绝只显示首字。
+    // 必须离开主线程：面板跑在 SystemUI 里，这里一次 getApplicationIcon 就是一次跨进程调用，
+    // 每个缺图标的格子都来一发会把系统界面卡住（图标本身另有按包名缓存，见 applicationIcon）。
+    if (rawBmp == null && rawDrawable == null && fallbackBmp == null && item.packageName.isNotEmpty()) {
+        LaunchedEffect(item.packageName) {
+            val loaded = withContext(Dispatchers.IO) {
+                ShortcutRepository.applicationIcon(context, item.packageName)
+            }
+            if (loaded != null) {
+                fallbackBmp = loaded
+            }
+        }
+    }
+
+    // remember 不能挂在 elvis 右边：那样它的调用位置会随 item 数据变化（这一帧走了 rawBmp、
+    // 下一帧（图标缺失的上报）走 remember），同一 key 的组合槽位序列就变了。
+    val drawableBmp = if (rawDrawable != null) {
+        remember(rawDrawable) { ShortcutRepository.drawableToBitmap(rawDrawable, ShortcutBridge.ICON_MAX_PX) }
+    } else null
+    val activeBmp = rawBmp ?: fallbackBmp ?: drawableBmp
+
+    Box(modifier = Modifier.size(size)) {
+        if (activeBmp != null) {
+            val isTransparent = remember(activeBmp) {
+                ShortcutRepository.isTransparentBitmap(activeBmp)
+            }
+            if (isTransparent) {
+                val isLight = remember(activeBmp) {
+                    ShortcutRepository.isLightForeground(activeBmp)
+                }
+                // 透明底的 shortcut：经过视觉归一化（Foreground Normalization），
+                // 剔除无效边缘空白，将前景图案尺寸与重心严格归一化居中，并提供高品质圆形底座。
+                // 归一化结果按 pinKey 缓存（[ShortcutRepository.normalizedForeground]）：
+                // 组合里逐像素重算 + 每次滚回来都新建一张位图是白花的。
+                val normalizedBmp = remember(activeBmp) {
+                    ShortcutRepository.normalizedForeground(item, activeBmp)
+                }
+                val plateBg = if (isLight) {
+                    MiuixTheme.colorScheme.surfaceVariant
+                } else {
+                    Color.White
+                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clip(CircleShape)
+                        .background(plateBg)
+                        .border(0.5.dp, Color.Black.copy(alpha = 0.08f), CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Image(
+                        bitmap = normalizedBmp.asImageBitmap(),
+                        contentDescription = item.label,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit,
+                    )
+                }
+            } else {
+                // 实底图标：直接充满圆形显示，不加多余 padding
+                Image(
+                    bitmap = activeBmp.asImageBitmap(),
+                    contentDescription = item.label,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clip(CircleShape),
+                    contentScale = ContentScale.Crop,
+                )
+            }
+        } else {
+            // 极限兜底：首字占位（仅在应用完全无法访问时）
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(CircleShape)
+                    .background(MiuixTheme.colorScheme.surfaceVariant),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = item.label.take(1),
+                    color = MiuixTheme.colorScheme.onSurface,
+                    fontSize = (size.value * 0.45f).sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        }
+
+        // 需求 6：添加的功能在左下角显示所属应用图标（参考 Flyme 原生样式）
+        if (showAppBadge) {
+            val badgeSize = (size.value * 0.42f).dp
+            var appBmp by remember(item.packageName) {
+                mutableStateOf(item.appIconBitmap)
+            }
+            if (appBmp == null && item.packageName.isNotEmpty()) {
+                LaunchedEffect(item.packageName) {
+                    val loaded = withContext(Dispatchers.IO) {
+                        ShortcutRepository.applicationIcon(context, item.packageName, 96)
+                    }
+                    if (loaded != null) {
+                        appBmp = loaded
+                    }
+                }
+            }
+
+            val currentAppBmp = appBmp
+            if (currentAppBmp != null) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .offset(x = (-2).dp, y = 2.dp)
+                        .size(badgeSize)
+                        .background(MiuixTheme.colorScheme.surface, CircleShape)
+                        .padding(1.5.dp)
+                        .clip(CircleShape),
+                ) {
+                    Image(
+                        bitmap = currentAppBmp.asImageBitmap(),
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop,
+                    )
+                }
+            }
+        }
+    }
+}

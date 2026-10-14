@@ -23,7 +23,7 @@ android {
                     commandLine("git", "rev-list", "--count", "HEAD")
                 }.standardOutput.asText.get().trim().toInt()
             }.getOrDefault(1)
-        versionName = providers.gradleProperty("versionName").orNull ?: "1.1.12"
+        versionName = providers.gradleProperty("versionName").orNull ?: "1.2.0"
     }
 
     buildFeatures {

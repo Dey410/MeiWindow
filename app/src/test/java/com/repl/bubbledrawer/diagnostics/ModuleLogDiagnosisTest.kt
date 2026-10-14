@@ -444,4 +444,77 @@ class ModuleLogDiagnosisTest {
         assertEquals(CheckStatus.WARN, lost.status)
         assertTrue(lost.detail, lost.detail.contains("没能送到设置应用"))
     }
+
+    // ---------------------------------------------------------------------------------------
+    // 功能页（快捷方式）：「页面是空的」有三种完全不同的原因，诊断要分开说
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    fun aHealthyLogWithoutShortcutScansSaysNothingAboutThem() {
+        assertTrue(checksOf(HEALTHY).none { it.id == "behaviour.shortcuts" })
+    }
+
+    @Test
+    fun aDeliveredShortcutScanReportsTheCountAndCost() {
+        val lines = HEALTHY + listOf(
+            "${LOGCAT_PREFIX}SHORTCUT_SCAN reason=REQUEST items=137 result=SENT ms=412",
+        )
+        val check = checksOf(lines).first { it.id == "behaviour.shortcuts" }
+        assertEquals(CheckStatus.PASS, check.status)
+        assertTrue(check.detail, check.detail.contains("137 条"))
+        assertTrue(check.detail, check.detail.contains("412ms"))
+    }
+
+    /**
+     * 「扫到了但没送到」是本功能的头号故障：分片没有回执时 App 侧的列表会一直空着，
+     * 而用户看到的只是「功能页没有东西」。
+     */
+    @Test
+    fun aFailedShortcutDeliveryWarns() {
+        val lines = HEALTHY + listOf(
+            "${LOGCAT_PREFIX}SHORTCUT_SCAN reason=INIT items=137 result=FAILED ms=480",
+        )
+        val check = checksOf(lines).first { it.id == "behaviour.shortcuts" }
+        assertEquals(CheckStatus.WARN, check.status)
+        assertTrue(check.detail, check.detail.contains("没能交给设置应用"))
+    }
+
+    @Test
+    fun anUnchangedScanAndAnEmptyScanAreInfoNotFailure() {
+        val unchanged = checksOf(
+            HEALTHY + listOf("${LOGCAT_PREFIX}SHORTCUT_SCAN reason=REQUEST items=137 result=UNCHANGED ms=3"),
+        ).first { it.id == "behaviour.shortcuts" }
+        assertEquals(CheckStatus.INFO, unchanged.status)
+        assertTrue(unchanged.detail, unchanged.detail.contains("跳过了重复上报"))
+
+        val empty = checksOf(
+            HEALTHY + listOf("${LOGCAT_PREFIX}SHORTCUT_SCAN reason=INIT items=0 result=EMPTY ms=8"),
+        ).first { it.id == "behaviour.shortcuts" }
+        assertEquals(CheckStatus.INFO, empty.status)
+        assertTrue(empty.detail, empty.detail.contains("枚举到 0 条"))
+    }
+
+    /** 枚举不完整（LauncherApps 没答上来）时不上报：要说清「页面为什么只有静态兜底那几条」。 */
+    @Test
+    fun anIncompleteEnumerationIsExplainedInsteadOfBlamedOnDelivery() {
+        val lines = HEALTHY + listOf(
+            "${LOGCAT_PREFIX}SHORTCUT_SCAN reason=INIT items=3 result=INCOMPLETE ms=52",
+        )
+        val check = checksOf(lines).first { it.id == "behaviour.shortcuts" }
+        assertEquals(CheckStatus.INFO, check.status)
+        assertTrue(check.detail, check.detail.contains("不可信"))
+        assertTrue(check.detail, check.detail.contains("静态兜底"))
+    }
+
+    /** 面板里点选的功能没能发出去：这条只能从 hook 侧的交接日志看出来。 */
+    @Test
+    fun aFailedFunctionHandoffIsCalledOut() {
+        val lines = HEALTHY + listOf(
+            "${LOGCAT_PREFIX}SHORTCUT_SCAN reason=INIT items=137 result=SENT ms=412",
+            "${LOGCAT_PREFIX}FUNCTION_WRITE_HANDOFF broadcast=false rev=1 valueLen=42",
+        )
+        val check = checksOf(lines).first { it.id == "behaviour.shortcuts" }
+        assertEquals(CheckStatus.WARN, check.status)
+        assertTrue(check.detail, check.detail.contains("没能发出去"))
+    }
 }

@@ -6,6 +6,10 @@
     <string name="slide_app_settings_drag_tips">长按拖动图标以排序</string>
     <string name="slide_launch_app_has_selected">收藏</string>
     <string name="slide_launcher_tab_all_app">应用</string>
+    <string name="slide_launcher_tab_all_shortcut">功能</string>
+    <string name="slide_launcher_tab_all_shortcut_item_category">桌面快捷方式</string>
+    <string name="slide_launcher_tab_all_shortcut_item_no_more">暂无更多功能</string>
+    <string name="slide_launcher_tab_all_shortcut_item_no_add_launcher">添加至桌面的快捷方式将会显示在这里</string>
     <string name="action_app_manager">管理</string>
     <string name="action_app_manager_complate">完成</string>
     <string name="slide_launch_app_settings_title">更多应用</string>
@@ -166,4 +170,9 @@
     <string name="exp_contact_bar_min_width">小窗宽度低于此值时隐藏</string>
     <string name="exp_contact_bar_min_width_off">不隐藏</string>
     <string name="exp_contact_bar_note" formatted="false">微信 / QQ 等应用以小窗打开时生效：条宽与小窗一致并随拉伸实时变化，圆角同小窗；迷你小窗或宽度低于阈值时自动隐藏。在头像上上下滑动可移除该联系人。头像与名称取自系统通知（不读取应用数据），因 HyperOS 打开应用会清空其通知，模块会把会话记忆 12 小时。阈值按「小窗宽度 ÷ 屏幕宽度」计算，默认 60%，嫌敏感就往下调，0 = 不按尺寸隐藏。</string>
+    <string name="pinned_functions_title">已选功能</string>
+    <string name="pinned_functions_empty">点击下方功能添加到已选</string>
+    <string name="panel_functions_empty">暂未添加功能\n点击右上角加号前往添加</string>
+    <string name="functions_catalog_empty">还没有读取到功能\n应用提供的快捷方式会显示在这里</string>
+    <string name="add">添加</string>
 </resources>

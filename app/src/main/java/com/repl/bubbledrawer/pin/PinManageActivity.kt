@@ -37,11 +37,13 @@ import top.yukonga.miuix.kmp.basic.InputField
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.SmallTopAppBar
+import top.yukonga.miuix.kmp.basic.TabRow
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.icon.extended.ListView
 import top.yukonga.miuix.kmp.icon.extended.Search
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import com.repl.bubbledrawer.shortcut.ShortcutRepository
 
 /**
  * Port of `SlideLaunchAppSettings` — the 应用 tab slice, now a Compose host
@@ -64,18 +66,26 @@ class PinManageActivity : ComponentActivity() {
     }
 
     private var pinsPrefsListener: android.content.SharedPreferences.OnSharedPreferenceChangeListener? = null
+    private var shortcutCacheListener: (() -> Unit)? = null
 
     override fun onDestroy() {
         pinsPrefsListener?.let { listener ->
             runCatching { RemoteBridge.local(this).unregisterOnSharedPreferenceChangeListener(listener) }
         }
         pinsPrefsListener = null
+        shortcutCacheListener?.let { listener ->
+            com.repl.bubbledrawer.shortcut.ShortcutCacheStore.removeListener(listener)
+        }
+        shortcutCacheListener = null
         super.onDestroy()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // 页签取自 Intent（面板的加号会指定「功能」页）：Activity 现在是导出的，别让外面塞进来的
+        // 任意整数直达 PagerState 的 initialPage。
+        val initialTab = intent.getIntExtra(EXTRA_INITIAL_TAB, 0).coerceIn(0, 1)
         val model = PinManageModel(
             loadApps = { repo.all() },
             pinsOf = { pinStore.pins() },
@@ -91,18 +101,31 @@ class PinManageActivity : ComponentActivity() {
             },
             // 分身角标：图标本身取主空间那张，这一项只决定要不要叠角标（与面板同源设置）。
             cloneBadge = SettingsStore.snapshot(this@PinManageActivity).cloneBadge,
+            loadShortcuts = { ShortcutRepository.loadShortcuts(this@PinManageActivity) },
+            initialTab = initialTab,
+            functionPinsOf = { com.repl.bubbledrawer.shortcut.FunctionPinStore.getPins(this@PinManageActivity) },
+            onFunctionOrderChange = { com.repl.bubbledrawer.shortcut.FunctionPinStore.setPins(this@PinManageActivity, it) },
         )
         model.reload()
         // Pins can also be edited in the fan's 更多 panel (SystemUI), which hands them over as a
         // broadcast into this process. Watch the mirror file so this page follows live instead
         // of showing the list as it was when the Activity opened.
         pinsPrefsListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-            if (key == com.repl.bubbledrawer.data.PrefsPinBackend.KEY) {
+            if (key == com.repl.bubbledrawer.data.PrefsPinBackend.KEY ||
+                key == com.repl.bubbledrawer.shortcut.FunctionPinStore.KEY_PINNED_FUNCTIONS
+            ) {
                 runOnUiThread { model.refreshPins() }
             }
         }.also { listener ->
             runCatching { RemoteBridge.local(this).registerOnSharedPreferenceChangeListener(listener) }
         }
+
+        // 监听来自 SystemUI 上报的完整快捷方式更新
+        val cacheListener = {
+            runOnUiThread { model.refreshShortcuts() }
+        }
+        shortcutCacheListener = cacheListener
+        com.repl.bubbledrawer.shortcut.ShortcutCacheStore.addListener(cacheListener)
         setContent {
             BubbleDrawerTheme {
                 val scrollBehavior = MiuixScrollBehavior()
@@ -194,6 +217,9 @@ class PinManageActivity : ComponentActivity() {
                         topPadding = innerPadding,
                         backdrop = backdrop,
                         scrollBehavior = scrollBehavior,
+                        onLaunchShortcut = { item ->
+                            ShortcutRepository.launchShortcut(this@PinManageActivity, item)
+                        },
                     )
                 }
             }
@@ -205,4 +231,8 @@ class PinManageActivity : ComponentActivity() {
         androidx.compose.ui.res.stringResource(
             if (model.manageMode) R.string.action_app_manager_complate else R.string.action_app_manager,
         )
+
+    companion object {
+        const val EXTRA_INITIAL_TAB = "extra_initial_tab"
+    }
 }
