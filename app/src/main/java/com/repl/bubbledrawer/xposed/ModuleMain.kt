@@ -106,7 +106,8 @@ class ModuleMain : XposedModule() {
             // 轻量打开的两项（点通知 / 控制中心长按）都在 SystemUI 进程里做 —— 系统闸门对
             // SystemUI 发起的启动直接早退，见 LightOpenSystemUi 的类注释。
             runCatching {
-                LightOpenSystemUi(this, prefs).also { lightOpenSystemUi = it }.install(param.classLoader)
+                LightOpenSystemUi(this, prefs) { systemUiInstaller?.capturedContext() }
+                    .also { lightOpenSystemUi = it }.install(param.classLoader)
             }.onFailure { log(Log.WARN, TAG, "LIGHT_OPEN_SYSTEMUI_INSTALL_FAILED", it) }
         }
     }
@@ -202,7 +203,8 @@ class ModuleMain : XposedModule() {
                 if (loader != null) systemUiClassLoader = loader
                 SystemUiHookInstaller(this, prefs).also { systemUiInstaller = it }.reinstall(ctx)
                 runCatching {
-                    LightOpenSystemUi(this, prefs).also { lightOpenSystemUi = it }
+                    LightOpenSystemUi(this, prefs) { systemUiInstaller?.capturedContext() }
+                        .also { lightOpenSystemUi = it }
                         .install(loader ?: javaClass.classLoader)
                 }.onFailure { log(Log.WARN, TAG, "HOT_RELOAD_LIGHT_OPEN_FAILED", it) }
             }.onFailure { log(Log.WARN, TAG, "HOT_RELOAD_REINSTALL_FAILED", it) }

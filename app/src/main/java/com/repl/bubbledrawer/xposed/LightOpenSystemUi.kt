@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.os.Bundle
+import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import com.repl.bubbledrawer.lightopen.LightOpen
 import com.repl.bubbledrawer.lightopen.LightOpenDecision
@@ -15,6 +17,7 @@ import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
 import java.lang.reflect.Field
 import java.lang.reflect.Method
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 【轻量打开】SystemUI 侧的钩子：`竖屏/横屏点通知以小窗打开` 与 `控制中心长按以小窗打开`。
@@ -34,41 +37,50 @@ import java.lang.reflect.Method
  *
  * 反过来，**SystemUI 自己带过去的 ActivityOptions 会被原样采用** —— 所以这几处改成"由我们把
  * 小窗 options 塞进这次启动"，用 MIUI 自己的官方姿势（`AppMiniWindowManagerImpl` 的迷你窗、
- * 桌面的小窗快捷方式都是这么干的）：
+ * 桌面的小窗快捷方式都是这么干的）。
  *
- * ```java
- * ActivityOptions opts = MiuiMultiWindowUtils.getActivityOptions(ctx, pkg, /*noCheck*/ true, false);
- * pendingIntent.send(ctx, 0, fillIn, null, null, null, opts.toBundle());
- * ```
+ * ## 结构：一个"上膛 → 消费"的漏斗（2026-10-14 真机两轮反馈后改成这样）
  *
- * ## 通知：两条完全不同的入口（2026-10-14 真机反馈后补齐）
+ * SystemUI 里所有"点通知/长按磁贴"的启动最后都汇到同一个地方造 options：
+ * `ActivityStarterUtilsKt.createActivityOptions(callerDisplayId, RemoteAnimationAdapter)`。
+ * 于是：
+ *
+ * 1. **上膛**：在各个入口（通知的两个 Runnable、控制中心长按、`ActivityStarter.post…`）算好这次
+ *    启动该不该小窗，把 `(目标包, 是否 PendingIntent, 用的哪个 Context)` 放进一个带 TTL 的槽；
+ * 2. **消费**：`createActivityOptions` 被调到时就地把它换成小窗 bundle，MIUI 自己的锁屏解锁、
+ *    通知动画、面板收起、启动动画全部保持原样（不再像上一版那样"接管这次启动"）。
+ *
+ * 这样做的原因：真机上"长按磁贴没反应"的两种可能（磁贴不是 `QSTileImpl` 子类、MIUI 名单里没有
+ * 这个包）都能被覆盖，而且每条路径都会留一行日志（`LIGHT_OPEN_ARM_*` / `LIGHT_OPEN_OPTIONS_*`），
+ * 下次再"没反应"能直接看出是哪一环。
+ *
+ * ## 通知：两条完全不同的入口
  *
  * | 入口 | 落点 | 备注 |
  * |---|---|---|
  * | 通知栏列表里点通知 | `…InjectorImpl$startNotificationIntentInjected$1.run()` | bundle 由 `startNotificationIntentPublic` 算好 |
- * | **悬浮通知（灵动岛/横幅）点开** | `…InjectorImpl$startIslandIntent$1.run()` | bundle 是 **空 options**（`createActivityOptions(null,null)`） |
- *
- * 两条路径都是"在那个 Runnable 里 `PendingIntent.send(ctx, 0, …, bundle)`"，两个类的 `$bundle`
- * 都是 public 非 final 合成字段 —— 我们在 `run()` 之前把字段换掉，MIUI 的锁屏解锁、通知动画、
- * UiOffloadThread 异步发送全部保持原样。
- *
- * ## 控制中心长按
- *
- * 视图长按 → `QSTileImpl.longClick(Expandable)` → handler 消息 → `handleLongClick(Expandable)`
- * → `mActivityStarter.postStartActivityDismissingKeyguard(getLongClickIntent(), 0, controller)`。
- * SystemUI 的 `ActivityStarter` 接口**没有**带 ActivityOptions 的重载，所以这里接管这一次启动
- * （锁屏不接管，交给 MIUI 的解锁流程）。
- *
- * 小窗参数优先用 MIUI 的 `MiuiMultiWindowUtils.getActivityOptions`；它返回 null（目标不在 MIUI 的
- * freeform 支持名单里，典型就是 `com.android.settings`）时退到我们自己造的
- * `ActivityOptions.makeBasic() + setLaunchWindowingMode(FREEFORM)`，否则"长按磁贴"永远没反应。
+ * | 悬浮通知（灵动岛/横幅）点开 | `…InjectorImpl$startIslandIntent$1.run()` / `postStartActivityDismissingKeyguard(PendingIntent, …)` | 前者 bundle 是空 options |
  */
 class LightOpenSystemUi(
     private val module: XposedModule,
     private val prefs: SharedPreferences,
+    private val contextProvider: () -> Context? = { null },
 ) {
     private val watcher = LightOpenWatcher(prefs)
     private var loader: ClassLoader? = null
+    private var cachedContext: Context? = null
+
+    /** 一次"上膛"：下一步 `createActivityOptions` 该给哪个包塞小窗 options。 */
+    private data class Armed(
+        val packageName: String,
+        val pendingIntentLaunch: Boolean,
+        val source: String,
+        val decision: LightOpenDecision,
+        val context: Context?,
+        val expiresAtUptime: Long,
+    )
+
+    private val armed = AtomicReference<Armed?>(null)
 
     /** `MiuiMultiWindowUtils.getActivityOptions(Context, String, boolean, boolean)`（miui-framework.jar）。 */
     private val activityOptionsMethod: Method? by lazy {
@@ -93,10 +105,147 @@ class LightOpenSystemUi(
     fun install(classLoader: ClassLoader) {
         loader = classLoader
         watcher.refresh()
+        runCatching { contextProvider() }.getOrNull()?.let { cachedContext = it }
         installNotificationHook(NOTIFICATION_INJECTED_CLASS, "injected")
         installNotificationHook(ISLAND_CLASS, "island")
+        installNotificationArmHook()
         installControlCenterHook()
+        installTileViewLongClickHook()
+        installPendingIntentArms()
+        installOptionsFunnel()
     }
+
+    // ------------------------------------------------------------------ 通知的统一入口（最重要的一个）
+
+    /**
+     * `StatusBarNotificationActivityStarter.startNotificationIntentPublic(PendingIntent, Intent, NotificationEntry)`：
+     * **所有**"点通知"最终都进这里（通知栏列表、悬浮通知横幅、灵动岛、以及插件画的那些视图），
+     * 它在 803 行调 `ActivityStarterUtilsKt.createActivityOptions(...)` 造 bundle —— 也就是我们
+     * 漏斗那一头。所以在这里按通知规则上膛，就能覆盖全部通知点击路径（插件里的也算，因为这个类
+     * 在 SystemUI 自己的 dex 里）。
+     *
+     * 之前只钩了两个内部 Runnable（`…Injected$1` / `…startIslandIntent$1`），真机上"悬浮通知点开"
+     * 一条都没命中 —— 说明它走的是别的分支；现在从源头兜住。
+     */
+    private fun installNotificationArmHook() {
+        val starterClass = runCatching {
+            loadClass("com.android.systemui.statusbar.phone.StatusBarNotificationActivityStarter")
+        }.getOrNull()
+        val entryClass = runCatching {
+            loadClass("com.android.systemui.statusbar.notification.collection.NotificationEntry")
+        }.getOrNull()
+        val method = runCatching {
+            starterClass?.getDeclaredMethod(
+                "startNotificationIntentPublic",
+                PendingIntent::class.java,
+                Intent::class.java,
+                entryClass,
+            )
+        }.getOrNull()
+        if (method == null) {
+            module.log(Log.WARN, TAG, "LIGHT_OPEN_NOTIFICATION_ARM_TARGET_UNAVAILABLE")
+            return
+        }
+        module.hook(method)
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .setId("bubbledrawer.lightopen.arm.notification")
+            .intercept { chain ->
+                val settings = watcher.current()
+                if (!settings.enabled) return@intercept chain.proceed()
+                val pendingIntent = chain.args.getOrNull(0) as? PendingIntent
+                val intent = chain.args.getOrNull(1) as? Intent
+                val context = cachedContext ?: runCatching { contextProvider() }.getOrNull()
+                context?.let { cachedContext = it }
+                val packageName = runCatching { pendingIntent?.creatorPackage }.getOrNull()
+                    ?: (intent?.`package` ?: intent?.component?.packageName)
+                val portrait = context?.let { isPortrait(it) } ?: true
+                val decision = LightOpen.notificationDecision(settings, packageName, portrait)
+                module.log(
+                    Log.INFO,
+                    TAG,
+                    "LIGHT_OPEN_NOTIFICATION_ARM_ENTER pkg=$packageName portrait=$portrait " +
+                        "decision=$decision entry=${chain.args.getOrNull(2) != null}",
+                )
+                if (decision == LightOpenDecision.FORCE_FREEFORM && packageName != null && context != null) {
+                    arm(
+                        packageName = packageName,
+                        pendingIntentLaunch = true,
+                        source = "notifPublic",
+                        decision = decision,
+                        context = context,
+                    )
+                }
+                chain.proceed()
+            }
+        module.log(Log.INFO, TAG, "LIGHT_OPEN_NOTIFICATION_ARM_HOOK_INSTALLED")
+    }
+
+    // ------------------------------------------------------------------ 磁贴（含插件磁贴）
+
+    /**
+     * 控制中心磁贴的**长按**最终是视图里的
+     * `MiuiQSTileBaseView$$ExternalSyntheticLambda2.onLongClick(View)` → `tile.longClick(null)`
+     * （`QSTile` 是插件接口，磁贴本体在**插件 APK** 里，`tile.longClick` 的实现我们钩不到；
+     * 但这个 lambda 在 SystemUI 自己的 dex 里，而且它捕获了磁贴对象 `f$0`）。
+     *
+     * 于是：钩这个 lambda 拿到磁贴对象 → 反射问它的 `getLongClickIntent()`（`MiuiQSTile` 与
+     * `QSTileImpl` 都有这个方法）→ 按控制中心规则上膛，然后放行（磁贴自己照常走 `longClick`）。
+     */
+    private fun installTileViewLongClickHook() {
+        val viewClass = runCatching {
+            loadClass("com.android.systemui.qs.tileimpl.MiuiQSTileBaseView")
+        }.getOrNull()
+        val lambdaClass = runCatching {
+            loadClass("com.android.systemui.qs.tileimpl.MiuiQSTileBaseView\$\$ExternalSyntheticLambda2")
+        }.getOrNull()
+        val method = runCatching {
+            lambdaClass?.getDeclaredMethod("onLongClick", android.view.View::class.java)
+        }.getOrNull()
+        if (method == null) {
+            module.log(Log.WARN, TAG, "LIGHT_OPEN_TILE_VIEW_TARGET_UNAVAILABLE view=${viewClass != null}")
+            return
+        }
+        module.hook(method)
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .setId("bubbledrawer.lightopen.arm.tileview")
+            .intercept { chain ->
+                val settings = watcher.current()
+                if (!settings.enabled || !settings.controlCenter) return@intercept chain.proceed()
+                val tile = readField(chain.thisObject, "f\$0")
+                val context = cachedContext ?: runCatching { contextProvider() }.getOrNull()
+                context?.let { cachedContext = it }
+                val intent = tile?.let { longClickIntentOf(it) }
+                val target = intent?.let { context?.let { ctx -> targetPackage(ctx, it) } }
+                val decision = LightOpen.controlCenterDecision(settings, target)
+                module.log(
+                    Log.INFO,
+                    TAG,
+                    "LIGHT_OPEN_TILE_VIEW_ENTER tile=${tile?.javaClass?.simpleName} target=$target decision=$decision",
+                )
+                if (decision == LightOpenDecision.FORCE_FREEFORM && target != null && context != null) {
+                    arm(target, pendingIntentLaunch = false, source = "tileView", decision = decision, context = context)
+                }
+                chain.proceed()
+            }
+        module.log(Log.INFO, TAG, "LIGHT_OPEN_TILE_VIEW_HOOK_INSTALLED")
+    }
+
+    /** 磁贴的 `getLongClickIntent()`：类或它实现的接口上找（`MiuiQSTile` / `QSTileImpl` 都有）。 */
+    private fun longClickIntentOf(tile: Any): Intent? {
+        var type: Class<*>? = tile.javaClass
+        while (type != null) {
+            runCatching {
+                type.getDeclaredMethod("getLongClickIntent").also { it.isAccessible = true }.invoke(tile)
+            }.getOrNull()?.let { return it as? Intent }
+            for (face in type.interfaces) {
+                runCatching { face.getMethod("getLongClickIntent").invoke(tile) }
+                    .getOrNull()?.let { return it as? Intent }
+            }
+            type = type.superclass
+        }
+        return null
+    }
+
 
     // ------------------------------------------------------------------ 通知（列表 + 悬浮）
 
@@ -116,12 +265,12 @@ class LightOpenSystemUi(
                 if (pendingIntent == null || context == null) {
                     return@intercept chain.proceed()
                 }
+                if (context is Context) cachedContext = context
                 val packageName = runCatching { pendingIntent.creatorPackage }.getOrNull()
-                val portrait = context.resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE
+                val portrait = isPortrait(context)
                 val settings = watcher.current()
                 val decision = LightOpen.notificationDecision(settings, packageName, portrait)
-                // 入口行：开关关着时也留一行，否则"点了没反应"和"钩子没装上"分不清。
-                if (settings.enabled && (settings.notificationPortrait || settings.notificationLandscape)) {
+                if (settings.enabled) {
                     module.log(
                         Log.INFO,
                         TAG,
@@ -146,7 +295,7 @@ class LightOpenSystemUi(
         module.log(Log.INFO, TAG, "LIGHT_OPEN_NOTIFICATION_HOOK_INSTALLED path=$path")
     }
 
-    // ------------------------------------------------------------------ 控制中心
+    // ------------------------------------------------------------------ 控制中心长按
 
     private fun installControlCenterHook() {
         val tileClass = runCatching { loadClass("com.android.systemui.qs.tileimpl.QSTileImpl") }.getOrNull()
@@ -162,11 +311,11 @@ class LightOpenSystemUi(
             .intercept { chain ->
                 val tile = chain.thisObject
                 val context = readField(tile, "mContext") as? Context
+                if (context != null) cachedContext = context
                 val settings = watcher.current()
                 if (context == null || !settings.enabled || !settings.controlCenter) {
                     return@intercept chain.proceed()
                 }
-                // 入口行：磁贴类名 + 解析出来的目标包 + 判定结果，"长按没反应"时这是唯一线索。
                 val intent = runCatching {
                     tile.javaClass.getMethod("getLongClickIntent").invoke(tile) as? Intent
                 }.getOrNull()
@@ -180,22 +329,261 @@ class LightOpenSystemUi(
                     "LIGHT_OPEN_CONTROL_CENTER_ENTER tile=${tile.javaClass.simpleName} target=$target " +
                         "locked=$locked decision=$decision",
                 )
-                if (locked || intent == null || target == null || decision != LightOpenDecision.FORCE_FREEFORM) {
+                if (locked || target == null || decision != LightOpenDecision.FORCE_FREEFORM) {
                     return@intercept chain.proceed()
                 }
-                val bundle = freeformBundle(context, target, pendingIntentLaunch = false)
-                if (bundle == null) {
-                    module.log(Log.WARN, TAG, "LIGHT_OPEN_CONTROL_CENTER_NO_OPTIONS pkg=$target")
-                    return@intercept chain.proceed()
-                }
-                runCatching { context.startActivity(intent, bundle) }
-                    .onFailure { module.log(Log.WARN, TAG, "LIGHT_OPEN_CONTROL_CENTER_START_FAILED pkg=$target", it) }
-                collapsePanels(tile)
-                module.log(Log.INFO, TAG, "LIGHT_OPEN_CONTROL_CENTER pkg=$target")
-                null
+                // 只上膛，不接管：这次启动仍旧走 MIUI 自己的 ActivityStarter（动画/面板收起都保持原样），
+                // 只是它造 options 的时候会把小窗 bundle 拿走。
+                arm(target, pendingIntentLaunch = false, source = "tile", decision = decision, context = context)
+                chain.proceed()
             }
         module.log(Log.INFO, TAG, "LIGHT_OPEN_CONTROL_CENTER_HOOK_INSTALLED")
     }
+
+    // ------------------------------------------------------------------ PendingIntent 入口（悬浮通知）
+
+    /**
+     * `悬浮通知点开`真机走的不是通知那两个 Runnable：它进的是 SystemUI 的
+     * `ActivityStarter.postStartActivityDismissingKeyguard(PendingIntent, Controller)`
+     * （点开一条横幅 = "启动这个 PendingIntent 并收起锁屏/面板"）。
+     *
+     * 这里按**通知**的规则上膛（方向 + `creatorPackage`），并且加两道保守限制，避免顺手把
+     * SystemUI 自己的跳转也小窗了：creator 必须是普通应用（uid ≥ 10000），且必须是普通 Activity 启动。
+     *
+     * **Intent 重载**（`postStartActivityDismissingKeyguard(Intent, …)`）是**控制中心磁贴长按**用的：
+     * 磁贴本体在插件 APK（`miui.systemui.plugin`）里，实测它调的就是这个 API
+     * （插件 dex 里 `postStartActivityDismissingKeyguard` 出现 2 次，`ActivityStarter` 18 次），
+     * 而磁贴自己的 `longClick` 实现我们钩不到 —— 所以在这一层按控制中心规则兜住。
+     */
+    private fun installPendingIntentArms() {
+        val starterClass = runCatching { loadClass("com.android.systemui.statusbar.phone.ActivityStarterImpl") }
+            .getOrNull()
+        val controllerClass = runCatching {
+            loadClass("com.android.systemui.animation.ActivityTransitionAnimator\$Controller")
+        }.getOrNull()
+        if (starterClass == null) {
+            module.log(Log.WARN, TAG, "LIGHT_OPEN_ARM_TARGET_UNAVAILABLE")
+            return
+        }
+        val pendingIntentSignatures = buildList {
+            add(arrayOf(PendingIntent::class.java))
+            if (controllerClass != null) add(arrayOf(PendingIntent::class.java, controllerClass))
+        }
+        var installed = 0
+        for (signature in pendingIntentSignatures) {
+            val method = runCatching {
+                starterClass.getDeclaredMethod("postStartActivityDismissingKeyguard", *signature)
+            }.getOrNull() ?: continue
+            module.hook(method)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .setId("bubbledrawer.lightopen.arm.pendingintent$installed")
+                .intercept { chain ->
+                    val pendingIntent = chain.args.firstOrNull() as? PendingIntent
+                    val context = readField(chain.thisObject, "mContext") as? Context ?: cachedContext
+                    if (pendingIntent != null && context != null) {
+                        cachedContext = context
+                        armFromPendingIntent(pendingIntent, context, "post.pi")
+                    }
+                    chain.proceed()
+                }
+            installed++
+        }
+        // Intent 重载（控制中心磁贴；插件的 longClick 走这里）
+        val intentSignatures = buildList {
+            add(arrayOf(Intent::class.java, Int::class.javaPrimitiveType))
+            if (controllerClass != null) {
+                add(arrayOf(Intent::class.java, Int::class.javaPrimitiveType, controllerClass))
+                add(
+                    arrayOf(
+                        Intent::class.java,
+                        Int::class.javaPrimitiveType,
+                        controllerClass,
+                        String::class.java,
+                    ),
+                )
+            }
+        }
+        var intentInstalled = 0
+        for (signature in intentSignatures) {
+            val method = runCatching {
+                starterClass.getDeclaredMethod("postStartActivityDismissingKeyguard", *signature)
+            }.getOrNull() ?: continue
+            module.hook(method)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .setId("bubbledrawer.lightopen.arm.intent$intentInstalled")
+                .intercept { chain ->
+                    val intent = chain.args.firstOrNull() as? Intent
+                    val context = readField(chain.thisObject, "mContext") as? Context ?: cachedContext
+                    if (intent != null && context != null) {
+                        cachedContext = context
+                        armFromIntent(intent, context, "post.intent")
+                    }
+                    chain.proceed()
+                }
+            intentInstalled++
+        }
+        module.log(
+            Log.INFO,
+            TAG,
+            "LIGHT_OPEN_ARM_PENDING_INTENT_INSTALLED count=$installed intent=$intentInstalled",
+        )
+    }
+
+    private fun armFromIntent(intent: Intent, context: Context, source: String) {
+        val settings = watcher.current()
+        if (!settings.enabled) return
+        val target = targetPackage(context, intent)
+        // 同一个 API 既被控制中心磁贴用、也被灵动岛/焦点通知用（真机取证：插件 dex 里
+        // `miui.systemui.util.FocusNotificationUtil` 与各 `*Tile` 都调它），靠调用栈区分是谁发起的。
+        val kind = classifyLaunch()
+        val decision = when (kind) {
+            LaunchKind.NOTIFICATION ->
+                LightOpen.notificationDecision(settings, target, isPortrait(context))
+            LaunchKind.CONTROL_CENTER -> LightOpen.controlCenterDecision(settings, target)
+            LaunchKind.UNKNOWN -> LightOpenDecision.LEAVE
+        }
+        module.log(
+            Log.INFO,
+            TAG,
+            "LIGHT_OPEN_ARM_INTENT_ENTER source=$source kind=$kind target=$target decision=$decision",
+        )
+        if (target == null || decision != LightOpenDecision.FORCE_FREEFORM) return
+        arm(
+            packageName = target,
+            // 通知点开是"启动一个 PendingIntent 语义"（可能已有全屏任务）→ 需要 NEW_TASK|MULTIPLE_TASK；
+            // 磁贴长按是普通 startActivity → 不需要。
+            pendingIntentLaunch = kind == LaunchKind.NOTIFICATION,
+            source = "$source/$kind",
+            decision = decision,
+            context = context,
+        )
+    }
+
+    private enum class LaunchKind { NOTIFICATION, CONTROL_CENTER, UNKNOWN }
+
+    /**
+     * 调用栈分类：`postStartActivityDismissingKeyguard(Intent, …)` 是所有 SystemUI/插件跳转的公共出口，
+     * 但"点通知"和"长按磁贴"要用两套不同的规则，只能看是谁调的。
+     * 通知优先（灵动岛/焦点通知的类名更容易识别），磁贴作为兜底。
+     */
+    private fun classifyLaunch(): LaunchKind {
+        var kind = LaunchKind.UNKNOWN
+        for (frame in Throwable().stackTrace) {
+            val name = frame.className
+            if (name.contains("FocusNotification") || name.contains("miui.systemui.notification") ||
+                name.contains("DynamicIsland") || name.contains("dynamicisland")
+            ) {
+                return LaunchKind.NOTIFICATION
+            }
+            if (name.contains("quicksettings") || name.contains("controlcenter") ||
+                name.contains("qs.tileimpl") || name.contains("MiuiQSTile") ||
+                name.contains("android.systemui.qs")
+            ) {
+                kind = LaunchKind.CONTROL_CENTER
+            }
+        }
+        return kind
+    }
+
+    private fun armFromPendingIntent(pendingIntent: PendingIntent, context: Context, source: String) {
+        val settings = watcher.current()
+        if (!settings.enabled) return
+        val packageName = runCatching { pendingIntent.creatorPackage }.getOrNull()
+        val uid = runCatching { pendingIntent.creatorUid }.getOrDefault(-1)
+        val portrait = isPortrait(context)
+        val decision = LightOpen.notificationDecision(settings, packageName, portrait)
+        // SystemUI / 系统应用自己造的 PendingIntent 不算"点通知"（媒体控件、锁屏按钮都会走这条路）。
+        val userApp = uid >= Process.FIRST_APPLICATION_UID
+        module.log(
+            Log.INFO,
+            TAG,
+            "LIGHT_OPEN_ARM_PI_ENTER source=$source pkg=$packageName uid=$uid portrait=$portrait " +
+                "userApp=$userApp decision=$decision",
+        )
+        if (decision != LightOpenDecision.FORCE_FREEFORM || packageName == null || !userApp) return
+        arm(packageName, pendingIntentLaunch = true, source = source, decision = decision, context = context)
+    }
+
+    // ------------------------------------------------------------------ options 漏斗
+
+    /**
+     * `ActivityStarterUtilsKt.createActivityOptions(int callerDisplayId, RemoteAnimationAdapter)`：
+     * SystemUI 所有启动最终都在这里造 bundle（通知列表、悬浮通知、磁贴长按、媒体控件……）。
+     */
+    private fun installOptionsFunnel() {
+        val utilsClass = runCatching { loadClass("com.android.systemui.statusbar.phone.ActivityStarterUtilsKt") }
+            .getOrNull()
+        val adapterClass = runCatching { loadClass("android.view.RemoteAnimationAdapter") }.getOrNull()
+        val method = runCatching {
+            utilsClass?.getDeclaredMethod(
+                "createActivityOptions",
+                Int::class.javaPrimitiveType,
+                adapterClass,
+            )
+        }.getOrNull()
+        if (method == null) {
+            module.log(Log.WARN, TAG, "LIGHT_OPEN_OPTIONS_TARGET_UNAVAILABLE")
+            return
+        }
+        module.hook(method)
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .setId("bubbledrawer.lightopen.options")
+            .intercept { chain ->
+                val pending = armed.getAndSet(null) ?: return@intercept chain.proceed()
+                val now = SystemClock.uptimeMillis()
+                if (now > pending.expiresAtUptime) {
+                    module.log(Log.INFO, TAG, "LIGHT_OPEN_OPTIONS_EXPIRED source=${pending.source} pkg=${pending.packageName}")
+                    return@intercept chain.proceed()
+                }
+                val settings = watcher.current()
+                if (!settings.enabled || pending.decision != LightOpenDecision.FORCE_FREEFORM) {
+                    module.log(
+                        Log.INFO,
+                        TAG,
+                        "LIGHT_OPEN_OPTIONS_SKIPPED source=${pending.source} pkg=${pending.packageName} " +
+                            "why=${if (!settings.enabled) "disabled" else pending.decision}",
+                    )
+                    return@intercept chain.proceed()
+                }
+                val context = pending.context ?: cachedContext
+                val bundle = context?.let {
+                    freeformBundle(it, pending.packageName, pendingIntentLaunch = pending.pendingIntentLaunch)
+                }
+                if (bundle == null) {
+                    module.log(Log.WARN, TAG, "LIGHT_OPEN_OPTIONS_NO_OPTIONS source=${pending.source} pkg=${pending.packageName}")
+                    return@intercept chain.proceed()
+                }
+                module.log(
+                    Log.INFO,
+                    TAG,
+                    "LIGHT_OPEN_OPTIONS_APPLIED source=${pending.source} pkg=${pending.packageName}",
+                )
+                bundle
+            }
+        module.log(Log.INFO, TAG, "LIGHT_OPEN_OPTIONS_HOOK_INSTALLED")
+    }
+
+    private fun arm(
+        packageName: String,
+        pendingIntentLaunch: Boolean,
+        source: String,
+        decision: LightOpenDecision,
+        context: Context?,
+    ) {
+        armed.set(
+            Armed(
+                packageName = packageName,
+                pendingIntentLaunch = pendingIntentLaunch,
+                source = source,
+                decision = decision,
+                context = context,
+                expiresAtUptime = SystemClock.uptimeMillis() + ARM_TTL_MS,
+            ),
+        )
+    }
+
+    private fun isPortrait(context: Context): Boolean =
+        context.resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE
 
     /** 目标包：优先 Intent 的显式组件，其次 `package`，最后交给 PackageManager 解析。 */
     private fun targetPackage(context: Context, intent: Intent): String? {
@@ -206,22 +594,14 @@ class LightOpenSystemUi(
         }.getOrNull()
     }
 
-    /** 尽力收起控制中心：拿不到 host 就算了（下一次启动/返回会自然收拢）。 */
-    private fun collapsePanels(tile: Any) {
-        runCatching {
-            val host = readField(tile, "mHost") ?: return
-            host.javaClass.getMethod("collapsePanels").invoke(host)
-        }
-    }
-
     // ------------------------------------------------------------------ 共用
 
     /**
      * 小窗 ActivityOptions → Bundle。
      *
      * 先问 MIUI（`MiuiMultiWindowUtils`），它返回 null 时退到我们自己造的 freeform options ——
-     * MIUI 那份名单里没有的应用（典型：`com.android.settings`）否则永远不会小窗，
-     * 表现为"长按磁贴没反应"（真机反馈 2026-10-14）。
+     * MIUI 那份名单里没有的应用（日志 `unsupported freeform mode`，实测 `com.tencent.mobileqq`、
+     * `com.android.settings` 都会命中）否则永远不会小窗，表现为"长按磁贴没反应"（真机反馈）。
      *
      * [pendingIntentLaunch] = true 时补 `setPendingIntentLaunchFlags(0x18000000)`（NEW_TASK |
      * MULTIPLE_TASK）—— 从 MIUI 自己的通知迷你窗抄来（`AppMiniWindowManagerImpl$launchMiniWindowActivity$1.run()`）：
@@ -286,7 +666,7 @@ class LightOpenSystemUi(
     private fun loadClass(name: String): Class<*>? {
         var last: Throwable? = null
         // 与 LightOpenGate 同一套回退：热重载后第一项（旧实例的 loader）可能失效，
-        // 中间两项（本实例 loader / 系统 Context loader）才是宿主真正那条链。
+        // 中间两项（本实例 loader / 系统 loader）才是宿主真正那条链。
         for (candidate in listOf(loader, javaClass.classLoader, ClassLoader.getSystemClassLoader(), null)) {
             try {
                 return Class.forName(name, false, candidate)
@@ -300,6 +680,9 @@ class LightOpenSystemUi(
 
     private companion object {
         const val TAG = "LightOpenSystemUi"
+
+        /** 上膛后等这个漏斗被调的宽限时间（毫秒）。超时就作废，避免影响无关启动。 */
+        const val ARM_TTL_MS = 1500L
 
         /** 通知栏列表里点通知。 */
         const val NOTIFICATION_INJECTED_CLASS =
