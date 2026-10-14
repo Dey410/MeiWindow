@@ -98,7 +98,9 @@ class ModuleMain : XposedModule() {
 
     override fun onPackageReady(param: XposedModuleInterface.PackageReadyParam) {
         if (hooksInstalled) return
-        val prefs = configuration ?: return
+        val prefs = configuration ?: runCatching { getRemotePreferences(RemotePrefs.GROUP) }.getOrNull()?.also {
+            configuration = it
+        } ?: return
         if (processName == PROCESS_SYSTEM_UI && param.packageName == PROCESS_SYSTEM_UI) {
             hooksInstalled = true
             systemUiClassLoader = param.classLoader

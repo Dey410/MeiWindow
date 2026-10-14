@@ -62,8 +62,11 @@ class SystemUiHookInstaller(
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .setId("bubbledrawer.systemui.corner_spy_owner.$index")
                     .intercept { chain ->
-                        val result = chain.proceed()
                         val context = chain.thisObject as? Context
+                        if (context != null && appContext == null) {
+                            appContext = context
+                        }
+                        val result = chain.proceed()
                         if (context != null && bound.compareAndSet(false, true)) {
                             startInputMonitor(context)
                         }

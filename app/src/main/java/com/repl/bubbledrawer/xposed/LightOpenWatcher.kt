@@ -46,7 +46,7 @@ class LightOpenWatcher(private val prefs: SharedPreferences) {
 
     fun current(): LightOpenSettings {
         val now = SystemClock.uptimeMillis()
-        if (now - lastReadUptime >= REREAD_INTERVAL_MS) {
+        if (!cached.enabled || now - lastReadUptime >= REREAD_INTERVAL_MS) {
             lastReadUptime = now
             cached = read()
         }

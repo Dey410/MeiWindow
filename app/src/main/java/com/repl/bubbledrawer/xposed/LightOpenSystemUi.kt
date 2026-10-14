@@ -70,6 +70,29 @@ class LightOpenSystemUi(
     private var loader: ClassLoader? = null
     private var cachedContext: Context? = null
 
+    /** 获取可用的 Context，依次尝试传入的 fallback、缓存值、contextProvider()、ActivityThread.currentApplication()。 */
+    private fun getContext(fallback: Context? = null): Context? {
+        if (fallback != null) {
+            cachedContext = fallback
+            return fallback
+        }
+        cachedContext?.let { return it }
+        val provided = runCatching { contextProvider() }.getOrNull()
+        if (provided != null) {
+            cachedContext = provided
+            return provided
+        }
+        val app = runCatching {
+            val atClass = Class.forName("android.app.ActivityThread")
+            atClass.getMethod("currentApplication").invoke(null) as? Context
+        }.getOrNull()
+        if (app != null) {
+            cachedContext = app
+            return app
+        }
+        return null
+    }
+
     /** 一次"上膛"：下一步 `createActivityOptions` 该给哪个包塞小窗 options。 */
     private data class Armed(
         val packageName: String,
@@ -105,7 +128,7 @@ class LightOpenSystemUi(
     fun install(classLoader: ClassLoader) {
         loader = classLoader
         watcher.refresh()
-        runCatching { contextProvider() }.getOrNull()?.let { cachedContext = it }
+        getContext()
         installNotificationHook(NOTIFICATION_INJECTED_CLASS, "injected")
         installNotificationHook(ISLAND_CLASS, "island")
         installNotificationArmHook()
@@ -154,10 +177,7 @@ class LightOpenSystemUi(
                 val packageName = chain.args.getOrNull(0) as? String
                 val pendingIntent = chain.args.getOrNull(1) as? PendingIntent
                 val animController = chain.thisObject
-                val context = (readField(animController, "context") as? Context)
-                    ?: cachedContext
-                    ?: runCatching { contextProvider() }.getOrNull()
-                if (context != null) cachedContext = context
+                val context = getContext(readField(animController, "context") as? Context)
                 val portrait = context?.let { isPortrait(it) } ?: true
                 val decision = if (!settings.enabled || packageName == null || packageName in SYSTEM_PACKAGES) {
                     LightOpenDecision.LEAVE
@@ -219,14 +239,11 @@ class LightOpenSystemUi(
                 .intercept { chain ->
                     val pendingIntent = chain.thisObject as? PendingIntent
                     val fillIn = chain.args.firstOrNull { it is Intent } as? Intent
-                    val context = (chain.args.firstOrNull { it is Context } as? Context)
-                        ?: cachedContext
-                        ?: runCatching { contextProvider() }.getOrNull()
+                    val context = getContext(chain.args.firstOrNull { it is Context } as? Context)
                     val settings = watcher.current()
                     if (!settings.enabled || pendingIntent == null || context == null) {
                         return@intercept chain.proceed()
                     }
-                    cachedContext = context
 
                     // 如果已经注入过小窗 bundle，直接放行，避免重复处理
                     val currentBundle = chain.args.getOrNull(bundleIndex) as? Bundle
@@ -305,11 +322,10 @@ class LightOpenSystemUi(
             .intercept { chain ->
                 val intent = chain.args.getOrNull(0) as? Intent
                 val settings = watcher.current()
-                val context = chain.thisObject as? Context
+                val context = getContext(chain.thisObject as? Context)
                 if (!settings.enabled || intent == null || context == null) {
                     return@intercept chain.proceed()
                 }
-                cachedContext = context
                 val target = targetPackage(context, intent)
                 val kind = classifyLaunch()
                 val decision = decideLaunch(settings, kind, target, context)
@@ -321,7 +337,7 @@ class LightOpenSystemUi(
                     "LIGHT_OPEN_CONTEXT_LAUNCH_ENTER kind=$kind target=$target decision=$decision " +
                         "options=${chain.args.getOrNull(1) != null} stack=${stackSummary()}",
                 )
-                if (decision != LightOpenDecision.FORCE_FREEFORM || target == null) {
+                if (decision != LightOpenDecision.FORCE_FREEFORM) {
                     return@intercept chain.proceed()
                 }
                 val bundle = freeformBundle(context, target, pendingIntentLaunch = kind == LaunchKind.NOTIFICATION)
@@ -389,8 +405,8 @@ class LightOpenSystemUi(
                 val pendingIntent = chain.args.getOrNull(0) as? PendingIntent
                 val intent = chain.args.getOrNull(1) as? Intent
                 val entry = chain.args.getOrNull(2)
-                val context = cachedContext ?: runCatching { contextProvider() }.getOrNull()
-                context?.let { cachedContext = it }
+                val row = chain.args.getOrNull(3) as? android.view.View
+                val context = getContext(row?.context)
                 // 真机取证（2026-10-14 19:43）：`creatorPackage` 对**通知**并不可靠 ——
                 // 点通知时 MIUI 传进来的 PendingIntent 有 `pkg=android`（框架造的）与
                 // `pkg=com.android.systemui`（SystemUI 自己造的）两种，都不是发通知的应用。
@@ -458,8 +474,9 @@ class LightOpenSystemUi(
                 val settings = watcher.current()
                 if (!settings.enabled || !settings.controlCenter) return@intercept chain.proceed()
                 val tile = readField(chain.thisObject, "f\$0")
-                val context = cachedContext ?: runCatching { contextProvider() }.getOrNull()
-                context?.let { cachedContext = it }
+                val view = chain.args.getOrNull(0) as? android.view.View
+                val tileContext = tile?.let { readField(it, "mContext") as? Context }
+                val context = getContext(view?.context ?: tileContext)
                 val intent = tile?.let { longClickIntentOf(it) }
                 val target = intent?.let { context?.let { ctx -> targetPackage(ctx, it) } }
                 val decision = LightOpen.controlCenterDecision(settings, target)
@@ -508,11 +525,10 @@ class LightOpenSystemUi(
             .intercept { chain ->
                 val self = chain.thisObject
                 val pendingIntent = readField(self, "\$intent") as? PendingIntent
-                val context = (readField(self, "this\$0")?.let { readField(it, "mContext") }) as? Context
+                val context = getContext((readField(self, "this\$0")?.let { readField(it, "mContext") }) as? Context)
                 if (pendingIntent == null || context == null) {
                     return@intercept chain.proceed()
                 }
-                if (context is Context) cachedContext = context
                 val packageName = runCatching { pendingIntent.creatorPackage }.getOrNull()
                 val portrait = isPortrait(context)
                 val settings = watcher.current()
@@ -557,8 +573,7 @@ class LightOpenSystemUi(
             .setId("bubbledrawer.lightopen.control_center")
             .intercept { chain ->
                 val tile = chain.thisObject
-                val context = readField(tile, "mContext") as? Context
-                if (context != null) cachedContext = context
+                val context = getContext(readField(tile, "mContext") as? Context)
                 val settings = watcher.current()
                 if (context == null || !settings.enabled || !settings.controlCenter) {
                     return@intercept chain.proceed()
@@ -567,16 +582,14 @@ class LightOpenSystemUi(
                     tile.javaClass.getMethod("getLongClickIntent").invoke(tile) as? Intent
                 }.getOrNull()
                 val target = intent?.let { targetPackage(context, it) }
-                val keyguard = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
-                val locked = keyguard?.isKeyguardLocked == true
                 val decision = LightOpen.controlCenterDecision(settings, target)
                 module.log(
                     Log.INFO,
                     TAG,
                     "LIGHT_OPEN_CONTROL_CENTER_ENTER tile=${tile.javaClass.simpleName} target=$target " +
-                        "locked=$locked decision=$decision",
+                        "decision=$decision",
                 )
-                if (locked || target == null || decision != LightOpenDecision.FORCE_FREEFORM) {
+                if (target == null || decision != LightOpenDecision.FORCE_FREEFORM) {
                     return@intercept chain.proceed()
                 }
                 // 只上膛，不接管：这次启动仍旧走 MIUI 自己的 ActivityStarter（动画/面板收起都保持原样），
@@ -626,9 +639,8 @@ class LightOpenSystemUi(
                 .setId("bubbledrawer.lightopen.arm.pendingintent$installed")
                 .intercept { chain ->
                     val pendingIntent = chain.args.firstOrNull() as? PendingIntent
-                    val context = readField(chain.thisObject, "mContext") as? Context ?: cachedContext
+                    val context = getContext(readField(chain.thisObject, "mContext") as? Context)
                     if (pendingIntent != null && context != null) {
-                        cachedContext = context
                         armFromPendingIntent(pendingIntent, context, "post.pi")
                     }
                     chain.proceed()
@@ -660,9 +672,8 @@ class LightOpenSystemUi(
                 .setId("bubbledrawer.lightopen.arm.intent$intentInstalled")
                 .intercept { chain ->
                     val intent = chain.args.firstOrNull() as? Intent
-                    val context = readField(chain.thisObject, "mContext") as? Context ?: cachedContext
+                    val context = getContext(readField(chain.thisObject, "mContext") as? Context)
                     if (intent != null && context != null) {
-                        cachedContext = context
                         armFromIntent(intent, context, "post.intent")
                     }
                     chain.proceed()
@@ -809,7 +820,7 @@ class LightOpenSystemUi(
                     )
                     return@intercept chain.proceed()
                 }
-                val context = pending.context ?: cachedContext
+                val context = getContext(pending.context)
                 val bundle = context?.let {
                     freeformBundle(it, pending.packageName, pendingIntentLaunch = pending.pendingIntentLaunch)
                 }
@@ -958,7 +969,7 @@ class LightOpenSystemUi(
         const val TAG = "LightOpenSystemUi"
 
         /** 上膛后等这个漏斗被调的宽限时间（毫秒）。超时就作废，避免影响无关启动。 */
-        const val ARM_TTL_MS = 1500L
+        const val ARM_TTL_MS = 5000L
 
         /** 通知栏列表里点通知。 */
         const val NOTIFICATION_INJECTED_CLASS =
