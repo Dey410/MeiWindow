@@ -109,10 +109,241 @@ class LightOpenSystemUi(
         installNotificationHook(NOTIFICATION_INJECTED_CLASS, "injected")
         installNotificationHook(ISLAND_CLASS, "island")
         installNotificationArmHook()
+        installDynamicIslandAnimHook()
         installControlCenterHook()
         installTileViewLongClickHook()
         installPendingIntentArms()
         installOptionsFunnel()
+        installPendingIntentSendHook()
+        installContextLaunchHook()
+    }
+
+    // ------------------------------------------------------------------ 悬浮通知（灵动岛 / 横幅通知）
+
+    /**
+     * 悬浮通知（灵动岛/横幅）在屏幕已解锁时的点击入口：
+     * `DynamicIslandWindowAnimController.openAppUseDefaultAnim(String packageName, PendingIntent pendingIntent)`
+     *
+     * 真机取证（HyperOS SystemUI）：
+     * 点击悬浮通知时，`DynamicIslandController.onDynamicPluginCallback_openApp` 会调用
+     * `animController.openAppUseDefaultAnim(packageName, pendingIntent)`。
+     * 原方法内部仅构建一个普通全屏的 ActivityOptions 并直接调用 `pendingIntent.send(bundle)`。
+     *
+     * 在这里拦截：如果判定为小窗，则使用小窗 bundle 启动并更新控制器状态，不走原本全屏启动逻辑。
+     */
+    private fun installDynamicIslandAnimHook() {
+        val animClass = runCatching {
+            loadClass("com.android.systemui.statusbar.notification.DynamicIslandWindowAnimController")
+        }.getOrNull()
+        if (animClass == null) {
+            module.log(Log.WARN, TAG, "LIGHT_OPEN_ISLAND_ANIM_UNAVAILABLE class=false")
+            return
+        }
+        val method = runCatching {
+            animClass.getDeclaredMethod("openAppUseDefaultAnim", String::class.java, PendingIntent::class.java)
+        }.getOrNull()
+        if (method == null) {
+            module.log(Log.WARN, TAG, "LIGHT_OPEN_ISLAND_ANIM_UNAVAILABLE method=false")
+            return
+        }
+        module.hook(method)
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .setId("bubbledrawer.lightopen.island.defaultanim")
+            .intercept { chain ->
+                val settings = watcher.current()
+                val packageName = chain.args.getOrNull(0) as? String
+                val pendingIntent = chain.args.getOrNull(1) as? PendingIntent
+                val animController = chain.thisObject
+                val context = (readField(animController, "context") as? Context)
+                    ?: cachedContext
+                    ?: runCatching { contextProvider() }.getOrNull()
+                if (context != null) cachedContext = context
+                val portrait = context?.let { isPortrait(it) } ?: true
+                val decision = if (!settings.enabled || packageName == null || packageName in SYSTEM_PACKAGES) {
+                    LightOpenDecision.LEAVE
+                } else {
+                    LightOpen.notificationDecision(settings, packageName, portrait)
+                }
+                module.log(
+                    Log.INFO,
+                    TAG,
+                    "LIGHT_OPEN_ISLAND_ANIM_ENTER pkg=$packageName portrait=$portrait decision=$decision " +
+                        "pi=${pendingIntent != null} ${settings.summary()}",
+                )
+                if (decision != LightOpenDecision.FORCE_FREEFORM || packageName == null || pendingIntent == null || context == null) {
+                    return@intercept chain.proceed()
+                }
+                val bundle = freeformBundle(context, packageName, pendingIntentLaunch = true)
+                if (bundle == null) {
+                    module.log(Log.WARN, TAG, "LIGHT_OPEN_ISLAND_ANIM_NO_BUNDLE pkg=$packageName")
+                    return@intercept chain.proceed()
+                }
+                module.log(Log.INFO, TAG, "LIGHT_OPEN_ISLAND_ANIM_APPLIED pkg=$packageName")
+                writeField(animController, "mPendingIntent", pendingIntent)
+                runCatching {
+                    pendingIntent.send(context, 0, null, null, null, null, bundle)
+                }.onFailure { err ->
+                    module.log(Log.WARN, TAG, "LIGHT_OPEN_ISLAND_ANIM_SEND_FAILED pkg=$packageName", err)
+                    return@intercept chain.proceed()
+                }
+                null
+            }
+        module.log(Log.INFO, TAG, "LIGHT_OPEN_ISLAND_ANIM_HOOK_INSTALLED")
+    }
+
+    // ------------------------------------------------------------------ 兜底：进程内所有"真正发起的启动"
+
+    /**
+     * `PendingIntent.send(...)` / `PendingIntent.sendAndReturnResult(...)` ——
+     * 覆盖所有带 options Bundle 参数的 send 重载（包含 1 参的 `send(Bundle)`、7 参的
+     * `send(Context, int, Intent, ..., Bundle)` 以及 `sendAndReturnResult`）。
+     *
+     * 无论悬浮通知还是列表通知，最终发起的 PendingIntent 都带着 options Bundle，在此处作为统一兜底。
+     */
+    private fun installPendingIntentSendHook() {
+        val onFinished = runCatching { loadClass("android.app.PendingIntent\$OnFinished") }.getOrNull()
+        val candidates = PendingIntent::class.java.declaredMethods.filter { candidate ->
+            (candidate.name == "send" || candidate.name == "sendAndReturnResult") &&
+                candidate.parameterTypes.contains(Bundle::class.java)
+        }
+        if (candidates.isEmpty()) {
+            module.log(Log.WARN, TAG, "LIGHT_OPEN_SEND_TARGET_UNAVAILABLE")
+            return
+        }
+        for ((index, candidate) in candidates.withIndex()) {
+            val bundleIndex = candidate.parameterTypes.indexOfFirst { it == Bundle::class.java }
+            if (bundleIndex < 0) continue
+            module.hook(candidate)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .setId("bubbledrawer.lightopen.send$index")
+                .intercept { chain ->
+                    val pendingIntent = chain.thisObject as? PendingIntent
+                    val fillIn = chain.args.firstOrNull { it is Intent } as? Intent
+                    val context = (chain.args.firstOrNull { it is Context } as? Context)
+                        ?: cachedContext
+                        ?: runCatching { contextProvider() }.getOrNull()
+                    val settings = watcher.current()
+                    if (!settings.enabled || pendingIntent == null || context == null) {
+                        return@intercept chain.proceed()
+                    }
+                    cachedContext = context
+
+                    // 如果已经注入过小窗 bundle，直接放行，避免重复处理
+                    val currentBundle = chain.args.getOrNull(bundleIndex) as? Bundle
+                    if (currentBundle?.getBoolean("bubbledrawer.lightopen.applied") == true) {
+                        module.log(
+                            Log.INFO,
+                            TAG,
+                            "LIGHT_OPEN_SEND_ALREADY_APPLIED name=${candidate.name} n=${candidate.parameterCount}",
+                        )
+                        return@intercept chain.proceed()
+                    }
+
+                    val innerIntent = runCatching {
+                        PendingIntent::class.java.getMethod("getIntent").invoke(pendingIntent) as? Intent
+                    }.getOrNull()
+                    val creator = runCatching { pendingIntent.creatorPackage }.getOrNull()
+                    val innerPackage = innerIntent?.component?.packageName ?: innerIntent?.`package`
+                    val fillInPackage = fillIn?.component?.packageName ?: fillIn?.`package`
+                    val target = listOf(innerPackage, fillInPackage, creator)
+                        .firstOrNull { it != null && it !in SYSTEM_PACKAGES }
+                    val kind = classifyLaunch()
+                    val decision = decideLaunch(settings, kind, target, context)
+                    module.log(
+                        Log.INFO,
+                        TAG,
+                        "LIGHT_OPEN_SEND_CALL name=${candidate.name} n=${candidate.parameterCount} kind=$kind target=$target " +
+                            "inner=$innerPackage fillIn=$fillInPackage creator=$creator decision=$decision " +
+                            "bundleIndex=$bundleIndex stack=${stackSummary()}",
+                    )
+                    if (decision != LightOpenDecision.FORCE_FREEFORM || target == null) {
+                        return@intercept chain.proceed()
+                    }
+                    val bundle = freeformBundle(context, target, pendingIntentLaunch = true)
+                        ?: return@intercept chain.proceed()
+                    val args = chain.args.toMutableList()
+                    args[bundleIndex] = bundle
+                    module.log(Log.INFO, TAG, "LIGHT_OPEN_SEND_APPLIED name=${candidate.name} n=${candidate.parameterCount} pkg=$target")
+                    chain.proceed(args.toTypedArray())
+                }
+        }
+        module.log(
+            Log.INFO,
+            TAG,
+            "LIGHT_OPEN_SEND_HOOK_INSTALLED methods=${candidates.size} onFinished=${onFinished != null}",
+        )
+    }
+
+    /** 调用栈摘要（跳过我们自己和反射/框架的帧），用于定位"到底是谁在发起这次启动"。 */
+    private fun stackSummary(): String = Throwable().stackTrace
+        .asSequence()
+        .filterNot { frame ->
+            val name = frame.className
+            name.startsWith("com.repl.bubbledrawer") || name.startsWith("java.lang.reflect") ||
+                name.startsWith("io.github.libxposed") || name.startsWith("android.app.PendingIntent") ||
+                name.startsWith("android.app.ContextImpl") || name.startsWith("android.os.Handler")
+        }
+        .take(6)
+        .joinToString("<") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
+
+    /**
+     * `ContextImpl.startActivity(Intent, Bundle)` —— SystemUI（含插件）**进程内**直接发起的启动
+     * 都会经过这里（控制中心磁贴、面板卡片、灵动岛自绘视图……）。带上我们的小窗 bundle 再 proceed。
+     */
+    private fun installContextLaunchHook() {
+        val implClass = runCatching { loadClass("android.app.ContextImpl") }.getOrNull()
+        val method = runCatching {
+            implClass?.getDeclaredMethod("startActivity", Intent::class.java, Bundle::class.java)
+        }.getOrNull()
+        if (method == null) {
+            module.log(Log.WARN, TAG, "LIGHT_OPEN_CONTEXT_LAUNCH_TARGET_UNAVAILABLE")
+            return
+        }
+        module.hook(method)
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .setId("bubbledrawer.lightopen.context.start")
+            .intercept { chain ->
+                val intent = chain.args.getOrNull(0) as? Intent
+                val settings = watcher.current()
+                val context = chain.thisObject as? Context
+                if (!settings.enabled || intent == null || context == null) {
+                    return@intercept chain.proceed()
+                }
+                cachedContext = context
+                val target = targetPackage(context, intent)
+                val kind = classifyLaunch()
+                val decision = decideLaunch(settings, kind, target, context)
+                // 只记"目标像一个真实应用"的启动：SystemUI 自己的窗口操作太多，全打会淹没日志。
+                if (target == null || target in SYSTEM_PACKAGES) return@intercept chain.proceed()
+                module.log(
+                    Log.INFO,
+                    TAG,
+                    "LIGHT_OPEN_CONTEXT_LAUNCH_ENTER kind=$kind target=$target decision=$decision " +
+                        "options=${chain.args.getOrNull(1) != null} stack=${stackSummary()}",
+                )
+                if (decision != LightOpenDecision.FORCE_FREEFORM || target == null) {
+                    return@intercept chain.proceed()
+                }
+                val bundle = freeformBundle(context, target, pendingIntentLaunch = kind == LaunchKind.NOTIFICATION)
+                    ?: return@intercept chain.proceed()
+                module.log(Log.INFO, TAG, "LIGHT_OPEN_CONTEXT_LAUNCH_APPLIED kind=$kind pkg=$target")
+                chain.proceed(arrayOf<Any?>(intent, bundle))
+            }
+        module.log(Log.INFO, TAG, "LIGHT_OPEN_CONTEXT_LAUNCH_HOOK_INSTALLED")
+    }
+
+    /** 按来源选规则：灵动岛/通知用"通知"规则，磁贴/控制中心用"控制中心"规则，其它不干预。 */
+    private fun decideLaunch(
+        settings: com.repl.bubbledrawer.lightopen.LightOpenSettings,
+        kind: LaunchKind,
+        target: String?,
+        context: Context,
+    ): LightOpenDecision = when {
+        target == null || target in SYSTEM_PACKAGES -> LightOpenDecision.LEAVE
+        kind == LaunchKind.NOTIFICATION ->
+            LightOpen.notificationDecision(settings, target, isPortrait(context))
+        kind == LaunchKind.CONTROL_CENTER -> LightOpen.controlCenterDecision(settings, target)
+        else -> LightOpen.notificationDecision(settings, target, isPortrait(context))
     }
 
     // ------------------------------------------------------------------ 通知的统一入口（最重要的一个）
@@ -157,17 +388,29 @@ class LightOpenSystemUi(
                 if (!settings.enabled) return@intercept chain.proceed()
                 val pendingIntent = chain.args.getOrNull(0) as? PendingIntent
                 val intent = chain.args.getOrNull(1) as? Intent
+                val entry = chain.args.getOrNull(2)
                 val context = cachedContext ?: runCatching { contextProvider() }.getOrNull()
                 context?.let { cachedContext = it }
-                val packageName = runCatching { pendingIntent?.creatorPackage }.getOrNull()
-                    ?: (intent?.`package` ?: intent?.component?.packageName)
+                // 真机取证（2026-10-14 19:43）：`creatorPackage` 对**通知**并不可靠 ——
+                // 点通知时 MIUI 传进来的 PendingIntent 有 `pkg=android`（框架造的）与
+                // `pkg=com.android.systemui`（SystemUI 自己造的）两种，都不是发通知的应用。
+                // 发通知的应用在 NotificationEntry 的 SBN 上（`mSbn.packageName`），那才是"这个通知属于谁"。
+                val sbnPackage = entryPackage(entry)
+                val intentPackage = intent?.component?.packageName ?: intent?.`package`
+                val creatorPackage = runCatching { pendingIntent?.creatorPackage }.getOrNull()
+                val packageName = sbnPackage ?: intentPackage ?: creatorPackage
                 val portrait = context?.let { isPortrait(it) } ?: true
-                val decision = LightOpen.notificationDecision(settings, packageName, portrait)
+                val decision = if (packageName == null || packageName in SYSTEM_PACKAGES) {
+                    LightOpenDecision.LEAVE
+                } else {
+                    LightOpen.notificationDecision(settings, packageName, portrait)
+                }
                 module.log(
                     Log.INFO,
                     TAG,
-                    "LIGHT_OPEN_NOTIFICATION_ARM_ENTER pkg=$packageName portrait=$portrait " +
-                        "decision=$decision entry=${chain.args.getOrNull(2) != null} ${settings.summary()}",
+                    "LIGHT_OPEN_NOTIFICATION_ARM_ENTER pkg=$packageName sbn=$sbnPackage intent=$intentPackage " +
+                        "creator=$creatorPackage portrait=$portrait decision=$decision " +
+                        "entry=${entry != null} ${settings.summary()}",
                 )
                 if (decision == LightOpenDecision.FORCE_FREEFORM && packageName != null && context != null) {
                     arm(
@@ -476,13 +719,16 @@ class LightOpenSystemUi(
         for (frame in Throwable().stackTrace) {
             val name = frame.className
             if (name.contains("FocusNotification") || name.contains("miui.systemui.notification") ||
-                name.contains("DynamicIsland") || name.contains("dynamicisland")
+                name.contains("DynamicIsland") || name.contains("dynamicisland") ||
+                name.contains("Notification") || name.contains("notification") ||
+                name.contains("Notif") || name.contains("HeadsUp") || name.contains("headsUp") ||
+                name.contains("Island") || name.contains("island")
             ) {
                 return LaunchKind.NOTIFICATION
             }
             if (name.contains("quicksettings") || name.contains("controlcenter") ||
                 name.contains("qs.tileimpl") || name.contains("MiuiQSTile") ||
-                name.contains("android.systemui.qs")
+                name.contains("android.systemui.qs") || name.contains("QSTile")
             ) {
                 kind = LaunchKind.CONTROL_CENTER
             }
@@ -493,21 +739,34 @@ class LightOpenSystemUi(
     private fun armFromPendingIntent(pendingIntent: PendingIntent, context: Context, source: String) {
         val settings = watcher.current()
         if (!settings.enabled) return
-        val packageName = runCatching { pendingIntent.creatorPackage }.getOrNull()
-        val uid = runCatching { pendingIntent.creatorUid }.getOrDefault(-1)
+        val creatorPackage = runCatching { pendingIntent.creatorPackage }.getOrNull()
+        val creatorUid = runCatching { pendingIntent.creatorUid }.getOrDefault(-1)
+        // 点悬浮通知时 MIUI 递进来的是一个 **SystemUI 自己造的** PendingIntent（真机日志：
+        // `pkg=com.android.systemui uid=10231`，因为 SystemUI 是普通应用 uid，按 uid 过滤挡不住），
+        // 所以 creator 不能直接当"通知属于谁"，要退回它包着的那个真实 Intent（`pi.getIntent()`，@hide）。
+        val innerIntent = runCatching {
+            PendingIntent::class.java.getMethod("getIntent").invoke(pendingIntent) as? Intent
+        }.getOrNull()
+        val innerPackage = innerIntent?.component?.packageName ?: innerIntent?.`package`
+        val packageName = creatorPackage?.takeIf { it !in SYSTEM_PACKAGES }
+            ?: innerPackage?.takeIf { it !in SYSTEM_PACKAGES }
         val portrait = isPortrait(context)
         val decision = LightOpen.notificationDecision(settings, packageName, portrait)
-        // SystemUI / 系统应用自己造的 PendingIntent 不算"点通知"（媒体控件、锁屏按钮都会走这条路）。
-        val userApp = uid >= Process.FIRST_APPLICATION_UID
         module.log(
             Log.INFO,
             TAG,
-            "LIGHT_OPEN_ARM_PI_ENTER source=$source pkg=$packageName uid=$uid portrait=$portrait " +
-                "userApp=$userApp decision=$decision",
+            "LIGHT_OPEN_ARM_PI_ENTER source=$source pkg=$packageName creator=$creatorPackage uid=$creatorUid " +
+                "inner=$innerPackage portrait=$portrait decision=$decision",
         )
-        if (decision != LightOpenDecision.FORCE_FREEFORM || packageName == null || !userApp) return
+        if (decision != LightOpenDecision.FORCE_FREEFORM || packageName == null) return
         arm(packageName, pendingIntentLaunch = true, source = source, decision = decision, context = context)
     }
+
+    /** 通知属于哪个应用：`NotificationEntry.mSbn.packageName`（ExpandedNotification 继承 StatusBarNotification）。 */
+    private fun entryPackage(entry: Any?): String? = runCatching {
+        val sbn = readField(entry, "mSbn") ?: entry ?: return null
+        sbn.javaClass.getMethod("getPackageName").invoke(sbn) as? String
+    }.getOrNull()
 
     // ------------------------------------------------------------------ options 漏斗
 
@@ -641,11 +900,17 @@ class LightOpenSystemUi(
             }.onFailure {
                 module.log(Log.WARN, TAG, "LIGHT_OPEN_NO_PENDING_INTENT_FLAGS", it)
             }
+            runCatching {
+                ActivityOptions::class.java
+                    .getMethod("setPendingIntentBackgroundActivityStartMode", Int::class.javaPrimitiveType)
+                    .invoke(options, 1)
+            }
         }
         val bundle = runCatching { options.toBundle() }.getOrNull() ?: return null
         // MIUI 的通知启动 bundle 自带这个标志（android.pendingIntent.backgroundActivityAllowed=1），
         // 我们自己造 bundle 时补上，否则后台启动限制会拦掉这次 launch。
         bundle.putInt("android.pendingIntent.backgroundActivityAllowed", 1)
+        bundle.putBoolean("bubbledrawer.lightopen.applied", true)
         return bundle
     }
 
@@ -710,5 +975,11 @@ class LightOpenSystemUi(
 
         /** ViewConfiguration/WM 的 WINDOWING_MODE_FREEFORM。 */
         const val WINDOWING_MODE_FREEFORM = 5
+
+        /**
+         * 系统界面自身的包名：它们既不是"发通知的应用"，也不是"要被小窗的目标"。
+         * 真机日志里点通知时出现的就是这两个（MIUI 用自己的 PendingIntent 转手）。
+         */
+        val SYSTEM_PACKAGES = setOf("android", "com.android.systemui")
     }
 }
