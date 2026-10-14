@@ -29,8 +29,21 @@ class ModuleMain : XposedModule() {
     private var systemUiInstaller: SystemUiHookInstaller? = null
     private var systemUiClassLoader: ClassLoader? = null
 
+    /**
+     * 「轻量打开」两侧的 hook 安装器。**必须持有引用**：它们的 prefs 监听器是重建缓存的入口，
+     * 而 SharedPreferences 对监听器只持弱引用 —— 被 GC 掉就等于开关不再生效（且毫无征兆）。
+     */
+    private var lightOpenSystemUi: LightOpenSystemUi? = null
+    private var lightOpenGate: LightOpenGate? = null
+
     override fun onModuleLoaded(param: XposedModuleInterface.ModuleLoadedParam) {
         processName = param.processName
+        if (param.processName == PROCESS_SYSTEM) {
+            // system_server：安装点在 onSystemServerStarting（那里才拿得到它的 classloader）。
+            // 这里不做 hidden-API 豁免 —— 它本身就是平台进程。
+            log(Log.INFO, TAG, "MODULE_LOADED_SYSTEM_SERVER")
+            return
+        }
         if (param.processName != PROCESS_SYSTEM_UI) {
             log(Log.WARN, TAG, "MODULE_SKIPPED_UNEXPECTED_PROCESS")
             return
@@ -54,7 +67,11 @@ class ModuleMain : XposedModule() {
                 "Landroid/content/pm/IPackageManager;",
                 "Landroid/util/MiuiFreeformLaunchConfig;",
                 "Landroid/util/MiuiMultiWindowUtils;",
+                "Landroid/app/ActivityOptions;",
                 "Lcom/android/wm/shell/",
+                "Lcom/android/systemui/animation/",
+                "Lcom/android/systemui/qs/",
+                "Lcom/android/systemui/statusbar/phone/",
             )
         }.getOrDefault(false)
         log(if (exempted) Log.INFO else Log.WARN, TAG, "HIDDEN_API_EXEMPT=$exempted")
@@ -83,7 +100,34 @@ class ModuleMain : XposedModule() {
             hooksInstalled = true
             systemUiClassLoader = param.classLoader
             SystemUiHookInstaller(this, prefs).also { systemUiInstaller = it }.install(param.classLoader)
+            // 轻量打开的两项（点通知 / 控制中心长按）都在 SystemUI 进程里做 —— 系统闸门对
+            // SystemUI 发起的启动直接早退，见 LightOpenSystemUi 的类注释。
+            runCatching {
+                LightOpenSystemUi(this, prefs).also { lightOpenSystemUi = it }.install(param.classLoader)
+            }.onFailure { log(Log.WARN, TAG, "LIGHT_OPEN_SYSTEMUI_INSTALL_FAILED", it) }
         }
+    }
+
+    /**
+     * API-102 里 system_server 的入口（`onPackageReady` 不会为它触发）。
+     *
+     * 这里只装一个钩子：`MiuiFreeformServiceImpl.startActivityByFreeForm` 的返回值覆盖
+     * （分享至应用 / 文本操作 / 应用间跳转）。system_server 没有热重载入口，改代码要重启才生效
+     * —— 见 docs/input-hook-architecture.md §3.3。
+     */
+    override fun onSystemServerStarting(param: XposedModuleInterface.SystemServerStartingParam) {
+        processName = PROCESS_SYSTEM
+        val prefs = configuration ?: runCatching { getRemotePreferences(RemotePrefs.GROUP) }
+            .onFailure { log(Log.WARN, TAG, "LIGHT_OPEN_GATE_CONFIG_FAILED", it) }
+            .getOrNull()
+        if (prefs == null) {
+            log(Log.WARN, TAG, "LIGHT_OPEN_GATE_NO_CONFIG")
+            return
+        }
+        configuration = prefs
+        runCatching {
+            LightOpenGate(this, prefs).also { lightOpenGate = it }.install(param.classLoader)
+        }.onFailure { log(Log.WARN, TAG, "LIGHT_OPEN_GATE_INSTALL_FAILED", it) }
     }
 
     /**
@@ -106,6 +150,7 @@ class ModuleMain : XposedModule() {
         }.onFailure { log(Log.WARN, TAG, "HOT_RELOAD_STATE_SAVE_FAILED", it) }
         runCatching { systemUiInstaller?.dispose() }
         systemUiInstaller = null
+        lightOpenSystemUi = null
         return true
     }
 
@@ -147,6 +192,10 @@ class ModuleMain : XposedModule() {
                 }
                 if (loader != null) systemUiClassLoader = loader
                 SystemUiHookInstaller(this, prefs).also { systemUiInstaller = it }.reinstall(ctx)
+                runCatching {
+                    LightOpenSystemUi(this, prefs).also { lightOpenSystemUi = it }
+                        .install(loader ?: javaClass.classLoader)
+                }.onFailure { log(Log.WARN, TAG, "HOT_RELOAD_LIGHT_OPEN_FAILED", it) }
             }.onFailure { log(Log.WARN, TAG, "HOT_RELOAD_REINSTALL_FAILED", it) }
         }
     }
@@ -170,5 +219,8 @@ class ModuleMain : XposedModule() {
         const val HOOK_ID_PREFIX = "bubbledrawer."
 
         const val PROCESS_SYSTEM_UI = "com.android.systemui"
+
+        /** system_server 在这个 API 里叫 "system"（见 commit 423c937 的 system_server 实验）。 */
+        const val PROCESS_SYSTEM = "system"
     }
 }

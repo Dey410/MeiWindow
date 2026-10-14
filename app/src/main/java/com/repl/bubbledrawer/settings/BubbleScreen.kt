@@ -11,5 +11,7 @@ sealed interface BubbleScreen : NavKey {
     data object Fan : BubbleScreen
     data object MorePanel : BubbleScreen
     data object Experimental : BubbleScreen
+    data object LightOpen : BubbleScreen
+    data object LightOpenApps : BubbleScreen
     data object Diagnostics : BubbleScreen
 }

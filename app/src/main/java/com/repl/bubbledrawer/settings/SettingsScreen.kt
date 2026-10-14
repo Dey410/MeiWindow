@@ -43,6 +43,7 @@ fun MainSettingsScreen(
     onNavigateToFan: () -> Unit,
     onNavigateToMorePanel: () -> Unit,
     onNavigateToExperimental: () -> Unit,
+    onNavigateToLightOpen: () -> Unit,
     onNavigateToDiagnostics: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -159,6 +160,13 @@ fun MainSettingsScreen(
                             title = stringResource(R.string.category_experimental),
                             summary = stringResource(R.string.category_experimental_summary),
                             onClick = onNavigateToExperimental,
+                        )
+                    },
+                    CardItem("light-open") {
+                        ArrowRow(
+                            title = stringResource(R.string.category_light_open),
+                            summary = stringResource(R.string.category_light_open_summary),
+                            onClick = onNavigateToLightOpen,
                         )
                     },
                     CardItem("diagnosis") {

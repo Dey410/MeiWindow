@@ -111,6 +111,8 @@ object ModuleLogDiagnosis {
         // 功能页（快捷方式）：扫没扫到、送没送到、面板里的编辑有没有交给 App。
         "SHORTCUT_SCAN", "SHORTCUT_REFRESH_REJECTED", "FUNCTION_WRITE_HANDOFF",
         "FUNCTION_REMOTE_CHANGED", "FUNCTION_SYNC_FROM_APP_",
+        // 轻量打开（六开关）：两个进程各装一次钩子，命中时各留一行。
+        "LIGHT_OPEN_",
     )
 
     fun moduleLines(lines: List<String>): List<String> =
@@ -785,6 +787,63 @@ object ModuleLogDiagnosis {
                         else -> "最近一次枚举 $items 条（result=${result ?: "?"}）"
                     } + if (handoffFailed) "；另外面板里刚才那次功能收藏的编辑**没能发出去**（广播失败）" else "",
                     evidence = trimPrefix(shortcutEvidence),
+                ),
+            )
+        }
+
+        // 轻量打开（六开关）：六项分两个进程生效 —— 通知/控制中心在 SystemUI，分享/文本操作/
+        // 应用间跳转在 system_server（要重启，且作用域必须含 system）。"没生效"因此至少有三种
+        // 完全不同的原因，这一条把它们分开：钩子没装上、装上了但一次都没命中（护栏放行）、
+        // 或者已经按名单改写窗口模式。
+        val gateInstalled = lines.lastOrNull { it.contains("LIGHT_OPEN_GATE_INSTALLED") }
+        val notificationInstalled = lines.lastOrNull { it.contains("LIGHT_OPEN_NOTIFICATION_HOOK_INSTALLED") }
+        val controlCenterInstalled = lines.lastOrNull { it.contains("LIGHT_OPEN_CONTROL_CENTER_HOOK_INSTALLED") }
+        val targetUnavailable = lines.lastOrNull {
+            it.contains("LIGHT_OPEN_GATE_TARGET_UNAVAILABLE") ||
+                it.contains("LIGHT_OPEN_NOTIFICATION_TARGET_UNAVAILABLE") ||
+                it.contains("LIGHT_OPEN_CONTROL_CENTER_TARGET_UNAVAILABLE")
+        }
+        val lastIntervention = lines.lastOrNull {
+            it.contains("LIGHT_OPEN_FREEFORM") || it.contains("LIGHT_OPEN_FULLSCREEN") ||
+                it.contains("LIGHT_OPEN_NOTIFICATION ") || it.contains("LIGHT_OPEN_CONTROL_CENTER ")
+        }
+        val anyLightOpen = gateInstalled != null || notificationInstalled != null ||
+            controlCenterInstalled != null || targetUnavailable != null
+        if (anyLightOpen) {
+            val freeformCount = count(lines, "LIGHT_OPEN_FREEFORM")
+            val fullscreenCount = count(lines, "LIGHT_OPEN_FULLSCREEN")
+            add(
+                DiagnosisCheck(
+                    id = "behaviour.light_open",
+                    group = CheckGroup.BEHAVIOUR,
+                    title = "轻量打开（六开关）",
+                    status = when {
+                        targetUnavailable != null -> CheckStatus.WARN
+                        gateInstalled == null || notificationInstalled == null ||
+                            controlCenterInstalled == null -> CheckStatus.INFO
+                        freeformCount + fullscreenCount > 0 -> CheckStatus.PASS
+                        else -> CheckStatus.INFO
+                    },
+                    detail = buildString {
+                        append("SystemUI 侧：点通知=")
+                        append(if (notificationInstalled != null) "已装" else "未见")
+                        append("，控制中心=")
+                        append(if (controlCenterInstalled != null) "已装" else "未见")
+                        append("；system_server 侧闸门=")
+                        append(
+                            if (gateInstalled != null) {
+                                "已装"
+                            } else {
+                                "未见（这两项要重启手机，且 LSPosed 作用域要含系统框架）"
+                            },
+                        )
+                        append("。这份日志里强制小窗 $freeformCount 次、强制全屏 $fullscreenCount 次。")
+                        if (freeformCount + fullscreenCount == 0 && gateInstalled != null) {
+                            append("开关已开却一次都没命中：多半是护栏放行（前台是桌面/锁屏/同应用），")
+                            append("或者目标应用不支持小窗（日志里有 unsupported freeform mode）。")
+                        }
+                    },
+                    evidence = trimPrefix((targetUnavailable ?: lastIntervention ?: gateInstalled).orEmpty()),
                 ),
             )
         }

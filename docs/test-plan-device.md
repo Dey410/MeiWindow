@@ -712,3 +712,40 @@ adb logcat -s BubbleDrawer | findstr PRESSURE_CALIBRATION
 
 ## 贴边模式（可选，root）
 - [ ] 设置页"贴边模式"：无 su → toast 需要 root；有 su → inset=0，正上滑角落也能出扇
+
+## A26 轻量打开（六开关）
+
+前置：`scope.list` 已含 `system`；**安装新包后重启一次手机**（system_server 没有热重载，
+见 docs/light-open.md §4）。设置页 →「轻量打开」→ 打开总开关。
+
+日志（`adb logcat -s BubbleDrawer:V LightOpenGate:V LightOpenSystemUi:V MiuiMultiWindowUtils:D MiuiFreeformServiceImpl:D`）：
+
+- [ ] 重启后能看到 `MODULE_LOADED_SYSTEM_SERVER` 与 `LIGHT_OPEN_GATE_INSTALLED …`
+      —— 没有这两行说明 system_server 作用域没生效（LSPosed 里确认作用域/重启）
+- [ ] SystemUI 侧能看到 `LIGHT_OPEN_NOTIFICATION_HOOK_INSTALLED` 与 `LIGHT_OPEN_CONTROL_CENTER_HOOK_INSTALLED`
+      （打 `*_TARGET_UNAVAILABLE` = ROM 改了类名/字段名，钩子没装上）
+
+### 通知 / 控制中心（SystemUI 侧）
+- [ ] 开「竖屏点通知以小窗打开」：竖屏时点一个通知 → 对应应用在小窗里打开；
+      日志 `LIGHT_OPEN_NOTIFICATION pkg=… portrait=true`
+- [ ] 关掉竖屏、开「横屏点通知以小窗打开」：横屏（视频/游戏里）点通知 → 小窗；
+      竖屏点通知 → 仍然全屏
+- [ ] 开「长按磁贴以小窗打开」：控制中心长按 WiFi/蓝牙磁贴 → 设置页在小窗里打开；
+      日志 `LIGHT_OPEN_CONTROL_CENTER pkg=…`；**锁屏时**长按 → 仍然走 MIUI 的解锁流程（不全屏抢跑）
+- [ ] 关掉总开关 → 两者都回到原生行为（日志里不再出现 `LIGHT_OPEN_*`）
+
+### 分享 / 文本操作 / 应用间跳转（system_server 侧）
+- [ ] 开「分享至应用」：任意应用点分享 → 选一个目标 → 目标以小窗打开；
+      日志 `LIGHT_OPEN_FREEFORM target=… top=… why=share`
+- [ ] 开「文本操作」：选中一段链接 → 编辑条里的浏览器图标 → 浏览器小窗打开（`why=text`）
+- [ ] 白名单模式 + 名单里放微信：从别的应用跳到微信 → 小窗（`why=list`）；
+      跳到不在名单里的应用 → 全屏（日志无 FREEORM 行）
+- [ ] 黑名单模式 + 名单里放微信：跳到任意其它应用 → 小窗；跳到微信 → 强制全屏
+      （`LIGHT_OPEN_FULLSCREEN target=com.tencent.mm`）
+- [ ] **桌面护栏**：回到桌面，点任意图标 → 正常全屏打开，日志**没有** `LIGHT_OPEN_FREEFORM`
+      （前台包是 `com.miui.home` 时必须放行）；最近任务卡片、负一屏同理
+- [ ] **同应用护栏**：在一个应用内部翻页/开子页面 → 不受影响
+- [ ] **空前台护栏**：锁屏状态下由后台拉起应用 → 不干预
+- [ ] **不可小窗的应用**：把某个 `resizeableActivity=false` 的应用放进白名单 → 仍全屏，
+      日志有 `MiuiMultiWindowUtils: pkg name: X unsupported freeform mode`（这是预期，不是 bug）
+- [ ] SystemUI 自己发起的启动不受影响：通知（未开开关时）、状态栏、模块自己的扇面启动应用

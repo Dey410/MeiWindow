@@ -51,6 +51,18 @@ interface SettingsActions {
     fun setFlymeFreeformDimBg(enabled: Boolean)
     fun setContactBar(enabled: Boolean)
     fun setContactBarMinWidthPct(pct: Int)
+
+    /** 轻量打开：总开关 + 六个分项 + 应用间跳转的模式与名单。 */
+    fun setLightOpenEnabled(enabled: Boolean)
+    fun setLightOpenNotifPortrait(enabled: Boolean)
+    fun setLightOpenNotifLandscape(enabled: Boolean)
+    fun setLightOpenControlCenter(enabled: Boolean)
+    fun setLightOpenShare(enabled: Boolean)
+    fun setLightOpenText(enabled: Boolean)
+    fun setLightOpenJump(enabled: Boolean)
+    fun setLightOpenJumpMode(mode: Int)
+    fun setLightOpenJumpList(packages: Set<String>)
+
     fun openManage(context: Context)
 
     /** 重启系统界面：模块的 hook 都在那个进程里，热重载只重建模块自己的运行时（见 [SystemUiRestart]）。 */
@@ -98,6 +110,15 @@ class StoreSettingsActions(private val context: Context) : SettingsActions {
     override fun setFlymeFreeformDimBg(enabled: Boolean) = SettingsStore.setFlymeFreeformDimBg(context, enabled)
     override fun setContactBar(enabled: Boolean) = SettingsStore.setContactBar(context, enabled)
     override fun setContactBarMinWidthPct(pct: Int) = SettingsStore.setContactBarMinWidthPct(context, pct)
+    override fun setLightOpenEnabled(enabled: Boolean) = SettingsStore.setLightOpenEnabled(context, enabled)
+    override fun setLightOpenNotifPortrait(enabled: Boolean) = SettingsStore.setLightOpenNotifPortrait(context, enabled)
+    override fun setLightOpenNotifLandscape(enabled: Boolean) = SettingsStore.setLightOpenNotifLandscape(context, enabled)
+    override fun setLightOpenControlCenter(enabled: Boolean) = SettingsStore.setLightOpenControlCenter(context, enabled)
+    override fun setLightOpenShare(enabled: Boolean) = SettingsStore.setLightOpenShare(context, enabled)
+    override fun setLightOpenText(enabled: Boolean) = SettingsStore.setLightOpenText(context, enabled)
+    override fun setLightOpenJump(enabled: Boolean) = SettingsStore.setLightOpenJump(context, enabled)
+    override fun setLightOpenJumpMode(mode: Int) = SettingsStore.setLightOpenJumpMode(context, mode)
+    override fun setLightOpenJumpList(packages: Set<String>) = SettingsStore.setLightOpenJumpList(context, packages)
     override fun openManage(context: Context) {
         context.startActivity(
             android.content.Intent(context, com.repl.bubbledrawer.pin.PinManageActivity::class.java),

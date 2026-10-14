@@ -74,6 +74,7 @@ class MainActivity : ComponentActivity() {
                                 onNavigateToFan = { backStack.add(BubbleScreen.Fan) },
                                 onNavigateToMorePanel = { backStack.add(BubbleScreen.MorePanel) },
                                 onNavigateToExperimental = { backStack.add(BubbleScreen.Experimental) },
+                                onNavigateToLightOpen = { backStack.add(BubbleScreen.LightOpen) },
                                 onNavigateToDiagnostics = { backStack.add(BubbleScreen.Diagnostics) },
                             )
                         }
@@ -107,6 +108,25 @@ class MainActivity : ComponentActivity() {
                         }
                         entry<BubbleScreen.Experimental>(swipeDismiss = swipeBack) {
                             ExperimentalSettingsScreen(
+                                state = state,
+                                actions = actions,
+                                onBack = {
+                                    if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
+                                },
+                            )
+                        }
+                        entry<BubbleScreen.LightOpen>(swipeDismiss = swipeBack) {
+                            LightOpenSettingsScreen(
+                                state = state,
+                                actions = actions,
+                                onBack = {
+                                    if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
+                                },
+                                onPickApps = { backStack.add(BubbleScreen.LightOpenApps) },
+                            )
+                        }
+                        entry<BubbleScreen.LightOpenApps>(swipeDismiss = swipeBack) {
+                            LightOpenAppsScreen(
                                 state = state,
                                 actions = actions,
                                 onBack = {

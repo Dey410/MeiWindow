@@ -257,6 +257,33 @@ object RemotePrefs {
     const val CONTACT_BAR_MIN_WIDTH_MIN = 0
     const val CONTACT_BAR_MIN_WIDTH_MAX = 90
 
+    /**
+     * 「轻量打开」六开关（判定逻辑见 com.repl.bubbledrawer.lightopen.LightOpen）。
+     *
+     * 全部默认**关闭**：这些开关会改变系统启动路径的结果，第一次上机必须是"什么都不做"的状态。
+     * [KEY_LIGHT_OPEN_JUMP_LIST] 存换行分隔的包名列表（编解码见 LightOpen.encodeTargets）；
+     * [KEY_LIGHT_OPEN_JUMP_MODE]：0 = 白名单（名单内才小窗），1 = 黑名单（名单外全部小窗）。
+     */
+    const val KEY_LIGHT_OPEN_ENABLED = "light_open_enabled"
+    const val KEY_LIGHT_OPEN_NOTIF_PORTRAIT = "light_open_notif_portrait"
+    const val KEY_LIGHT_OPEN_NOTIF_LANDSCAPE = "light_open_notif_landscape"
+    const val KEY_LIGHT_OPEN_CONTROL_CENTER = "light_open_control_center"
+    const val KEY_LIGHT_OPEN_SHARE = "light_open_share"
+    const val KEY_LIGHT_OPEN_TEXT = "light_open_text"
+    const val KEY_LIGHT_OPEN_JUMP = "light_open_jump"
+    const val KEY_LIGHT_OPEN_JUMP_MODE = "light_open_jump_mode"
+    const val KEY_LIGHT_OPEN_JUMP_LIST = "light_open_jump_list"
+
+    const val DEFAULT_LIGHT_OPEN_ENABLED = false
+    const val DEFAULT_LIGHT_OPEN_NOTIF_PORTRAIT = false
+    const val DEFAULT_LIGHT_OPEN_NOTIF_LANDSCAPE = false
+    const val DEFAULT_LIGHT_OPEN_CONTROL_CENTER = false
+    const val DEFAULT_LIGHT_OPEN_SHARE = false
+    const val DEFAULT_LIGHT_OPEN_TEXT = false
+    const val DEFAULT_LIGHT_OPEN_JUMP = false
+    const val DEFAULT_LIGHT_OPEN_JUMP_MODE = com.repl.bubbledrawer.lightopen.LightOpen.MODE_WHITE
+    const val DEFAULT_LIGHT_OPEN_JUMP_LIST = ""
+
     @androidx.compose.runtime.Immutable
     data class Snapshot(
         val enabled: Boolean,
@@ -323,7 +350,31 @@ object RemotePrefs {
         val contactBar: Boolean = DEFAULT_CONTACT_BAR,
         /** 联系人条尺寸阈值：小窗宽度低于屏幕宽度的 N% 时隐藏（0 = 关闭该限制） */
         val contactBarMinWidthPct: Int = DEFAULT_CONTACT_BAR_MIN_WIDTH_PCT,
+        /** 轻量打开：六个开关 + 应用间跳转的模式与名单（名单是换行分隔的原始字符串） */
+        val lightOpenEnabled: Boolean = DEFAULT_LIGHT_OPEN_ENABLED,
+        val lightOpenNotifPortrait: Boolean = DEFAULT_LIGHT_OPEN_NOTIF_PORTRAIT,
+        val lightOpenNotifLandscape: Boolean = DEFAULT_LIGHT_OPEN_NOTIF_LANDSCAPE,
+        val lightOpenControlCenter: Boolean = DEFAULT_LIGHT_OPEN_CONTROL_CENTER,
+        val lightOpenShare: Boolean = DEFAULT_LIGHT_OPEN_SHARE,
+        val lightOpenText: Boolean = DEFAULT_LIGHT_OPEN_TEXT,
+        val lightOpenJump: Boolean = DEFAULT_LIGHT_OPEN_JUMP,
+        val lightOpenJumpMode: Int = DEFAULT_LIGHT_OPEN_JUMP_MODE,
+        val lightOpenJumpList: String = DEFAULT_LIGHT_OPEN_JUMP_LIST,
     )
+
+    /** 轻量打开判定用的设置对象（hook 侧与 UI 侧读同一份）。 */
+    fun lightOpenSettings(snap: Snapshot): com.repl.bubbledrawer.lightopen.LightOpenSettings =
+        com.repl.bubbledrawer.lightopen.LightOpen.from(
+            enabled = snap.lightOpenEnabled,
+            notificationPortrait = snap.lightOpenNotifPortrait,
+            notificationLandscape = snap.lightOpenNotifLandscape,
+            controlCenter = snap.lightOpenControlCenter,
+            shareToApp = snap.lightOpenShare,
+            textAction = snap.lightOpenText,
+            appJump = snap.lightOpenJump,
+            jumpMode = snap.lightOpenJumpMode,
+            jumpListRaw = snap.lightOpenJumpList,
+        )
 
     fun enabledFor(side: com.repl.bubbledrawer.gesture.SpySide): (Snapshot) -> Boolean = { snap ->
         snap.enabled && when (side) {
@@ -418,6 +469,16 @@ object RemotePrefs {
             contactBar = sp.getBoolean(KEY_CONTACT_BAR, DEFAULT_CONTACT_BAR),
             contactBarMinWidthPct = sp.getInt(KEY_CONTACT_BAR_MIN_WIDTH_PCT, DEFAULT_CONTACT_BAR_MIN_WIDTH_PCT)
                 .coerceIn(CONTACT_BAR_MIN_WIDTH_MIN, CONTACT_BAR_MIN_WIDTH_MAX),
+            lightOpenEnabled = sp.getBoolean(KEY_LIGHT_OPEN_ENABLED, DEFAULT_LIGHT_OPEN_ENABLED),
+            lightOpenNotifPortrait = sp.getBoolean(KEY_LIGHT_OPEN_NOTIF_PORTRAIT, DEFAULT_LIGHT_OPEN_NOTIF_PORTRAIT),
+            lightOpenNotifLandscape = sp.getBoolean(KEY_LIGHT_OPEN_NOTIF_LANDSCAPE, DEFAULT_LIGHT_OPEN_NOTIF_LANDSCAPE),
+            lightOpenControlCenter = sp.getBoolean(KEY_LIGHT_OPEN_CONTROL_CENTER, DEFAULT_LIGHT_OPEN_CONTROL_CENTER),
+            lightOpenShare = sp.getBoolean(KEY_LIGHT_OPEN_SHARE, DEFAULT_LIGHT_OPEN_SHARE),
+            lightOpenText = sp.getBoolean(KEY_LIGHT_OPEN_TEXT, DEFAULT_LIGHT_OPEN_TEXT),
+            lightOpenJump = sp.getBoolean(KEY_LIGHT_OPEN_JUMP, DEFAULT_LIGHT_OPEN_JUMP),
+            lightOpenJumpMode = sp.getInt(KEY_LIGHT_OPEN_JUMP_MODE, DEFAULT_LIGHT_OPEN_JUMP_MODE)
+                .coerceIn(com.repl.bubbledrawer.lightopen.LightOpen.MODE_WHITE, com.repl.bubbledrawer.lightopen.LightOpen.MODE_BLACK),
+            lightOpenJumpList = sp.getString(KEY_LIGHT_OPEN_JUMP_LIST, DEFAULT_LIGHT_OPEN_JUMP_LIST).orEmpty(),
             pins = sp.getString(com.repl.bubbledrawer.data.PrefsPinBackend.KEY, "").orEmpty(),
         )
     }

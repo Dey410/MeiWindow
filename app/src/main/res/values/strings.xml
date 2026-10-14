@@ -175,4 +175,36 @@
     <string name="panel_functions_empty">暂未添加功能\n点击右上角加号前往添加</string>
     <string name="functions_catalog_empty">还没有读取到功能\n应用提供的快捷方式会显示在这里</string>
     <string name="add">添加</string>
+
+    <!-- 轻量打开（六开关） -->
+    <string name="category_light_open">轻量打开</string>
+    <string name="category_light_open_summary">六种系统跳转改用小窗打开</string>
+    <string name="light_open_title">轻量打开</string>
+    <string name="light_open_enable">启用轻量打开</string>
+    <string name="light_open_enable_summary">开启后下面各项才会生效（全部默认关闭）</string>
+    <string name="light_open_section_notification">通知</string>
+    <string name="light_open_notif_portrait">竖屏点通知以小窗打开</string>
+    <string name="light_open_notif_portrait_summary">竖屏时点击通知，该应用在小窗里打开而不是全屏</string>
+    <string name="light_open_notif_landscape">横屏点通知以小窗打开</string>
+    <string name="light_open_notif_landscape_summary">横屏（看视频、玩游戏）时点击通知，该应用在小窗里打开</string>
+    <string name="light_open_section_control_center">控制中心</string>
+    <string name="light_open_control_center">长按磁贴以小窗打开</string>
+    <string name="light_open_control_center_summary">控制中心里长按带设置页的磁贴，打开的页面落在小窗</string>
+    <string name="light_open_section_jump">跳转</string>
+    <string name="light_open_share">分享至应用</string>
+    <string name="light_open_share_summary">系统分享（含分享多个）选中的应用以小窗打开</string>
+    <string name="light_open_text">文本操作</string>
+    <string name="light_open_text_summary">选中文本后编辑条里的条目（打开链接 / 搜索 / 翻译）以小窗打开</string>
+    <string name="light_open_jump">应用间跳转</string>
+    <string name="light_open_jump_summary">应用之间的跳转按下面的名单决定要不要小窗</string>
+    <string name="light_open_jump_mode">名单模式</string>
+    <string name="light_open_jump_mode_white">白名单（名单内才小窗）</string>
+    <string name="light_open_jump_mode_black">黑名单（名单外全部小窗）</string>
+    <string name="light_open_jump_pick">选择应用</string>
+    <string name="light_open_jump_pick_count">已选 %1$d 个</string>
+    <string name="light_open_jump_pick_empty">还没有选择应用</string>
+    <string name="light_open_apps_title">选择应用</string>
+    <string name="light_open_apps_selected">已选 %1$d 个</string>
+    <string name="light_open_apps_loading">正在读取应用列表…</string>
+    <string name="light_open_hint">说明：这些开关只在「你正在用的应用跳到另一个应用」时生效 —— 桌面 / 负一屏 / 最近任务里打开应用、锁屏上的启动、同一个应用内部的跳转都不受影响；不支持小窗的应用会自动保持全屏。通知与控制中心改动即时生效（必要时重启一次系统界面），应用间跳转等三项要重启手机（system_server 没有热重载）。</string>
 </resources>

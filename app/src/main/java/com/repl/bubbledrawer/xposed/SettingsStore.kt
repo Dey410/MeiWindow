@@ -355,6 +355,59 @@ object SettingsStore {
         pct.coerceIn(RemotePrefs.CONTACT_BAR_MIN_WIDTH_MIN, RemotePrefs.CONTACT_BAR_MIN_WIDTH_MAX),
     )
 
+    // ------------------------------------------------------------------ 轻量打开
+
+    /**
+     * 「轻量打开」六开关的写入口。判定逻辑不在这里跑：这里只把值同步进 LSPosed 远程组，
+     * SystemUI（通知 / 控制中心）与 system_server（分享 / 文本操作 / 应用间跳转）两侧的 hook
+     * 都通过 `getRemotePreferences` 读同一份。
+     */
+    fun setLightOpenEnabled(context: Context, enabled: Boolean) =
+        putBoolean(context, RemotePrefs.KEY_LIGHT_OPEN_ENABLED, enabled)
+
+    /** 竖屏 / 横屏点通知以小窗打开。 */
+    fun setLightOpenNotifPortrait(context: Context, enabled: Boolean) =
+        putBoolean(context, RemotePrefs.KEY_LIGHT_OPEN_NOTIF_PORTRAIT, enabled)
+
+    fun setLightOpenNotifLandscape(context: Context, enabled: Boolean) =
+        putBoolean(context, RemotePrefs.KEY_LIGHT_OPEN_NOTIF_LANDSCAPE, enabled)
+
+    /** 控制中心长按磁贴以小窗打开。 */
+    fun setLightOpenControlCenter(context: Context, enabled: Boolean) =
+        putBoolean(context, RemotePrefs.KEY_LIGHT_OPEN_CONTROL_CENTER, enabled)
+
+    /** 分享至应用 / 文本操作。 */
+    fun setLightOpenShare(context: Context, enabled: Boolean) =
+        putBoolean(context, RemotePrefs.KEY_LIGHT_OPEN_SHARE, enabled)
+
+    fun setLightOpenText(context: Context, enabled: Boolean) =
+        putBoolean(context, RemotePrefs.KEY_LIGHT_OPEN_TEXT, enabled)
+
+    /** 应用间跳转（带黑白名单）。 */
+    fun setLightOpenJump(context: Context, enabled: Boolean) =
+        putBoolean(context, RemotePrefs.KEY_LIGHT_OPEN_JUMP, enabled)
+
+    fun setLightOpenJumpMode(context: Context, mode: Int) = putInt(
+        context,
+        RemotePrefs.KEY_LIGHT_OPEN_JUMP_MODE,
+        mode.coerceIn(
+            com.repl.bubbledrawer.lightopen.LightOpen.MODE_WHITE,
+            com.repl.bubbledrawer.lightopen.LightOpen.MODE_BLACK,
+        ),
+    )
+
+    /** 写入完整名单（UI 改完再交进来；编码 / 清洗在 [com.repl.bubbledrawer.lightopen.LightOpen]）。 */
+    fun setLightOpenJumpList(context: Context, packages: Collection<String>) = putString(
+        context,
+        RemotePrefs.KEY_LIGHT_OPEN_JUMP_LIST,
+        com.repl.bubbledrawer.lightopen.LightOpen.encodeTargets(packages),
+    )
+
+    private fun putString(context: Context, key: String, value: String) {
+        RemoteBridge.local(context).edit().putString(key, value).apply()
+        RemoteBridge.remote?.edit()?.putString(key, value)?.apply()
+    }
+
     private fun putBoolean(context: Context, key: String, value: Boolean) {
         RemoteBridge.local(context).edit().putBoolean(key, value).apply()
         RemoteBridge.remote?.edit()?.putBoolean(key, value)?.apply()
