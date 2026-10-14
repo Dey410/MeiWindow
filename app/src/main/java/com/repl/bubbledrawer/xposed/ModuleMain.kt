@@ -36,6 +36,9 @@ class ModuleMain : XposedModule() {
     private var lightOpenSystemUi: LightOpenSystemUi? = null
     private var lightOpenGate: LightOpenGate? = null
 
+    /** system_server 的 classloader（热重载后重建闸门钩子要用）。 */
+    private var systemServerClassLoader: ClassLoader? = null
+
     override fun onModuleLoaded(param: XposedModuleInterface.ModuleLoadedParam) {
         processName = param.processName
         if (param.processName == PROCESS_SYSTEM) {
@@ -112,11 +115,16 @@ class ModuleMain : XposedModule() {
      * API-102 里 system_server 的入口（`onPackageReady` 不会为它触发）。
      *
      * 这里只装一个钩子：`MiuiFreeformServiceImpl.startActivityByFreeForm` 的返回值覆盖
-     * （分享至应用 / 文本操作 / 应用间跳转）。system_server 没有热重载入口，改代码要重启才生效
-     * —— 见 docs/input-hook-architecture.md §3.3。
+     * （分享至应用 / 文本操作 / 应用间跳转）。
+     *
+     * **注意**：真机上 LSPosed 会照常给 system_server 投递热重载（日志
+     * `HOT_RELOAD_ACCEPTED process=system`），但本回调不会再次触发 —— 重建在
+     * [onHotReloaded] 里做（见那里的注释：漏了这一步，闸门钩子会在每次 `adb install` 之后
+     * 静默消失到下次重启）。
      */
     override fun onSystemServerStarting(param: XposedModuleInterface.SystemServerStartingParam) {
         processName = PROCESS_SYSTEM
+        systemServerClassLoader = param.classLoader
         val prefs = configuration ?: runCatching { getRemotePreferences(RemotePrefs.GROUP) }
             .onFailure { log(Log.WARN, TAG, "LIGHT_OPEN_GATE_CONFIG_FAILED", it) }
             .getOrNull()
@@ -144,13 +152,14 @@ class ModuleMain : XposedModule() {
         // Hand what the next generation cannot rebuild on its own to the framework: the
         // Application Context (onCreate will not run again) and this process' identity.
         val context = runCatching { systemUiInstaller?.capturedContext() }.getOrNull()
-        val loader = systemUiClassLoader
+        val loader = systemUiClassLoader ?: systemServerClassLoader
         runCatching {
             param.setSavedInstanceState(arrayOf(processName, context, loader))
         }.onFailure { log(Log.WARN, TAG, "HOT_RELOAD_STATE_SAVE_FAILED", it) }
         runCatching { systemUiInstaller?.dispose() }
         systemUiInstaller = null
         lightOpenSystemUi = null
+        lightOpenGate = null
         return true
     }
 
@@ -197,6 +206,21 @@ class ModuleMain : XposedModule() {
                         .install(loader ?: javaClass.classLoader)
                 }.onFailure { log(Log.WARN, TAG, "HOT_RELOAD_LIGHT_OPEN_FAILED", it) }
             }.onFailure { log(Log.WARN, TAG, "HOT_RELOAD_REINSTALL_FAILED", it) }
+        }
+
+        // system_server：LSPosed 也会给它投递热重载，但 onSystemServerStarting 不会再次触发 ——
+        // 少了这一步，闸门钩子会在**每次 `adb install -r`** 之后被卸掉并且再也装不回来
+        // （真机踩到：HOT_RELOADED process=system unhooked=1，之后所有跳转都回到原生行为），
+        // 只有重启才能恢复。classloader 用启动时存下的那个，取不到就退回系统 classloader
+        // （system_server 的框架类都在 boot classpath 上，够用）。
+        if (processName == PROCESS_SYSTEM) {
+            runCatching {
+                val prefs = configuration ?: getRemotePreferences(RemotePrefs.GROUP).also {
+                    configuration = it
+                }
+                LightOpenGate(this, prefs).also { lightOpenGate = it }
+                    .install(loader ?: systemServerClassLoader ?: ClassLoader.getSystemClassLoader())
+            }.onFailure { log(Log.WARN, TAG, "HOT_RELOAD_LIGHT_OPEN_GATE_FAILED", it) }
         }
     }
 

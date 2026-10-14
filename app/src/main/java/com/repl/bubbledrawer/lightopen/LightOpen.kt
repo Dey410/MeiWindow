@@ -55,6 +55,13 @@ object LightOpen {
     const val MAX_TARGETS = 200
     const val MAX_TARGET_LEN = 200
 
+    /**
+     * 小米安全中心的"XX 想打开 XX，是否允许"拦截弹窗。它是系统弹窗：带名单的跳转被它拦下来时，
+     * 这次启动的目标就是它（真实目标在它后面那一次启动里）—— 绝不能把拦截框本身变成小窗
+     * （真机反馈 2026-10-14）。
+     */
+    const val SECURITY_CENTER = "com.miui.securitycenter"
+
     // 动作常量自己写：纯逻辑层不 import android.content.Intent（单测里那是 stub）。
     const val ACTION_SEND = "android.intent.action.SEND"
     const val ACTION_SEND_MULTIPLE = "android.intent.action.SEND_MULTIPLE"
@@ -174,6 +181,9 @@ object LightOpen {
         val target = targetPackage
         if (target.isNullOrBlank()) return LightOpenDecision.LEAVE
         if (target == topFullscreenPackage) return LightOpenDecision.LEAVE
+        // 系统拦截框（安全中心的"是否允许"）永远不参与小窗：它出现时，"目标应用"其实是它，
+        // 真正的目标在用户点"允许"之后的第二次启动里 —— 那一次才该由我们判定。
+        if (target == SECURITY_CENTER) return LightOpenDecision.LEAVE
 
         // 黑名单是「否决票」：名单内的应用即使命中了分享/文本开关也保持全屏。
         val listed = target in settings.jumpTargets

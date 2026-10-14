@@ -208,9 +208,32 @@ class LightOpenGate(
         activityThread.getMethod("getSystemContext").invoke(current) as? Context
     }.getOrNull()
 
-    private fun loadClass(name: String): Class<*>? = runCatching {
-        Class.forName(name, false, loader ?: javaClass.classLoader)
-    }.getOrNull()
+    private fun loadClass(name: String): Class<*>? {
+        var last: Throwable? = null
+        // system_server 的框架类（miui-services.jar 里的 com.android.server.wm.*）**不是** boot
+        // classpath 上就能 `Class.forName` 到的：真机实测 boot loader / 系统 classloader 都会
+        // ClassNotFound，只有"宿主自己那条 classloader 链"能找到。所以候选顺序是：
+        //   启动时拿到的 loader → 本模块实例的 loader（热重载后是新的一条，父链挂在宿主上）→
+        //   系统 Context 的 loader → 系统 classloader → boot。
+        // 少了中间两项，热重载后闸门会以 `LIGHT_OPEN_GATE_CLASS_MISSING` 静默失效（真机踩到）。
+        for (candidate in candidateLoaders()) {
+            try {
+                return Class.forName(name, false, candidate)
+            } catch (throwable: Throwable) {
+                last = throwable
+            }
+        }
+        module.log(Log.WARN, TAG, "LIGHT_OPEN_GATE_CLASS_MISSING $name", last)
+        return null
+    }
+
+    private fun candidateLoaders(): List<ClassLoader?> = listOf(
+        loader,
+        javaClass.classLoader,
+        runCatching { systemContext()?.classLoader }.getOrNull(),
+        ClassLoader.getSystemClassLoader(),
+        null,
+    )
 
     private companion object {
         const val TAG = "LightOpenGate"
