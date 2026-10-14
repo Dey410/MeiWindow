@@ -83,6 +83,7 @@ class PinManageModelFunctionTest {
 
     private fun model(
         functionPinsOf: () -> List<String> = { emptyList() },
+        pinnedFunctionItems: () -> List<ShortcutItem> = { emptyList() },
         onFunctionOrderChange: (List<String>) -> Unit = {},
     ) = PinManageModel(
         loadApps = { persistentListOf() },
@@ -90,6 +91,7 @@ class PinManageModelFunctionTest {
         onOrderChange = {},
         recommendConfig = { false to 0 },
         functionPinsOf = functionPinsOf,
+        pinnedFunctionItems = pinnedFunctionItems,
         onFunctionOrderChange = onFunctionOrderChange,
     )
 
@@ -192,10 +194,49 @@ class PinManageModelFunctionTest {
         injectPins(model, listOf(alipayScan.pinKey, "com.gone#x", wechatScan.pinKey))
 
         assertEquals(
-            "已选区按用户点选的顺序排，已经卸载/失效的键直接跳过",
-            listOf(alipayScan.pinKey, wechatScan.pinKey),
+            "已选区按用户点选的顺序排；枚举里没有的键也不能凭空消失（面板里认不出来就是这种情形）",
+            listOf(alipayScan.pinKey, "com.gone#x", wechatScan.pinKey),
             model.pinnedFunctions.map { it.pinKey },
         )
+    }
+
+    /**
+     * 面板（SystemUI）的枚举结果里未必有用户选的那条 —— 它靠宿主给的详情来画。
+     * 用户 2026-10-13 报「功能不显示在扇形面板」，根因就在这里：认不出来的键被静默丢掉了。
+     */
+    @Test
+    fun pinnedFunctionsFallBackToTheHostProvidedDetailsThenToAPlaceholder() {
+        val fromDetails = ShortcutItem(
+            id = "telegram_group_42",
+            packageName = "org.telegram.messenger",
+            label = "群聊",
+            subLabel = "Telegram",
+            type = ShortcutType.APP_SHORTCUT,
+            intentUri = "intent:#Intent;action=VIEW;end",
+        )
+        val model = model(
+            // 面板就是这么拿的：键来自共享组，详情（名称/宿主/Intent）来自 App 发布的那份。
+            functionPinsOf = { listOf(wechatScan.pinKey, fromDetails.pinKey, "com.unknown#thing") },
+            pinnedFunctionItems = { listOf(fromDetails) },
+        )
+        injectShortcuts(model, listOf(wechatScan))
+        model.refreshFunctionPins()
+
+        assertEquals(
+            listOf(wechatScan.pinKey, fromDetails.pinKey, "com.unknown#thing"),
+            model.pinnedFunctions.map { it.pinKey },
+        )
+        // 详情优先于占位：标题与启动 Intent 都来自详情。
+        val resolved = model.pinnedFunctions.first { it.pinKey == fromDetails.pinKey }
+        assertEquals("群聊", resolved.label)
+        assertEquals("intent:#Intent;action=VIEW;end", resolved.intentUri)
+        // 自己枚举到的条目优先于详情（它带着 ShortcutInfo，面板能用 LauncherApps 直接启动）。
+        val own = model.pinnedFunctions.first { it.pinKey == wechatScan.pinKey }
+        assertEquals(wechatScan.label, own.label)
+        // 谁都没有的那条至少还看得见、能被取消（标题退回 id，包名可还原）。
+        val placeholder = model.pinnedFunctions.first { it.pinKey == "com.unknown#thing" }
+        assertEquals("thing", placeholder.label)
+        assertEquals("com.unknown", placeholder.packageName)
     }
 
     @Test

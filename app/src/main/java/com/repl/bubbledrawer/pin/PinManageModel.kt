@@ -41,6 +41,12 @@ class PinManageModel(
     private val loadShortcuts: (suspend () -> Pair<List<com.repl.bubbledrawer.shortcut.ShortcutItem>, List<com.repl.bubbledrawer.shortcut.ShortcutItem>>)? = null,
     initialTab: Int = 0,
     private val functionPinsOf: () -> List<String> = { emptyList() },
+    /**
+     * 已选功能的**详情**（宿主提供）。面板（SystemUI）从共享组读 App 发布的那份：
+     * 它自己的枚举结果里未必有这些键，而 `mapNotNull` 遇上认不出来的键会**静默丢掉** ——
+     * 「设置页里选好了，扇形面板里什么都没有」就是这么来的。
+     */
+    private val pinnedFunctionItems: () -> List<com.repl.bubbledrawer.shortcut.ShortcutItem> = { emptyList() },
     private val onFunctionOrderChange: (List<String>) -> Unit = {},
 ) {
     /** 0 = 应用 (Apps), 1 = 功能 (Shortcuts / Features) */
@@ -56,8 +62,18 @@ class PinManageModel(
     var functionPins: List<String> by mutableStateOf(emptyList())
         private set
 
+    /**
+     * 宿主给的已选功能详情（面板从共享组读 App 发布的那份）。
+     *
+     * 缓存在状态里而不是每次读都问宿主：这是个 getter，组合里会被读很多次，而它背后是一次 prefs
+     * 读取 + 解码。
+     */
+    var pinnedFunctionDetails: List<com.repl.bubbledrawer.shortcut.ShortcutItem> by mutableStateOf(emptyList())
+        private set
+
     fun refreshFunctionPins() {
         functionPins = functionPinsOf()
+        pinnedFunctionDetails = runCatching { pinnedFunctionItems() }.getOrDefault(emptyList())
     }
 
     fun isFunctionPinned(item: com.repl.bubbledrawer.shortcut.ShortcutItem): Boolean =
@@ -80,11 +96,18 @@ class PinManageModel(
     var desktopShortcuts: List<com.repl.bubbledrawer.shortcut.ShortcutItem> by mutableStateOf(emptyList())
         private set
 
+    /**
+     * 功能页的完整目录 = 自己枚举到的 + 宿主给的已选详情。
+     *
+     * 加上详情这一半是为了让面板**至少画得出用户已经选过的那些**：面板（SystemUI）自己的枚举结果
+     * 里未必有它们（它读不到 App 侧的缓存），而认不出来的键在已选区就是"凭空消失"
+     * （用户 2026-10-13：「功能不显示在扇形面板」）。自己枚举到的条目排在前、优先使用。
+     */
     val allShortcuts: List<com.repl.bubbledrawer.shortcut.ShortcutItem>
         get() {
             val list = mutableListOf<com.repl.bubbledrawer.shortcut.ShortcutItem>()
             val seen = mutableSetOf<String>()
-            for (item in appShortcuts + desktopShortcuts) {
+            for (item in appShortcuts + desktopShortcuts + pinnedFunctionDetails) {
                 if (seen.add(item.pinKey)) {
                     list.add(item)
                 }
@@ -95,8 +118,12 @@ class PinManageModel(
     /** 需求 3：从扇形面板打开的更多应用，只显示用户手动添加的功能 */
     val pinnedFunctions: List<com.repl.bubbledrawer.shortcut.ShortcutItem>
         get() {
+            // [allShortcuts] 里已经含「自己枚举到的」与「宿主给的详情」两半，自己那份优先。
+            // 两边都没有才退回占位项 —— 绝不让一条已选功能凭空消失（用户 2026-10-13 的报障）。
             val allMap = allShortcuts.associateBy { it.pinKey }
-            val list = functionPins.mapNotNull { allMap[it] }
+            val list = functionPins.map { key ->
+                allMap[key] ?: com.repl.bubbledrawer.shortcut.FunctionPinDetails.placeholder(key)
+            }
             if (!isSearching || searchQuery.isBlank()) return list
             val q = searchQuery.trim()
             return list.filter {
@@ -253,7 +280,8 @@ class PinManageModel(
         scope.launch {
             apps = loadApps()
             rebuild()
-            functionPins = functionPinsOf()
+            // 键与详情一起刷新（详情决定「面板能不能把已选功能画出来」，见 allShortcuts）。
+            refreshFunctionPins()
             loadShortcuts?.let { loader ->
                 runCatching {
                     val (appsList, desktopList) = kotlinx.coroutines.withContext(Dispatchers.IO) {

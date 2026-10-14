@@ -147,7 +147,6 @@ object PanelContentFactory {
             com.repl.bubbledrawer.shortcut.ShortcutRepository.launchShortcut(context, item)
             onClose()
         },
-        onOpenManage: ((Int) -> Unit)? = null,
     ): ComposeView {
         val owners = OverlayComposeOwners()
         // Resume BEFORE the first composition: the recomposer reads the lifecycle state on
@@ -186,7 +185,6 @@ object PanelContentFactory {
                         manageLabel = manageLabelOf(model),
                         backdrop = backdrop,
                         onLaunchShortcut = onLaunchShortcut,
-                        onOpenManage = onOpenManage,
                     )
                 }
             }

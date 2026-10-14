@@ -49,8 +49,8 @@ import com.repl.bubbledrawer.launch.FreeformTrigger
 import com.repl.bubbledrawer.launch.FullscreenLaunchStrategy
 import com.repl.bubbledrawer.launch.ILaunchStrategy
 import com.repl.bubbledrawer.pin.PanelContentFactory
-import com.repl.bubbledrawer.pin.PinManageActivity
 import com.repl.bubbledrawer.pin.PinManageModel
+import com.repl.bubbledrawer.shortcut.FunctionPinDetails
 import com.repl.bubbledrawer.shortcut.FunctionPinStore
 import com.repl.bubbledrawer.shortcut.ShortcutItem
 import com.repl.bubbledrawer.shortcut.ShortcutRepository
@@ -186,6 +186,18 @@ class FanHost(
 
     private val functionsLocal get() = FunctionPinStore.backend(sysUiPrefs)
     private val functionsRemote get() = FunctionPinStore.backend(prefs)
+
+    /**
+     * 面板读「已选功能」的**详情**（App 进程发布到共享组的那份）。
+     *
+     * 面板要画一条已选功能，本来得在自己的枚举结果里认出这个键 —— 而两边的枚举结果并不相同
+     * （面板有 LauncherApps 但读不到 App 的缓存，App 反过来）。少一条就会出现「设置页里选好了，
+     * 扇形面板里什么都没有」，还不给任何提示。详情里带着名称、宿主与启动 Intent，面板直接画就行，
+     * 不再依赖自己的枚举（图标缺失时 `ShortcutIcon` 会退回宿主应用图标）。
+     */
+    private fun readFunctionDetails(): List<ShortcutItem> =
+        runCatching { FunctionPinDetails.decode(prefs.getString(FunctionPinDetails.KEY, null)) }
+            .getOrDefault(emptyList())
 
     /** 面板读：[com.repl.bubbledrawer.shortcut.FunctionPinStore] 的键列表。 */
     private fun readFunctionPins(): List<String> {
@@ -439,6 +451,16 @@ class FanHost(
                     null,
                 )
                 rebindFanIfBusy()
+            } else if (key == FunctionPinDetails.KEY) {
+                // 已选功能的详情到了：面板开着就重画已选区 —— 这一刻它可能刚从「认不出来」变成
+                // 「认得出来」（用户 2026-10-13：设置页选好了、面板里没有）。
+                logger(
+                    Log.INFO,
+                    "FUNCTION_DETAILS_CHANGED len=" +
+                        prefs.getString(FunctionPinDetails.KEY, "").orEmpty().length,
+                    null,
+                )
+                mainHandler.post { if (moreUp) moreContent?.refreshFunctionPins() }
             } else if (key == FunctionPinStore.KEY_PINNED_FUNCTIONS || key == FunctionPinStore.PREFS_KEY_REV) {
                 // 功能收藏的同款逐 key 回调（为什么不回推见上面 PIN_REMOTE_CHANGED 那段）：
                 // 远端戳不小于本地就采纳，其余什么都不做，和解交给读路径。
@@ -1346,6 +1368,8 @@ class FanHost(
                 com.repl.bubbledrawer.shortcut.ShortcutRepository.loadShortcuts(host)
             },
             functionPinsOf = { readFunctionPins() },
+            // 已选功能的详情（名称/宿主/启动 Intent）：面板据此渲染，不依赖自己那份枚举结果。
+            pinnedFunctionItems = { readFunctionDetails() },
             onFunctionOrderChange = { writeFunctionPins(it) },
         )
         // Panel window root FIRST, then the Compose content inside it: the view-tree
@@ -1398,15 +1422,6 @@ class FanHost(
                 ShortcutRepository.launchShortcut(host, item, RemotePrefs.read(prefs).freeform)
                 hideMorePanel()
             },
-            onOpenManage = { targetTab ->
-                hideMorePanel(animated = false)
-                val intent = Intent().apply {
-                    setClassName(ModuleResources.MODULE_PACKAGE, "com.repl.bubbledrawer.pin.PinManageActivity")
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    putExtra(PinManageActivity.EXTRA_INITIAL_TAB, targetTab)
-                }
-                runCatching { host.startActivity(intent) }
-            },
         )
         panel.addView(
             composeView,
@@ -1435,7 +1450,12 @@ class FanHost(
             } else {
                 "closed-before-rebuild"
             }
-            panelLog("MORE_PANEL_TREE $page")
+            // 已选功能的两半分开记：keys = 用户选了几条，items = 面板真能画出来几条。两个数不一样
+            // 就说明详情没送到（或还没发布），页面会缺项 —— 这是「设置页选好了、面板里没有」的判据。
+            panelLog(
+                "MORE_PANEL_TREE $page functions=${content.functionPins.size}" +
+                    " resolved=${content.pinnedFunctions.size}",
+            )
         }
         content.reload()
         panel.animate().alpha(1f).setDuration(FADE).start()

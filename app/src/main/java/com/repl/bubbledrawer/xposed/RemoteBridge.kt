@@ -106,6 +106,8 @@ object RemoteBridge {
             }
             migrateLegacyPins(context, prefs)
             syncLocal(context) // always re-push local truth; keeps remote consistent after reboot
+            // 绑上之后立刻把「已选功能」的详情重算一次：上一次可能是在缓存还空的时候算的占位项。
+            runCatching { SettingsStore.publishFunctionDetails(context) }
             notifyConnection(true)
         } catch (exception: RuntimeException) {
             Log.w("BubbleDrawer", "BRIDGE_BIND_FAILED", exception)
@@ -137,6 +139,15 @@ object RemoteBridge {
         val localPrefs = local(context)
         val snap = RemotePrefs.read(localPrefs)
         val localPins = localPrefs.getString(com.repl.bubbledrawer.data.PrefsPinBackend.KEY, null)
+        // 「已选功能」与它的详情也必须一起推。
+        //
+        // 这里是本地文件把真相推给共享组的唯一时机（onBind），而写功能收藏会先落本地：LSPosed 还没绑上
+        // 的那一小段窗口里写下的收藏只存在于本地文件，漏掉这一步就**永远不会**进共享组 ——
+        // 面板（SystemUI）读的正是共享组，于是「设置页里明明选好了，扇形面板里没有」，而且不自愈。
+        // 收藏应用的 pins 一直有这一步（下面那段），功能收藏是后加的，所以先漏了它。
+        val localFunctions = localPrefs.getString(com.repl.bubbledrawer.shortcut.FunctionPinStore.KEY_PINNED_FUNCTIONS, null)
+        val localFunctionsRev = localPrefs.getLong(com.repl.bubbledrawer.shortcut.FunctionPinStore.PREFS_KEY_REV, 0L)
+        val localFunctionDetails = localPrefs.getString(com.repl.bubbledrawer.shortcut.FunctionPinDetails.KEY, null)
         val editor = target.edit()
             .putBoolean(RemotePrefs.KEY_ENABLED, snap.enabled)
             .putBoolean(RemotePrefs.KEY_LEFT, snap.left)
@@ -186,6 +197,13 @@ object RemoteBridge {
             .putInt(RemotePrefs.KEY_CONTACT_BAR_MIN_WIDTH_PCT, snap.contactBarMinWidthPct)
         if (localPins != null) {
             editor.putString(com.repl.bubbledrawer.data.PrefsPinBackend.KEY, localPins)
+        }
+        if (localFunctions != null) {
+            editor.putString(com.repl.bubbledrawer.shortcut.FunctionPinStore.KEY_PINNED_FUNCTIONS, localFunctions)
+            editor.putLong(com.repl.bubbledrawer.shortcut.FunctionPinStore.PREFS_KEY_REV, localFunctionsRev)
+        }
+        if (localFunctionDetails != null) {
+            editor.putString(com.repl.bubbledrawer.shortcut.FunctionPinDetails.KEY, localFunctionDetails)
         }
         editor.commit() // synchronous: LSPosed mirrors the group only after the write lands
         Log.i(

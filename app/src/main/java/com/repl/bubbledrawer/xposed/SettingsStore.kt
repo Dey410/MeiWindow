@@ -10,7 +10,9 @@ import com.repl.bubbledrawer.data.PinCodec
 import com.repl.bubbledrawer.data.PinnedRef
 import com.repl.bubbledrawer.data.PinsSync
 import com.repl.bubbledrawer.data.PrefsPinBackend
+import com.repl.bubbledrawer.shortcut.FunctionPinDetails
 import com.repl.bubbledrawer.shortcut.FunctionPinStore
+import com.repl.bubbledrawer.shortcut.ShortcutCacheStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.awaitClose
@@ -525,6 +527,8 @@ object SettingsStore {
                 RemoteBridge.start(context)
             }
             broadcastFunctions(context, value, rev)
+            // 面板要画的是「这一条是什么」，光有键不够 —— 详情跟着一起发（见 publishFunctionDetails）。
+            publishFunctionDetails(context)
         }
 
         override fun readRev(): Long = local.readRev()
@@ -561,6 +565,38 @@ object SettingsStore {
     }
 
     /**
+     * 把「已选功能」的**详情**发布到共享组，供 SystemUI 侧的面板直接渲染。
+     *
+     * 只发键是不够的：面板要显示一条功能，就得在自己的枚举结果里认出这个键，而两个进程的枚举结果
+     * 并不相同（面板有 LauncherApps 但读不到 App 的缓存，App 反过来）。少一条，用户就会看到
+     * 「设置页选好了，扇形面板里没有」，且毫无提示。详情里带上名称、宿主与启动 Intent，面板就不必
+     * 依赖自己的枚举了（图标缺失时 `ShortcutIcon` 会用宿主应用图标兜底）。
+     *
+     * 由 App 进程写（它的缓存最全），hook 进程只读 —— 与其它所有跨进程数据同一个方向。
+     */
+    fun publishFunctionDetails(context: Context) {
+        runCatching {
+            val pins = FunctionPinStore.decode(FunctionPinStore.backend(fallbackMirror(context)).read())
+            val catalogue = ShortcutCacheStore.load(context).orEmpty().associateBy { it.pinKey }
+            val details = pins.map { key ->
+                catalogue[key] ?: FunctionPinDetails.placeholder(key, appLabelOf(context, key.substringBefore('#')))
+            }
+            val encoded = FunctionPinDetails.encode(details)
+            fallbackMirror(context).edit().putString(FunctionPinDetails.KEY, encoded).apply()
+            RemoteBridge.remote?.edit()?.putString(FunctionPinDetails.KEY, encoded)?.apply()
+            android.util.Log.i(
+                TAG,
+                "FUNCTION_DETAILS_PUBLISHED pins=${pins.size} resolved=${details.size} len=${encoded.length}",
+            )
+        }
+    }
+
+    private fun appLabelOf(context: Context, packageName: String): String? = runCatching {
+        val info = context.packageManager.getApplicationInfo(packageName, 0)
+        context.packageManager.getApplicationLabel(info).toString()
+    }.getOrNull()
+
+    /**
      * 功能收藏由 SystemUI 面板推过来时落盘：保留发送方的戳、比本地旧就丢（不回推）—— 规则与
      * [applyPushedPins] 完全相同，理由见那里的注释。
      */
@@ -578,6 +614,8 @@ object SettingsStore {
         RemoteBridge.remote?.let { r ->
             runCatching { FunctionPinStore.backend(r).writeWithRev(value, rev) }
         }
+        // 面板推过来的这一笔也可能带着「面板并不认识」的键（它自己的枚举里没有），详情重新发布一次。
+        publishFunctionDetails(context)
     }
 
     /** Encode/decode passthroughs keep the call sites honest about the format. */
@@ -598,6 +636,8 @@ object SettingsStore {
         // [recoverStuckPressureCalibration]）——必须赶在第一次 push() 之前，这样页面拿到的
         // 第一帧就已经是收尾后的状态，不会先闪一下「校准中」。
         runCatching { recoverStuckPressureCalibration(app) }
+        // 顺手把「已选功能」的详情重发一次：上一次可能是拿空缓存算的占位项，而现在缓存已经更全了。
+        runCatching { publishFunctionDetails(app) }
         val local = RemoteBridge.local(app)
 
         fun push() { trySend(currentState(app)) }

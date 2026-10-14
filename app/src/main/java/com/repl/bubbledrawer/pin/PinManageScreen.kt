@@ -127,7 +127,6 @@ fun PinManageScreen(
     backdrop: top.yukonga.miuix.kmp.blur.LayerBackdrop? = null,
     scrollBehavior: top.yukonga.miuix.kmp.basic.ScrollBehavior? = null,
     onLaunchShortcut: ((ShortcutItem) -> Unit)? = null,
-    onOpenManage: ((Int) -> Unit)? = null,
 ) {
     val appsGridState = rememberLazyGridState()
     val fnsGridState = rememberLazyGridState()
@@ -567,7 +566,6 @@ fun PinManageScreen(
                     manageMode = model.manageMode,
                     onToggleManage = onToggleManage,
                     model = model,
-                    onOpenManage = onOpenManage,
                 )
             }
         }
@@ -832,7 +830,6 @@ private fun PanelBar(
     manageMode: Boolean,
     onToggleManage: () -> Unit,
     model: PinManageModel,
-    onOpenManage: ((Int) -> Unit)? = null,
 ) {
     if (model.isSearching) {
         MiuixSearchBar(
@@ -889,17 +886,8 @@ private fun PanelBar(
                     tint = if (manageMode) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurface,
                 )
             }
-            // 加号只出现在「功能」页，而且只有面板宿主给得出（管理页自己就是目的地，传 null）。
-            // 面板里的功能页能直接点选添加，加号只是把人送到整页的搜索/列表去。
-            if (onOpenManage != null && model.selectedTab == 1) {
-                IconButton(onClick = { onOpenManage(1) }) {
-                    Image(
-                        painter = painterResource(R.drawable.app_launcher_item_add_icon),
-                        contentDescription = stringResource(R.string.add),
-                        modifier = Modifier.size(22.dp),
-                    )
-                }
-            }
+            // 加号已经去掉（用户 2026-10-13：面板功能页右上角那个加号不要）。
+            // 面板里直接点「管理」就能点选功能，加号只是多一条会跳走的出口。
         }
     }
 }
