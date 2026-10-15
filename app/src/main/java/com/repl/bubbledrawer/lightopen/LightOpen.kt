@@ -69,6 +69,20 @@ object LightOpen {
     const val ACTION_VIEW = "android.intent.action.VIEW"
     const val ACTION_WEB_SEARCH = "android.intent.action.WEB_SEARCH"
 
+    /**
+     * Android TextClassifier 附带的标志位（API 28+）。
+     * 当用户选中文本后在系统浮动工具栏（ActionMode）里点击识别出来的条目（打开链接 / 电话 / 地图等）时，
+     * Android 系统会在生成的 Intent 里附带此 Extra。
+     */
+    const val EXTRA_FROM_TEXT_CLASSIFIER = "android.view.textclassifier.extra.FROM_TEXT_CLASSIFIER"
+
+    /**
+     * Google Gemini 在 Android 上的入口包名。
+     * 本质是桌面点击 Gemini 图标时，bard 作为轻量蹦床立刻发 Intent 拉起主 Google 应用。
+     */
+    const val BARD_PACKAGE = "com.google.android.apps.bard"
+    const val GOOGLE_SEARCH_PACKAGE = "com.google.android.googlequicksearchbox"
+
     // ---------------------------------------------------------------- 名单编解码
 
     /**
@@ -166,6 +180,7 @@ object LightOpen {
      * @param topFullscreenPackage ROM 传进来的"当前前台全屏应用包名"（排除小窗后的顶层 Activity 包名）
      * @param isHomeTop [topFullscreenPackage] 是否属于 HOME 包集合
      * @param hasSelectedText 本次 Intent 是否带着"选中的文本"extra（文本操作那条规则要用，见 [isTextAction]）
+     * @param fromTextClassifier 本次 Intent 是否来自系统 TextClassifier（选中文本后浮动工具栏条目）
      */
     fun jumpDecision(
         settings: LightOpenSettings,
@@ -174,6 +189,7 @@ object LightOpen {
         topFullscreenPackage: String?,
         isHomeTop: Boolean,
         hasSelectedText: Boolean = false,
+        fromTextClassifier: Boolean = false,
     ): LightOpenDecision {
         if (!settings.enabled) return LightOpenDecision.LEAVE
         if (topFullscreenPackage.isNullOrBlank()) return LightOpenDecision.LEAVE
@@ -184,6 +200,11 @@ object LightOpen {
         // 系统拦截框（安全中心的"是否允许"）永远不参与小窗：它出现时，"目标应用"其实是它，
         // 真正的目标在用户点"允许"之后的第二次启动里 —— 那一次才该由我们判定。
         if (target == SECURITY_CENTER) return LightOpenDecision.LEAVE
+        // Gemini 启动蹦床（com.google.android.apps.bard → com.google.android.googlequicksearchbox）：
+        // 本质是桌面点击 Gemini 时的入口蹦床，保持全屏。
+        if (topFullscreenPackage == BARD_PACKAGE && target == GOOGLE_SEARCH_PACKAGE) {
+            return LightOpenDecision.LEAVE
+        }
 
         // 黑名单是「否决票」：名单内的应用即使命中了分享/文本开关也保持全屏。
         val listed = target in settings.jumpTargets
@@ -198,7 +219,9 @@ object LightOpen {
             }
         }
         if (settings.shareToApp && isShareAction(action)) return LightOpenDecision.FORCE_FREEFORM
-        if (settings.textAction && isTextAction(action, hasSelectedText)) return LightOpenDecision.FORCE_FREEFORM
+        if (settings.textAction && isTextAction(action, hasSelectedText, fromTextClassifier)) {
+            return LightOpenDecision.FORCE_FREEFORM
+        }
         return LightOpenDecision.LEAVE
     }
 
@@ -209,15 +232,20 @@ object LightOpen {
     /**
      * 文本操作：编辑条/选中文本工具栏里的条目。
      *
-     * `PROCESS_TEXT` / `WEB_SEARCH` 是明确的"文本操作"动作，直接认。
+     *  - `fromTextClassifier`：来自系统 TextClassifier 生成的动作（打开链接 / 电话 / 地图等，
+     *    带 `android.view.textclassifier.extra.FROM_TEXT_CLASSIFIER` extra），直接认。
+     *  - `PROCESS_TEXT` / `WEB_SEARCH` 是明确的"文本操作"动作，直接认。
+     *  - `ACTION_VIEW` 并且携带选中文本 extra（`EXTRA_PROCESS_TEXT` / `EXTRA_TEXT` / `EXTRA_HTML_TEXT`）。
      *
-     * `ACTION_VIEW` **必须再带上"选中的文本"**（`EXTRA_PROCESS_TEXT` / `EXTRA_TEXT` / `EXTRA_HTML_TEXT`）
-     * 才算 —— 之前只看 http(s) scheme 就认，真机误伤：**从桌面打开 Gemini，Gemini 自己 `VIEW` 跳
-     * Google 应用**被这个开关判成"文本操作"，于是在"应用间跳转"关着的情况下也变成了小窗
-     * （2026-10-15 真机日志 `why=text action=android.intent.action.VIEW`）。
-     * 应用内点链接同样是 `VIEW http(s)`，靠 scheme 区分不了，只能要求"带着选中的文本"这个 extra。
+     * 之前只看 http(s) scheme 就认，真机误伤：从桌面打开 Gemini，Gemini 自己 VIEW 跳 Google 应用被
+     * 误判为文本操作。现在区分 TextClassifier 标记、选中文本 extra 与普通链接跳转。
      */
-    fun isTextAction(action: String?, hasSelectedText: Boolean): Boolean {
+    fun isTextAction(
+        action: String?,
+        hasSelectedText: Boolean,
+        fromTextClassifier: Boolean = false,
+    ): Boolean {
+        if (fromTextClassifier) return true
         if (action == ACTION_PROCESS_TEXT || action == ACTION_WEB_SEARCH) return true
         return action == ACTION_VIEW && hasSelectedText
     }

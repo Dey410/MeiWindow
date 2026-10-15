@@ -84,6 +84,8 @@ ROM 只排除：真实调用进程是 SystemUI、`aInfo == null`、`needFullScre
 | 前台包 ∈ HOME 包集合（运行时解析 `CATEGORY_HOME` + 显式带 `com.miui.home`，60s 缓存） | 桌面点图标、桌面文件夹、负一屏、桌面搜索、HyperOS 最近任务卡片 |
 | 前台包为空 | 锁屏 / 息屏 / 没有明确前台 |
 | 目标包 == 前台包 | 同应用内跳转（ROM 也会拦，双保险） |
+| 系统拦截框（`com.miui.securitycenter`） | 小米安全中心"是否允许"弹窗不参与小窗 |
+| Gemini 启动蹦床（`com.google.android.apps.bard` → `com.google.android.googlequicksearchbox`） | 桌面启动 Gemini 时的蹦床跳转保持全屏 |
 
 另外 `packageSupportFreeform()` 为假的目标（不可 resize、MIUI freeform 黑名单/云控名单）会让
 `MiuiMultiWindowUtils.getActivityOptions(...)` 返回 `null`，外层原样返回 → 自动保持全屏，
@@ -97,7 +99,7 @@ ROM 只排除：真实调用进程是 SystemUI、`aInfo == null`、`needFullScre
 | 横屏点通知以小窗打开 | `notificationDecision(settings, creatorPkg, isPortrait=false)` | SystemUI |
 | 控制中心长按以小窗打开 | `controlCenterDecision(settings, targetPkg)` | SystemUI |
 | 分享至应用（SEND / SEND_MULTIPLE） | `jumpDecision(...)` | system_server |
-| 文本操作（PROCESS_TEXT / WEB_SEARCH / VIEW http(s)） | `jumpDecision(...)` | system_server |
+| 文本操作（PROCESS_TEXT / WEB_SEARCH / TextClassifier / 带选中文本 extra 的 VIEW） | `jumpDecision(...)` | system_server |
 | 应用间跳转（白/黑名单，按**目标**应用匹配） | `jumpDecision(...)` | system_server |
 
 - **白名单**：名单内的目标应用 → 小窗；其余保持原生。

@@ -124,9 +124,13 @@ class LightOpenGate(
 
         val target = rawTargetPackage(info, intent)
         val top = topPackage?.takeIf { it.isNotEmpty() }
-        // 「文本操作」那条规则要靠"这次 Intent 有没有带选中的文本"来区分（见 LightOpen.isTextAction）。
+        // 「文本操作」判定：
+        // 1. 系统 TextClassifier 标记（选中文本后弹出的编辑条/浮动菜单条目，带 EXTRA_FROM_TEXT_CLASSIFIER）
+        // 2. Intent 显式携带选中文本 extra（EXTRA_PROCESS_TEXT / EXTRA_TEXT / EXTRA_HTML_TEXT）
+        val fromClassifier = intent != null && intent.hasExtra(LightOpen.EXTRA_FROM_TEXT_CLASSIFIER)
         val hasSelectedText = intent != null && (
-            intent.hasExtra(Intent.EXTRA_PROCESS_TEXT) ||
+            fromClassifier ||
+                intent.hasExtra(Intent.EXTRA_PROCESS_TEXT) ||
                 intent.hasExtra(Intent.EXTRA_TEXT) ||
                 intent.hasExtra(Intent.EXTRA_HTML_TEXT)
             )
@@ -137,15 +141,21 @@ class LightOpenGate(
             topFullscreenPackage = top,
             isHomeTop = top != null && isHomePackage(top),
             hasSelectedText = hasSelectedText,
+            fromTextClassifier = fromClassifier,
         )
         // 探针：文本开关开着时，把"像文本操作"的每一次都记下来（不管最后判成什么），
         // 这样"误伤"和"该生效却没生效"都能从日志里直接对上。
         if (settings.textAction && isTextProbe(intent)) {
+            val extrasKeys = intent?.extras?.keySet()?.joinToString("|") ?: "-"
+            val clip = intent?.clipData?.let { "yes(${it.itemCount})" } ?: "no"
             module.log(
                 Log.INFO,
                 TAG,
                 "LIGHT_OPEN_TEXT_PROBE action=${intent?.action} scheme=${runCatching { intent?.data?.scheme }.getOrNull()} " +
-                    "target=$target top=$top hasSelectedText=$hasSelectedText decision=$decision",
+                    "type=${intent?.type} comp=${runCatching { intent?.component?.flattenToShortString() }.getOrNull() ?: "-"} " +
+                    "flags=0x${(intent?.flags ?: 0).toString(16)} extras=[$extrasKeys] clip=$clip " +
+                    "cats=${intent?.categories?.joinToString("|") ?: "-"} target=$target top=$top " +
+                    "hasSelectedText=$hasSelectedText fromClassifier=$fromClassifier decision=$decision",
             )
         }
         return when (decision) {
@@ -155,7 +165,7 @@ class LightOpenGate(
                     Log.INFO,
                     TAG,
                     "LIGHT_OPEN_FREEFORM target=$target top=$top action=${intent?.action} " +
-                        "why=${why(settings, target, intent)}",
+                        "why=${why(settings, target, intent, hasSelectedText, fromClassifier)}",
                 )
                 true
             }
@@ -166,20 +176,26 @@ class LightOpenGate(
         }
     }
 
-    private fun why(settings: LightOpenSettings, target: String?, intent: Intent?): String = when {
+    private fun why(
+        settings: LightOpenSettings,
+        target: String?,
+        intent: Intent?,
+        hasSelectedText: Boolean,
+        fromClassifier: Boolean,
+    ): String = when {
         settings.appJump && target != null && target in settings.jumpTargets -> "list"
         settings.shareToApp && LightOpen.isShareAction(intent?.action) -> "share"
-        settings.textAction && isTextProbe(intent) -> "text"
+        settings.textAction && LightOpen.isTextAction(intent?.action, hasSelectedText, fromClassifier) -> "text"
         settings.globalFreeform -> "global"
         else -> "?"
     }
 
-    /** 文本操作探针：`PROCESS_TEXT`/`WEB_SEARCH`，或者带"选中文本"extra 的 `VIEW`。 */
+    /** 文本操作探针：`PROCESS_TEXT`/`WEB_SEARCH`，`VIEW`，或者带 TextClassifier extra 的 Intent。 */
     private fun isTextProbe(intent: Intent?): Boolean {
         if (intent == null) return false
         val action = intent.action
         return action == Intent.ACTION_PROCESS_TEXT || action == Intent.ACTION_WEB_SEARCH ||
-            action == Intent.ACTION_VIEW
+            action == Intent.ACTION_VIEW || intent.hasExtra(LightOpen.EXTRA_FROM_TEXT_CLASSIFIER)
     }
 
     /**
