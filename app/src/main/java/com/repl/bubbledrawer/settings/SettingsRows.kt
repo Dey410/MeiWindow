@@ -78,6 +78,11 @@ fun ModuleStatusRow(state: SettingsUiState) {
  * [summary] is the miuix description slot — the setting's one-line explanation belongs HERE,
  * not in a separate hint row below (docs/ui-guidelines.md: 每个设置项自带主标题 + 描述).
  * [enabled] = false greys the row out; used for "总开关没开时子项不可用".
+ *
+ * [leading] is miuix's `startAction` slot — the leading icon position. Used by the app
+ * pickers to put the app's icon in front of its name (hence in front of the package name
+ * on the second line too). Keep the icon small enough that it does not make the row taller
+ * than the two-line text block already does.
  */
 @Composable
 fun SwitchRow(
@@ -86,6 +91,7 @@ fun SwitchRow(
     onCheckedChange: (Boolean) -> Unit,
     summary: String? = null,
     enabled: Boolean = true,
+    leading: (@Composable () -> Unit)? = null,
 ) {
     SwitchPreference(
         title = title,
@@ -93,6 +99,7 @@ fun SwitchRow(
         checked = checked,
         onCheckedChange = onCheckedChange,
         enabled = enabled,
+        startAction = leading,
     )
 }
 

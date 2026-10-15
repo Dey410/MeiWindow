@@ -205,6 +205,7 @@
     <string name="light_open_jump_pick_empty">还没有选择应用</string>
     <string name="light_open_apps_title">选择应用</string>
     <string name="light_open_apps_selected">已选 %1$d 个</string>
+    <string name="light_open_apps_found">找到 %1$d 个</string>
     <string name="light_open_apps_loading">正在读取应用列表…</string>
     <string name="light_open_hint">说明：这些开关只在「你正在用的应用跳到另一个应用」时生效 —— 桌面 / 负一屏 / 最近任务里打开应用、锁屏上的启动、同一个应用内部的跳转都不受影响；不支持小窗的应用会自动保持全屏。通知与控制中心改动即时生效（必要时重启一次系统界面），应用间跳转等三项要重启手机（system_server 没有热重载）。</string>
 </resources>

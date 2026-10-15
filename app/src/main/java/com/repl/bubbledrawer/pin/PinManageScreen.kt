@@ -2,12 +2,7 @@ package com.repl.bubbledrawer.pin
 
 import android.content.res.Configuration
 import android.graphics.drawable.Drawable
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.expandHorizontally
-import androidx.compose.animation.shrinkHorizontally
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -80,11 +75,13 @@ import androidx.compose.ui.zIndex
 import top.yukonga.miuix.kmp.blur.LayerBackdrop
 import top.yukonga.miuix.kmp.blur.textureBlur
 import com.repl.bubbledrawer.R
-import com.repl.bubbledrawer.data.AppIconCache
 import com.repl.bubbledrawer.pinyin.BubbleApp
 import com.repl.bubbledrawer.shortcut.ShortcutBridge
 import com.repl.bubbledrawer.shortcut.ShortcutItem
 import com.repl.bubbledrawer.shortcut.ShortcutRepository
+import com.repl.bubbledrawer.ui.component.AppIcon
+import com.repl.bubbledrawer.ui.component.MiuixSearchBar
+import com.repl.bubbledrawer.ui.component.SearchCloseButton
 import com.repl.bubbledrawer.ui.theme.StatusColors
 import com.repl.bubbledrawer.ui.util.BlurredBar
 import com.repl.bubbledrawer.ui.util.PageBottomSpacer
@@ -99,7 +96,6 @@ import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.InputField
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.icon.MiuixIcons
-import top.yukonga.miuix.kmp.icon.extended.Close
 import top.yukonga.miuix.kmp.icon.extended.ListView
 import top.yukonga.miuix.kmp.icon.extended.Search
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -789,38 +785,6 @@ private fun cellKey(cell: Cell): String = when (cell) {
 }
 
 /**
- * Miuix SearchBar container
- */
-@Composable
-fun MiuixSearchBar(
-    inputField: @Composable () -> Unit,
-    modifier: Modifier = Modifier,
-    insideMargin: DpSize = DpSize(12.dp, 0.dp),
-    expanded: Boolean = true,
-    outsideEndAction: @Composable (() -> Unit)? = null,
-) {
-    Row(
-        modifier = modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .padding(vertical = insideMargin.height, horizontal = insideMargin.width),
-        ) {
-            inputField()
-        }
-        AnimatedVisibility(
-            visible = expanded,
-            enter = expandHorizontally() + slideInHorizontally(initialOffsetX = { it }),
-            exit = shrinkHorizontally() + slideOutHorizontally(targetOffsetX = { it }),
-        ) {
-            outsideEndAction?.invoke()
-        }
-    }
-}
-
-/**
  * The overlay panel's 56dp look-alike bar: title left, search + listview icon buttons right.
  */
 @Composable
@@ -889,36 +853,6 @@ private fun PanelBar(
             // 加号已经去掉（用户 2026-10-13：面板功能页右上角那个加号不要）。
             // 面板里直接点「管理」就能点选功能，加号只是多一条会跳走的出口。
         }
-    }
-}
-
-/**
- * 圆形灰底 Close 图标用于取消搜索。
- */
-@Composable
-fun SearchCloseButton(
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Box(
-        modifier = modifier
-            .padding(end = 12.dp)
-            .size(32.dp)
-            .clip(CircleShape)
-            .background(MiuixTheme.colorScheme.surfaceContainerHighest)
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-                onClick = onClick,
-            ),
-        contentAlignment = Alignment.Center,
-    ) {
-        Icon(
-            imageVector = MiuixIcons.Close,
-            contentDescription = stringResource(R.string.search_cancel),
-            tint = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-            modifier = Modifier.size(16.dp),
-        )
     }
 }
 
@@ -1110,43 +1044,6 @@ private fun AppTile(
             color = MiuixTheme.colorScheme.onSurface,
             fontSize = titleSp.sp,
             maxLines = 1,
-        )
-    }
-}
-
-@Composable
-private fun AppIcon(app: BubbleApp, size: Dp, cloneBadge: Boolean) {
-    val context = LocalContext.current
-    val density = LocalDensity.current
-    val px = with(density) { size.roundToPx() }
-
-    var imageBitmap by remember(app.packageName, app.userId, px, cloneBadge) {
-        mutableStateOf(AppIconCache.get(app.packageName, app.userId, px, cloneBadge))
-    }
-
-    if (imageBitmap == null) {
-        LaunchedEffect(app.packageName, app.userId, px, cloneBadge) {
-            val loaded = AppIconCache.loadOrGet(context, app, px, cloneBadge)
-            if (loaded != null) {
-                imageBitmap = loaded
-            }
-        }
-    }
-
-    val currentBmp = imageBitmap
-    if (currentBmp != null) {
-        Image(
-            bitmap = currentBmp,
-            contentDescription = app.label,
-            modifier = Modifier
-                .size(size)
-                .clip(CircleShape),
-        )
-    } else {
-        Box(
-            modifier = Modifier
-                .size(size)
-                .clip(CircleShape),
         )
     }
 }

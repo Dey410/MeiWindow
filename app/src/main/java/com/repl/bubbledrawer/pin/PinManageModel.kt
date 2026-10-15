@@ -223,19 +223,7 @@ class PinManageModel(
             if (!isSearching || searchQuery.isBlank()) {
                 return cells
             }
-            val q = searchQuery.trim()
-            val matched = apps.mapNotNull { app ->
-                val rank = searchRank(app, q)
-                if (rank > 0) app to rank else null
-            }.sortedWith { (a, rankA), (b, rankB) ->
-                if (rankA != rankB) rankA.compareTo(rankB)
-                else {
-                    val lenCmp = a.label.length.compareTo(b.label.length)
-                    if (lenCmp != 0) lenCmp
-                    else if (b.usageCount != a.usageCount) b.usageCount.compareTo(a.usageCount)
-                    else a.sortKey.compareTo(b.sortKey)
-                }
-            }.map { it.first }
+            val matched = com.repl.bubbledrawer.pinyin.AppSearch.filter(apps, searchQuery)
 
             if (matched.isEmpty()) {
                 return listOf(Cell.Label("无搜索结果"))
@@ -244,23 +232,11 @@ class PinManageModel(
         }
 
     /**
-     * 搜索排序优先级：
-     * 1: 首字匹配 (app.label.startsWith)
-     * 2: 拼音首字匹配 (app.sortKey.startsWith 或 app.initials.startsWith)
-     * 3: 字符包含 (app.label / sortKey / initials 包含)
-     * 4: 包名包含 (app.packageName 包含)
-     * 0: 不匹配
+     * 搜索排序优先级：见 [com.repl.bubbledrawer.pinyin.AppSearch] —— 匹配与排序都搬到那里了，
+     * 「选择应用」页要和面板给出同样的结果，两边共用一份实现（这里只留转发，别再加分支）。
      */
-    fun searchRank(app: BubbleApp, query: String): Int {
-        if (app.label.startsWith(query, ignoreCase = true)) return 1
-        if (app.sortKey.startsWith(query, ignoreCase = true) ||
-            app.initials.startsWith(query, ignoreCase = true)) return 2
-        if (app.label.contains(query, ignoreCase = true) ||
-            app.sortKey.contains(query, ignoreCase = true) ||
-            app.initials.contains(query, ignoreCase = true)) return 3
-        if (app.packageName.contains(query, ignoreCase = true)) return 4
-        return 0
-    }
+    fun searchRank(app: BubbleApp, query: String): Int =
+        com.repl.bubbledrawer.pinyin.AppSearch.rank(app, query)
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 

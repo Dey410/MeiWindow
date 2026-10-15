@@ -13,6 +13,8 @@ import com.repl.bubbledrawer.data.AppRepository
 import com.repl.bubbledrawer.data.LaunchCountStore
 import com.repl.bubbledrawer.data.PinStore
 import com.repl.bubbledrawer.launch.ConfigurableLaunchStrategy
+import com.repl.bubbledrawer.ui.component.MiuixSearchBar
+import com.repl.bubbledrawer.ui.component.SearchCloseButton
 import com.repl.bubbledrawer.ui.theme.BubbleDrawerTheme
 import com.repl.bubbledrawer.ui.util.BlurredBar
 import com.repl.bubbledrawer.ui.util.barColor
