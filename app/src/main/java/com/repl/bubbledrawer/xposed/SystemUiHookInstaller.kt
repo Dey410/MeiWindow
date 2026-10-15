@@ -23,7 +23,12 @@ class SystemUiHookInstaller(
     private var flymeController: com.repl.bubbledrawer.launch.FlymeFreeformController? = null
     private var contactBar: com.repl.bubbledrawer.contactbar.ContactBarController? = null
 
-    /** captured when the Application first runs — needed to rebuild after a hot reload */
+    /**
+     * captured when the Application first runs — needed to rebuild after a hot reload.
+     * `@Volatile`：写在 `SystemUIApplicationImpl.attachBaseContext` 的钩子里（Binder/主线程各有可能），
+     * 读发生在轻量打开的钩子线程上，不能靠"碰巧可见"。
+     */
+    @Volatile
     private var appContext: Context? = null
 
     fun install(classLoader: ClassLoader) {

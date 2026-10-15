@@ -1,14 +1,12 @@
 package com.repl.bubbledrawer.xposed
 
 import android.app.ActivityOptions
-import android.app.KeyguardManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.os.Bundle
-import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import com.repl.bubbledrawer.lightopen.LightOpen
@@ -199,7 +197,9 @@ class LightOpenSystemUi(
                     return@intercept chain.proceed()
                 }
                 module.log(Log.INFO, TAG, "LIGHT_OPEN_ISLAND_ANIM_APPLIED pkg=$packageName")
-                writeField(animController, "mPendingIntent", pendingIntent)
+                // 原方法在 send 之前刚把同一个值写进 mPendingIntent（见
+                // DynamicIslandWindowAnimController.openAppUseDefaultAnim 第 1935 行），
+                // 这里再写一次是自赋值 —— 删掉（它失败时还会多一条 FIELD_WRITE_FAILED 噪音）。
                 runCatching {
                     pendingIntent.send(context, 0, null, null, null, null, bundle)
                 }.onFailure { err ->
@@ -348,7 +348,15 @@ class LightOpenSystemUi(
         module.log(Log.INFO, TAG, "LIGHT_OPEN_CONTEXT_LAUNCH_HOOK_INSTALLED")
     }
 
-    /** 按来源选规则：灵动岛/通知用"通知"规则，磁贴/控制中心用"控制中心"规则，其它不干预。 */
+    /**
+     * 按来源选规则：灵动岛/通知用"通知"规则，磁贴/控制中心用"控制中心"规则，**其它一律不干预**。
+     *
+     * 最后一条曾经写的是"未知来源也按通知规则处理" —— 那会把 SystemUI 里**任何**启动真实应用的
+     * 路径都卷进来（媒体卡片的"打开应用"、状态栏里的跳转、锁屏上的按钮……），而这些都不是用户
+     * 勾选"点通知以小窗打开"时想表达的意思。核对过：通知/灵动岛两条路线的调用栈里本来就带
+     * `DynamicIsland` / `.notification.` / `FocusNotification` 标记，会被判成 NOTIFICATION，
+     * 所以放宽那一条并不需要（审查 2026-10-15）。
+     */
     private fun decideLaunch(
         settings: com.repl.bubbledrawer.lightopen.LightOpenSettings,
         kind: LaunchKind,
@@ -359,7 +367,7 @@ class LightOpenSystemUi(
         kind == LaunchKind.NOTIFICATION ->
             LightOpen.notificationDecision(settings, target, isPortrait(context))
         kind == LaunchKind.CONTROL_CENTER -> LightOpen.controlCenterDecision(settings, target)
-        else -> LightOpen.notificationDecision(settings, target, isPortrait(context))
+        else -> LightOpenDecision.LEAVE
     }
 
     // ------------------------------------------------------------------ 通知的统一入口（最重要的一个）
@@ -968,8 +976,14 @@ class LightOpenSystemUi(
     private companion object {
         const val TAG = "LightOpenSystemUi"
 
-        /** 上膛后等这个漏斗被调的宽限时间（毫秒）。超时就作废，避免影响无关启动。 */
-        const val ARM_TTL_MS = 5000L
+        /**
+         * 上膛后等这个漏斗被调的宽限时间（毫秒）。
+         *
+         * 漏斗消费时**不校验目标包**（`createActivityOptions` 拿不到目标），所以这个窗口越长，
+         * 把"无关启动"顺手做成小窗的概率越大：原来是 1.5s，审查时被放宽到 5s 是为了兜住
+         * 重启/锁屏过渡，但代价不值得 —— 回到 2s（真机上从"上膛"到"造 options"只隔几毫秒）。
+         */
+        const val ARM_TTL_MS = 2000L
 
         /** 通知栏列表里点通知。 */
         const val NOTIFICATION_INJECTED_CLASS =
@@ -989,8 +1003,11 @@ class LightOpenSystemUi(
 
         /**
          * 系统界面自身的包名：它们既不是"发通知的应用"，也不是"要被小窗的目标"。
-         * 真机日志里点通知时出现的就是这两个（MIUI 用自己的 PendingIntent 转手）。
+         *  - `android` / `com.android.systemui`：真机日志里点通知时出现的就是这两个（MIUI 用自己的
+         *    PendingIntent 转手）；
+         *  - `com.miui.home`：桌面。system_server 那侧对 HOME 有专门的护栏（HOME 包集合），
+         *    SystemUI 这侧没有，所以这里显式排掉 —— 万一来一条"回到桌面"性质的启动，别把它变小窗。
          */
-        val SYSTEM_PACKAGES = setOf("android", "com.android.systemui")
+        val SYSTEM_PACKAGES = setOf("android", "com.android.systemui", "com.miui.home")
     }
 }

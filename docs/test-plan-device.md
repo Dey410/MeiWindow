@@ -715,37 +715,64 @@ adb logcat -s BubbleDrawer | findstr PRESSURE_CALIBRATION
 
 ## A26 轻量打开（六开关）
 
-前置：`scope.list` 已含 `system`；**安装新包后重启一次手机**（system_server 没有热重载，
-见 docs/light-open.md §4）。设置页 →「轻量打开」→ 打开总开关。
+前置：`scope.list` 已含 `system`；**第一次加作用域要重启一次手机**（作用域由 LSPosed 在开机时应用）。
+之后**改代码只 `adb install -r` 即可**：SystemUI 与 system_server 都会热重载、钩子自动重建
+（见 docs/light-open.md §4）。设置页 →「轻量打开」→ 打开总开关。
 
-日志（`adb logcat -s BubbleDrawer:V LightOpenGate:V LightOpenSystemUi:V MiuiMultiWindowUtils:D MiuiFreeformServiceImpl:D`）：
+日志（`adb logcat -s LSPosedFramework:V MiuiMultiWindowUtils:D MiuiFreeformServiceImpl:D`；
+模块行都带 `LSPosedFramework` 前缀）：
 
-- [ ] 重启后能看到 `MODULE_LOADED_SYSTEM_SERVER` 与 `LIGHT_OPEN_GATE_INSTALLED …`
-      —— 没有这两行说明 system_server 作用域没生效（LSPosed 里确认作用域/重启）
-- [ ] SystemUI 侧能看到 `LIGHT_OPEN_NOTIFICATION_HOOK_INSTALLED` 与 `LIGHT_OPEN_CONTROL_CENTER_HOOK_INSTALLED`
-      （打 `*_TARGET_UNAVAILABLE` = ROM 改了类名/字段名，钩子没装上）
+- [ ] 装载行齐全：`LIGHT_OPEN_GATE_INSTALLED enabled=… jump=… share=… text=…`、
+      `LIGHT_OPEN_NOTIFICATION_HOOK_INSTALLED path=injected` / `path=island`、
+      `LIGHT_OPEN_NOTIFICATION_ARM_HOOK_INSTALLED params=7`、`LIGHT_OPEN_CONTROL_CENTER_HOOK_INSTALLED`、
+      `LIGHT_OPEN_TILE_VIEW_HOOK_INSTALLED`、`LIGHT_OPEN_ARM_PENDING_INTENT_INSTALLED count=2 intent=3`、
+      `LIGHT_OPEN_OPTIONS_HOOK_INSTALLED`、`LIGHT_OPEN_SEND_HOOK_INSTALLED overloads=…`、
+      `LIGHT_OPEN_CONTEXT_LAUNCH_HOOK_INSTALLED`、`LIGHT_OPEN_ISLAND_ANIM_HOOK_INSTALLED`
+      （打 `*_TARGET_UNAVAILABLE` / `*_CLASS_MISSING` = ROM 改了类名/字段名，钩子没装上）
+- [ ] 「不用重启」验证：`adb install -r` 后应看到 `HOT_RELOADED process=system` 紧跟
+      `LIGHT_OPEN_GATE_INSTALLED …`，此时直接触发跳转就能生效
 
-### 通知 / 控制中心（SystemUI 侧）
-- [ ] 开「竖屏点通知以小窗打开」：竖屏时点一个通知 → 对应应用在小窗里打开；
-      日志 `LIGHT_OPEN_NOTIFICATION pkg=… portrait=true`
-- [ ] 关掉竖屏、开「横屏点通知以小窗打开」：横屏（视频/游戏里）点通知 → 小窗；
-      竖屏点通知 → 仍然全屏
-- [ ] 开「长按磁贴以小窗打开」：控制中心长按 WiFi/蓝牙磁贴 → 设置页在小窗里打开；
-      日志 `LIGHT_OPEN_CONTROL_CENTER pkg=…`；**锁屏时**长按 → 仍然走 MIUI 的解锁流程（不全屏抢跑）
-- [ ] 关掉总开关 → 两者都回到原生行为（日志里不再出现 `LIGHT_OPEN_*`）
+### 通知（SystemUI 侧）
+- [ ] 开「竖屏点通知」：竖屏**通知栏列表**点一条通知 → 应用小窗打开；
+      日志 `LIGHT_OPEN_NOTIFICATION_ARM_ENTER pkg=<发通知的应用> … decision=FORCE_FREEFORM`
+      与 `LIGHT_OPEN_OPTIONS_APPLIED source=notifPublic`
+- [ ] **悬浮通知/灵动岛**：等一条横幅/灵动岛通知出现，点它 → 同样小窗；
+      日志 `LIGHT_OPEN_ISLAND_ANIM_APPLIED` 或 `LIGHT_OPEN_SEND_APPLIED n=1`
+      （栈里应能看到 `DynamicIslandWindowAnimController.openAppUseDefaultAnim`）
+- [ ] 关掉竖屏、开「横屏点通知」：横屏点通知 → 小窗；竖屏点 → 仍全屏
+- [ ] 通知归属正确：点第三方应用的通知时，日志里 `pkg=` 是**发通知的那个应用**，
+      而不是 `android` / `com.android.systemui`（MIUI 会用自己的 PendingIntent 转手）
+- [ ] **误伤检查**：在应用内点一个链接（如 Gemini 里点链接）→ 保持全屏，日志没有 `LIGHT_OPEN_FREEFORM`
+
+### 控制中心（SystemUI 侧）
+- [ ] 开「长按磁贴」：控制中心长按 WiFi / 蓝牙（原生磁贴）→ 设置页小窗打开；
+      日志 `LIGHT_OPEN_CONTROL_CENTER_ENTER tile=… target=…` + `LIGHT_OPEN_OPTIONS_APPLIED source=post.intent/…`
+- [ ] 长按**插件磁贴**（小米自己的磁贴，如小米互传/扫一扫）→ 同样小窗；
+      日志 `LIGHT_OPEN_TILE_VIEW_ENTER tile=… target=…`
+- [ ] 目标不在 MIUI freeform 名单里时（如「设置」）应看到 `LIGHT_OPEN_FALLBACK_OPTIONS pkg=com.android.settings`
+      且仍然小窗（兜底路径生效）
+- [ ] 锁屏上长按磁贴 → 走 MIUI 自己的解锁流程（不抢跑、没有异常小窗）
+- [ ] 关掉总开关 → 通知/磁贴都回原生行为（日志里不再出现 `LIGHT_OPEN_*`）
 
 ### 分享 / 文本操作 / 应用间跳转（system_server 侧）
-- [ ] 开「分享至应用」：任意应用点分享 → 选一个目标 → 目标以小窗打开；
-      日志 `LIGHT_OPEN_FREEFORM target=… top=… why=share`
-- [ ] 开「文本操作」：选中一段链接 → 编辑条里的浏览器图标 → 浏览器小窗打开（`why=text`）
-- [ ] 白名单模式 + 名单里放微信：从别的应用跳到微信 → 小窗（`why=list`）；
-      跳到不在名单里的应用 → 全屏（日志无 FREEORM 行）
-- [ ] 黑名单模式 + 名单里放微信：跳到任意其它应用 → 小窗；跳到微信 → 强制全屏
+- [ ] 开「分享至应用」：任意应用分享 → 选目标 → 小窗；日志 `why=share`
+- [ ] 开「文本操作」：选中一段文字/链接 → 系统编辑条里点识别出的条目（打开链接/地图/电话等）
+      → 小窗；日志 `LIGHT_OPEN_TEXT_PROBE … fromClassifier=true` + `why=text`
+      （若这里不生效，先看探针行：`fromClassifier=false` 且 `extras=[]` 说明该路径不带
+      TextClassifier 标记，需要再找判据）
+- [ ] **文本操作不误伤**：应用内普通点链接（`ACTION_VIEW`、无 TextClassifier 标记）→ 全屏
+- [ ] **Gemini 蹦床**：桌面点 Gemini 图标 → Gemini 拉起 Google 应用 → 全程全屏
+      （即使黑名单模式/全局小窗也不该动它）
+- [ ] 白名单模式 + 名单放微信：从别的应用跳微信 → 小窗（`why=list`）；跳其它应用 → 全屏
+      （日志无 `FREEFORM` 行）
+- [ ] 黑名单模式 + 名单放微信：跳任意其它应用 → 小窗；跳微信 → 强制全屏
       （`LIGHT_OPEN_FULLSCREEN target=com.tencent.mm`）
 - [ ] **桌面护栏**：回到桌面，点任意图标 → 正常全屏打开，日志**没有** `LIGHT_OPEN_FREEFORM`
       （前台包是 `com.miui.home` 时必须放行）；最近任务卡片、负一屏同理
 - [ ] **同应用护栏**：在一个应用内部翻页/开子页面 → 不受影响
 - [ ] **空前台护栏**：锁屏状态下由后台拉起应用 → 不干预
+- [ ] **安全中心拦截框**：出现"某应用想打开某应用，是否允许"时 → 弹窗本身保持全屏，
+      点「允许」之后那一次启动才按名单判定
 - [ ] **不可小窗的应用**：把某个 `resizeableActivity=false` 的应用放进白名单 → 仍全屏，
       日志有 `MiuiMultiWindowUtils: pkg name: X unsupported freeform mode`（这是预期，不是 bug）
-- [ ] SystemUI 自己发起的启动不受影响：通知（未开开关时）、状态栏、模块自己的扇面启动应用
+- [ ] 开关即时生效：不重启、不重装，在设置页改开关/名单 → 下一次跳转立刻按新配置判定

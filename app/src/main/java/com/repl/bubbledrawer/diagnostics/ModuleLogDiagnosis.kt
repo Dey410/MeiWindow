@@ -792,7 +792,7 @@ object ModuleLogDiagnosis {
         }
 
         // 轻量打开（六开关）：六项分两个进程生效 —— 通知/控制中心在 SystemUI，分享/文本操作/
-        // 应用间跳转在 system_server（要重启，且作用域必须含 system）。"没生效"因此至少有三种
+        // 应用间跳转在 system_server（热重载会重建，见 docs/light-open.md §4）。"没生效"因此至少有三种
         // 完全不同的原因，这一条把它们分开：钩子没装上、装上了但一次都没命中（护栏放行）、
         // 或者已经按名单改写窗口模式。
         val gateInstalled = lines.lastOrNull { it.contains("LIGHT_OPEN_GATE_INSTALLED") }
@@ -801,11 +801,18 @@ object ModuleLogDiagnosis {
         val targetUnavailable = lines.lastOrNull {
             it.contains("LIGHT_OPEN_GATE_TARGET_UNAVAILABLE") ||
                 it.contains("LIGHT_OPEN_NOTIFICATION_TARGET_UNAVAILABLE") ||
-                it.contains("LIGHT_OPEN_CONTROL_CENTER_TARGET_UNAVAILABLE")
+                it.contains("LIGHT_OPEN_CONTROL_CENTER_TARGET_UNAVAILABLE") ||
+                it.contains("LIGHT_OPEN_SEND_TARGET_UNAVAILABLE") ||
+                it.contains("LIGHT_OPEN_ISLAND_ANIM_UNAVAILABLE") ||
+                it.contains("LIGHT_OPEN_*_CLASS_MISSING") ||
+                it.contains("LIGHT_OPEN_SYSTEMUI_CLASS_MISSING") ||
+                it.contains("LIGHT_OPEN_GATE_CLASS_MISSING")
         }
         val lastIntervention = lines.lastOrNull {
             it.contains("LIGHT_OPEN_FREEFORM") || it.contains("LIGHT_OPEN_FULLSCREEN") ||
-                it.contains("LIGHT_OPEN_NOTIFICATION ") || it.contains("LIGHT_OPEN_CONTROL_CENTER ")
+                it.contains("LIGHT_OPEN_NOTIFICATION ") || it.contains("LIGHT_OPEN_CONTROL_CENTER ") ||
+                it.contains("LIGHT_OPEN_SEND_APPLIED") || it.contains("LIGHT_OPEN_ISLAND_ANIM_APPLIED") ||
+                it.contains("LIGHT_OPEN_CONTEXT_LAUNCH_APPLIED") || it.contains("LIGHT_OPEN_OPTIONS_APPLIED")
         }
         val anyLightOpen = gateInstalled != null || notificationInstalled != null ||
             controlCenterInstalled != null || targetUnavailable != null
