@@ -124,14 +124,30 @@ class LightOpenGate(
 
         val target = rawTargetPackage(info, intent)
         val top = topPackage?.takeIf { it.isNotEmpty() }
+        // 「文本操作」那条规则要靠"这次 Intent 有没有带选中的文本"来区分（见 LightOpen.isTextAction）。
+        val hasSelectedText = intent != null && (
+            intent.hasExtra(Intent.EXTRA_PROCESS_TEXT) ||
+                intent.hasExtra(Intent.EXTRA_TEXT) ||
+                intent.hasExtra(Intent.EXTRA_HTML_TEXT)
+            )
         val decision = LightOpen.jumpDecision(
             settings = settings,
             action = intent?.action,
-            dataScheme = runCatching { intent?.data?.scheme }.getOrNull(),
             targetPackage = target,
             topFullscreenPackage = top,
             isHomeTop = top != null && isHomePackage(top),
+            hasSelectedText = hasSelectedText,
         )
+        // 探针：文本开关开着时，把"像文本操作"的每一次都记下来（不管最后判成什么），
+        // 这样"误伤"和"该生效却没生效"都能从日志里直接对上。
+        if (settings.textAction && isTextProbe(intent)) {
+            module.log(
+                Log.INFO,
+                TAG,
+                "LIGHT_OPEN_TEXT_PROBE action=${intent?.action} scheme=${runCatching { intent?.data?.scheme }.getOrNull()} " +
+                    "target=$target top=$top hasSelectedText=$hasSelectedText decision=$decision",
+            )
+        }
         return when (decision) {
             LightOpenDecision.LEAVE -> null
             LightOpenDecision.FORCE_FREEFORM -> {
@@ -153,9 +169,17 @@ class LightOpenGate(
     private fun why(settings: LightOpenSettings, target: String?, intent: Intent?): String = when {
         settings.appJump && target != null && target in settings.jumpTargets -> "list"
         settings.shareToApp && LightOpen.isShareAction(intent?.action) -> "share"
-        settings.textAction && LightOpen.isTextAction(intent?.action, runCatching { intent?.data?.scheme }.getOrNull()) -> "text"
+        settings.textAction && isTextProbe(intent) -> "text"
         settings.globalFreeform -> "global"
         else -> "?"
+    }
+
+    /** 文本操作探针：`PROCESS_TEXT`/`WEB_SEARCH`，或者带"选中文本"extra 的 `VIEW`。 */
+    private fun isTextProbe(intent: Intent?): Boolean {
+        if (intent == null) return false
+        val action = intent.action
+        return action == Intent.ACTION_PROCESS_TEXT || action == Intent.ACTION_WEB_SEARCH ||
+            action == Intent.ACTION_VIEW
     }
 
     /**

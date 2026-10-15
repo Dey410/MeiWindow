@@ -162,18 +162,18 @@ object LightOpen {
      *  3. 目标包 == 前台包（同应用内跳转）→ 不干预。ROM 自己也会拦，这里是双保险。
      *
      * @param action 目标 Intent 的 action
-     * @param dataScheme 目标 Intent 的 data scheme（http/https 用于"打开链接/文本操作"）
      * @param targetPackage 目标 Activity 的包名（ROM 内部叫 rawPackageName）
      * @param topFullscreenPackage ROM 传进来的"当前前台全屏应用包名"（排除小窗后的顶层 Activity 包名）
      * @param isHomeTop [topFullscreenPackage] 是否属于 HOME 包集合
+     * @param hasSelectedText 本次 Intent 是否带着"选中的文本"extra（文本操作那条规则要用，见 [isTextAction]）
      */
     fun jumpDecision(
         settings: LightOpenSettings,
         action: String?,
-        dataScheme: String?,
         targetPackage: String?,
         topFullscreenPackage: String?,
         isHomeTop: Boolean,
+        hasSelectedText: Boolean = false,
     ): LightOpenDecision {
         if (!settings.enabled) return LightOpenDecision.LEAVE
         if (topFullscreenPackage.isNullOrBlank()) return LightOpenDecision.LEAVE
@@ -198,7 +198,7 @@ object LightOpen {
             }
         }
         if (settings.shareToApp && isShareAction(action)) return LightOpenDecision.FORCE_FREEFORM
-        if (settings.textAction && isTextAction(action, dataScheme)) return LightOpenDecision.FORCE_FREEFORM
+        if (settings.textAction && isTextAction(action, hasSelectedText)) return LightOpenDecision.FORCE_FREEFORM
         return LightOpenDecision.LEAVE
     }
 
@@ -209,14 +209,16 @@ object LightOpen {
     /**
      * 文本操作：编辑条/选中文本工具栏里的条目。
      *
-     * 真机上「选中链接 → 编辑条里的浏览器图标」走的是 `ACTION_VIEW` + http(s) data，
-     * 所以这里同时认 `PROCESS_TEXT`、http(s) 的 `VIEW` 和 `WEB_SEARCH`；代价是应用内
-     * 直接点链接也会被算进这个开关（实测确认后再决定要不要收窄）。
+     * `PROCESS_TEXT` / `WEB_SEARCH` 是明确的"文本操作"动作，直接认。
+     *
+     * `ACTION_VIEW` **必须再带上"选中的文本"**（`EXTRA_PROCESS_TEXT` / `EXTRA_TEXT` / `EXTRA_HTML_TEXT`）
+     * 才算 —— 之前只看 http(s) scheme 就认，真机误伤：**从桌面打开 Gemini，Gemini 自己 `VIEW` 跳
+     * Google 应用**被这个开关判成"文本操作"，于是在"应用间跳转"关着的情况下也变成了小窗
+     * （2026-10-15 真机日志 `why=text action=android.intent.action.VIEW`）。
+     * 应用内点链接同样是 `VIEW http(s)`，靠 scheme 区分不了，只能要求"带着选中的文本"这个 extra。
      */
-    fun isTextAction(action: String?, dataScheme: String?): Boolean {
+    fun isTextAction(action: String?, hasSelectedText: Boolean): Boolean {
         if (action == ACTION_PROCESS_TEXT || action == ACTION_WEB_SEARCH) return true
-        if (action != ACTION_VIEW) return false
-        val scheme = dataScheme?.lowercase()
-        return scheme == "http" || scheme == "https"
+        return action == ACTION_VIEW && hasSelectedText
     }
 }
