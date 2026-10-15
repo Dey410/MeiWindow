@@ -140,12 +140,15 @@ jobs:
           if [ -z "$(tr -d '[:space:]' < notes.md)" ]; then
             git log --no-merges --pretty='- %s' -n 10 "$tag" > notes.md
           fi
+          # --latest：Latest 徽章只认"非预发布"里最新的那个，而 v1.3.0 是预发布 —— 显式
+          # 把它顶过来，免得 GitHub 那边的排序出意外（本版就是要顶掉 1.3.0）。
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Release $tag already exists, updating assets and notes..."
             gh release upload "$tag" dist/*.apk --clobber
-            gh release edit "$tag" --title "魅窗 $tag" --notes-file notes.md
+            gh release edit "$tag" --title "魅窗 $tag" --notes-file notes.md --latest
           else
             gh release create "$tag" dist/*.apk \
               --title "魅窗 $tag" \
-              --notes-file notes.md
+              --notes-file notes.md \
+              --latest
           fi
