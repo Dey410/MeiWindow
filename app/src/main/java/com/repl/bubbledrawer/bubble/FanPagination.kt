@@ -70,4 +70,33 @@ object FanPagination {
         }
         return out
     }
+
+    /**
+     * 「最后一页也要铺满」要跟预测器要多少条推荐。
+     *
+     * 用户 2026-10-15：「如果翻到最后一页数量不够就用后续的推荐补齐（即使没开那么多推荐…）
+     * 如果用户没开推荐就不动」。做法是把推荐数（或与收藏相加的总数）补到 [perPage] 的整数倍：
+     * 多出来的那几条排在推荐序的后面，正好就是"后面的推荐"。
+     *
+     * 取不到那么多（机器上没那么多应用）就少给几条，最后一页短一点 —— 尽力而为。
+     *
+     * @param base 基数（原来的取数上限：容量 ×3，至少 15）
+     * @param pinnedCount 收藏（含已选功能）条数
+     * @param perPage 每页应用数（容量 − 1）
+     * @param autoFillRecommend 关掉时首屏只放收藏、推荐自己成页，所以只要把**推荐**补成整数页
+     */
+    fun topUpRequest(base: Int, pinnedCount: Int, perPage: Int, autoFillRecommend: Boolean): Int {
+        if (perPage <= 0 || base <= 0) return base
+        val recommendOwnsPages = !autoFillRecommend && pinnedCount in 1..perPage
+        val wanted = if (recommendOwnsPages) {
+            roundUp(base, perPage)
+        } else {
+            roundUp(pinnedCount + base, perPage) - pinnedCount
+        }
+        return wanted.coerceAtLeast(base)
+    }
+
+    /** 向上取整到 [perPage] 的整数倍。 */
+    private fun roundUp(value: Int, perPage: Int): Int =
+        ((value + perPage - 1) / perPage) * perPage
 }

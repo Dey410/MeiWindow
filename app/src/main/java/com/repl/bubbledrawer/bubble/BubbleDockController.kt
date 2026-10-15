@@ -146,7 +146,7 @@ class BubbleDockController(
         private set
     private var pages: List<List<GestureAppLauncher.AdapterItem>> = emptyList()
 
-    /** 这一轮 [show] 用的图标数量与层数 —— 翻页时要按同一套规则给每一页算圈（见 [adapterFor]）。 */
+    /** 这一轮 [show] 用的图标数量与层数 —— 翻页时要按同一套规则给每一页算圈。 */
     private var pageIconCount = 6
     private var pageLayers = FanLayout.LAYERS_SINGLE
 
@@ -162,14 +162,18 @@ class BubbleDockController(
     }
 
     /**
-     * 一页的 adapter：item 顺序就是 [FanPagination] 给的顺序，**外圈占前几枚**由
-     * [FanLayout.outerSplit] 现算 —— 满页时是 `iconCount + 2`，末页装不满时退回单圈。
+     * 一页的 adapter：先按 [FanLayout.ringOrder] 把 item 排成「内圈（前几个应用 + 「更多」）在前、
+     * 外圈（剩下的应用）在后」，再把「前几枚归内圈」告诉 launcher。
      */
-    private fun adapterFor(items: List<GestureAppLauncher.AdapterItem>): GestureAppLauncher.SlideAdapter =
-        GestureAppLauncher.SlideAdapter(
-            items = items,
-            outerSplit = FanLayout.outerSplit(items.size, pageIconCount, pageLayers),
+    private fun adapterFor(items: List<GestureAppLauncher.AdapterItem>): GestureAppLauncher.SlideAdapter {
+        val more = GestureAppLauncher.AdapterItem.More
+        val ordered = FanLayout.ringOrder(items, pageIconCount, pageLayers) { it is GestureAppLauncher.AdapterItem.More }
+        val appsOnPage = ordered.count { it !== more }
+        return GestureAppLauncher.SlideAdapter(
+            items = ordered,
+            innerSplit = FanLayout.innerTileCount(appsOnPage, pageIconCount, pageLayers),
         ) { item, index -> viewFactory?.create(item, index) ?: itemView(item) }
+    }
 
     /** @param screenH full-screen height in px (the launcher window is MATCH_PARENT). */
     fun show(
@@ -180,16 +184,17 @@ class BubbleDockController(
         radiusDp: Int = 0,
         autoFillRecommend: Boolean = false,
         layers: Int = FanLayout.LAYERS_SINGLE,
+        recommendEnabled: Boolean = true,
     ) {
         currentPage = 0
         pageIconCount = maxApps
         pageLayers = layers
-        pages = buildPages(maxApps, autoFillRecommend, layers)
+        pages = buildPages(maxApps, autoFillRecommend, layers, recommendEnabled)
         totalPages = pages.size
         val items = pages.firstOrNull() ?: listOf(GestureAppLauncher.AdapterItem.More)
         val side = if (corner == Corner.BOTTOM_RIGHT || corner == Corner.SIDE_RIGHT) 1 else 0
         launcher.setAdapter(adapterFor(items))
-        launcher.setFanLayers(layers)
+        launcher.setFanLayout(layers, maxApps)
         launcher.setLayoutSide(side)
         val navbar = hasNavBar()
         val defaultRadius = context.resources.getDimension(
@@ -227,11 +232,16 @@ class BubbleDockController(
      *
      * 容量随层数变：单层 = [maxApps] 个应用 + 「更多」；双层 = 内层 `maxApps` + 外层
      * `maxApps + 2`（外层没有「更多」），见 [FanLayout.tilesPerPage]。
+     *
+     * @param recommendEnabled 「启用推荐应用」总开关。关掉时扇形里**一条推荐都不放**
+     *   （用户 2026-10-15：「如果用户没开推荐就不动」）：页数=收藏切出来的那几页，
+     *   最后一页短就短着。
      */
     fun buildPages(
         maxApps: Int,
         autoFillRecommend: Boolean,
         layers: Int = FanLayout.LAYERS_SINGLE,
+        recommendEnabled: Boolean = true,
     ): List<List<GestureAppLauncher.AdapterItem>> {
         val all = repo.cachedAll()
         val pinnedApps = ArrayList<com.repl.bubbledrawer.pinyin.BubbleApp>()
@@ -252,10 +262,20 @@ class BubbleDockController(
         pinnedFunctions.forEach { pinned.add(GestureAppLauncher.AdapterItem.FunctionItem(it)) }
 
         val capacity = FanLayout.tilesPerPage(maxApps, layers)
-        val recCount = maxOf(15, capacity * 3)
-        val recommendations = com.repl.bubbledrawer.data.predict.AppPredictor.getRecommendations(
-            context, all, pinnedKeys, recCount,
+        // 取数上限 = 「够铺满前几页」的基数（容量 ×3）再按 [FanPagination.topUpRequest] 往上补整页 ——
+        // 用户要的是"最后一页也铺满"，哪怕为此要多要几条推荐（"即使没开那么多推荐"）。
+        val base = maxOf(15, capacity * 3)
+        val request = FanPagination.topUpRequest(
+            base = base,
+            pinnedCount = pinned.size,
+            perPage = capacity - 1,
+            autoFillRecommend = autoFillRecommend,
         )
+        val recommendations = if (recommendEnabled) {
+            com.repl.bubbledrawer.data.predict.AppPredictor.getRecommendations(context, all, pinnedKeys, request)
+        } else {
+            emptyList()
+        }
 
         return FanPagination.pages(
             pinned = pinned,

@@ -94,15 +94,53 @@ class FanPaginationTest {
     }
 
     @Test
-    fun testDoubleLayerPageSplitsOuterFirst() {
-        // 满页 13 枚 tile：前 [FanLayout.outerApps] 枚给外圈，剩下给内圈（含「更多」）。
+    fun testDoubleLayerPageSplitsInnerFirst() {
+        // 满页 13 枚 tile：**前 6 枚（5 应用 + 「更多」）在内圈**，剩下 7 枚应用在外圈。
         val pages = paginate(pinnedCount = 20, recommendCount = 0, maxApps = 5, autoFillRecommend = true, layers = FanLayout.LAYERS_DOUBLE)
         assertEquals(13, pages[0].size)
-        assertEquals(7, FanLayout.outerSplit(pages[0].size, 5, FanLayout.LAYERS_DOUBLE))
-        assertEquals("More", pages[0].last())
-        // 12 枚应用：外圈 7 枚 = pinned_1..7，内圈 5 枚 + 更多 = pinned_8..12
-        assertEquals((1..7).map { "pinned_$it" }, pages[0].take(7))
-        assertEquals((8..12).map { "pinned_$it" } + "More", pages[0].drop(7))
+        assertEquals(6, FanLayout.innerTileCount(12, 5, FanLayout.LAYERS_DOUBLE))
+        val ordered = FanLayout.ringOrder(pages[0], 5, FanLayout.LAYERS_DOUBLE) { it == "More" }
+        assertEquals((1..5).map { "pinned_$it" } + "More", ordered.take(6))
+        assertEquals((6..12).map { "pinned_$it" }, ordered.drop(6))
+    }
+
+    @Test
+    fun testTopUpFillsTheLastPage() {
+        // 用户 2026-10-15：最后一页不够就用后面的推荐补齐，哪怕为此要多要几条推荐。
+        val perPage = FanLayout.tilesPerPage(5, FanLayout.LAYERS_DOUBLE) - 1
+        // 没有收藏：把推荐补成整数页
+        assertEquals(48, FanPagination.topUpRequest(base = 39, pinnedCount = 0, perPage = perPage, autoFillRecommend = false))
+        // 收藏 12 个 + 没开自动填充：首屏只放收藏，推荐自己成页 → 也要整数页
+        assertEquals(48, FanPagination.topUpRequest(base = 39, pinnedCount = 12, perPage = perPage, autoFillRecommend = false))
+        // 收藏 13 个：首屏塞不下，收藏与推荐同一个池子 → 把 (13 + 推荐) 补到整数页
+        assertEquals(47, FanPagination.topUpRequest(base = 39, pinnedCount = 13, perPage = perPage, autoFillRecommend = false))
+        // 开了自动填充：收藏 2 个也要一起算进页里
+        assertEquals(46, FanPagination.topUpRequest(base = 39, pinnedCount = 2, perPage = perPage, autoFillRecommend = true))
+        // 单层（每页 5 个应用）：15 本来就是整数页，不用多要
+        assertEquals(15, FanPagination.topUpRequest(base = 15, pinnedCount = 0, perPage = 5, autoFillRecommend = false))
+        // 基数不是整数页时往上补：16 → 20
+        assertEquals(20, FanPagination.topUpRequest(base = 16, pinnedCount = 0, perPage = 5, autoFillRecommend = false))
+        // 退化输入不当机
+        assertEquals(39, FanPagination.topUpRequest(39, 0, 0, false))
+        assertEquals(0, FanPagination.topUpRequest(0, 0, 12, false))
+    }
+
+    @Test
+    fun testToppedUpPoolMakesEveryPageFull() {
+        // 补过之后，只要机器上的应用够，每一页都是满的（末页也不例外）。
+        val capacity = FanLayout.tilesPerPage(5, FanLayout.LAYERS_DOUBLE)
+        val perPage = capacity - 1
+        val request = FanPagination.topUpRequest(base = 39, pinnedCount = 0, perPage = perPage, autoFillRecommend = false)
+        val rec = (1..request).map { "rec_$it" }
+        val pages = FanPagination.pages(
+            pinned = emptyList<String>(),
+            recommended = rec,
+            capacity = capacity,
+            autoFillRecommend = false,
+            more = { "More" },
+        )
+        assertEquals(4, pages.size)
+        pages.forEach { assertEquals(capacity, it.size) }
     }
 
     @Test

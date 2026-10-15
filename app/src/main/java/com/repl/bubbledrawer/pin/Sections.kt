@@ -31,13 +31,13 @@ sealed interface Cell {
     data class App(val app: BubbleApp, val section: String) : Cell  // regular grid cell
 
     /**
-     * 「展开全部 / 收起」行（用户 2026-10-14）：某一区超过 [Sections.VISIBLE_MAX] 个时，先只铺
+     * 「展开更多」行（用户 2026-10-14/15）：某一区超过 [Sections.VISIBLE_MAX] 个时，先只铺
      * [Sections.VISIBLE_MAX] 个，这一行垫在第 N 个下面，点开才把剩下的放出来。
      *
-     * @param remaining 还藏着几个（展开状态下为 0）
-     * @param expanded 当前是不是展开态（决定按钮写「展开全部」还是「收起」）
+     * 没有"收起"：用户 2026-10-15 明确不要（展开是一次性的，看完自己滚回去就行），所以这个 cell
+     * 只在**折叠态**出现，展开后整行消失。文案也不带数量（"还有 N 个"那对括号是用户点名去掉的）。
      */
-    data class Expand(val section: String, val remaining: Int, val expanded: Boolean) : Cell
+    data class Expand(val section: String) : Cell
 }
 
 private fun MutableList<Cell>.addApp(app: BubbleApp, section: String) = add(Cell.App(app, section))
@@ -168,8 +168,9 @@ object Sections {
     }
 
     /**
-     * 折叠一段：[items] 不超过 [max] 就原样返回；超过则只留前 [max]（或全部，展开时），
+     * 折叠一段：[items] 不超过 [max] 就原样返回；超过则只留前 [max]（展开时是全部），
      * 并在**第一个 item 的位置之后**补一枚 [Cell.Expand]（收藏区的 PinHead 在 items 之前，别打乱它）。
+     * 已展开时不再补任何 cell —— 没有"收起"按钮（用户 2026-10-15）。
      */
     private fun cap(
         block: List<Cell>,
@@ -179,8 +180,8 @@ object Sections {
         isItem: (Cell) -> Boolean,
     ): List<Cell> {
         val items = block.filter(isItem)
-        if (items.size <= max) return block
-        val shown = if (expanded) items.size else max
+        if (items.size <= max || expanded) return block
+        val shown = max
         val out = ArrayList<Cell>(shown + 3)
         var placed = false
         for (cell in block) {
@@ -194,7 +195,7 @@ object Sections {
             out.add(cell)
         }
         if (!placed) out.addAll(items.take(shown))
-        out.add(Cell.Expand(section = section, remaining = items.size - shown, expanded = expanded))
+        out.add(Cell.Expand(section = section))
         return out
     }
 }

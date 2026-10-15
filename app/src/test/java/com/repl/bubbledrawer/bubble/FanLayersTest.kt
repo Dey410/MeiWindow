@@ -28,7 +28,7 @@ class FanLayersTest {
         assertEquals(6, FanLayout.tilesPerPage(5, FanLayout.LAYERS_SINGLE))
         assertEquals(6, FanLayout.outerTiles(5, FanLayout.LAYERS_SINGLE))
         assertEquals(0, FanLayout.innerTiles(5, FanLayout.LAYERS_SINGLE))
-        assertEquals(0, FanLayout.outerSplit(6, 5, FanLayout.LAYERS_SINGLE))
+        assertEquals(0, FanLayout.innerTileCount(5, 5, FanLayout.LAYERS_SINGLE))
     }
 
     @Test
@@ -48,14 +48,48 @@ class FanLayersTest {
     }
 
     @Test
-    fun fullPageSplitsAtTheOuterRing() {
-        // 满页：前 7 枚（= 外层应用数）归外圈，剩下 6 枚（5 应用 + 更多）归内圈。
-        assertEquals(7, FanLayout.outerSplit(13, 5, FanLayout.LAYERS_DOUBLE))
-        // 不满一页装得下外圈时整页按单圈画（原来是 2 个收藏 + 更多 → 一圈三枚，别退化成
-        // 「两枚外圈 + 一枚挂在内圈的更多」）。
-        assertEquals(0, FanLayout.outerSplit(3, 5, FanLayout.LAYERS_DOUBLE))
-        assertEquals(0, FanLayout.outerSplit(7, 5, FanLayout.LAYERS_DOUBLE))
-        assertEquals(7, FanLayout.outerSplit(8, 5, FanLayout.LAYERS_DOUBLE))
+    fun firstAppsGoToTheInnerRing() {
+        // 用户 2026-10-15：内圈显示 1–5 个应用，外圈显示第 6 个起的。
+        assertEquals(5, FanLayout.innerAppsOnPage(appsOnPage = 12, iconCount = 5, layers = FanLayout.LAYERS_DOUBLE))
+        // 不满内圈就全在内圈（外圈空着）
+        assertEquals(3, FanLayout.innerAppsOnPage(appsOnPage = 3, iconCount = 5, layers = FanLayout.LAYERS_DOUBLE))
+        // 空页只剩一枚「更多」，它也在内圈
+        assertEquals(0, FanLayout.innerAppsOnPage(appsOnPage = 0, iconCount = 5, layers = FanLayout.LAYERS_DOUBLE))
+        assertEquals(1, FanLayout.innerTileCount(appsOnPage = 0, iconCount = 5, layers = FanLayout.LAYERS_DOUBLE))
+    }
+
+    @Test
+    fun ringOrderPutsTheMoreTileInside() {
+        val apps = (1..12).map { "app$it" }
+        val page = apps + "More"
+        val ordered = FanLayout.ringOrder(page, iconCount = 5, layers = FanLayout.LAYERS_DOUBLE) { it == "More" }
+        // 内圈 = app1..app5 + More；外圈 = app6..app12
+        assertEquals(
+            listOf("app1", "app2", "app3", "app4", "app5", "More", "app6", "app7", "app8", "app9", "app10", "app11", "app12"),
+            ordered,
+        )
+        assertEquals(6, FanLayout.innerTileCount(ordered.count { it != "More" }, 5, FanLayout.LAYERS_DOUBLE))
+    }
+
+    @Test
+    fun ringOrderLeavesShortPagesAlone() {
+        // 装得进内圈：顺序不动（内圈就是整页，「更多」仍在末尾）
+        val short = listOf("app1", "app2", "app3", "More")
+        assertEquals(short, FanLayout.ringOrder(short, 5, FanLayout.LAYERS_DOUBLE) { it == "More" })
+        // 单层：永远不动
+        val full = (1..12).map { "app$it" } + "More"
+        assertEquals(full, FanLayout.ringOrder(full, 5, FanLayout.LAYERS_SINGLE) { it == "More" })
+    }
+
+    @Test
+    fun sixAppsOnTheLastPageSplitFiveAndOne() {
+        // 用户报的那个 bug：最后一页 6 个应用 —— 旧规则会按页退化成单圈（半径也跟着变），
+        // 看起来就像"跑到内圈"。现在恒按满页几何，6 个应用 = 内圈 5 个 + 外圈 1 个。
+        val page = (1..6).map { "app$it" } + "More"
+        val ordered = FanLayout.ringOrder(page, 5, FanLayout.LAYERS_DOUBLE) { it == "More" }
+        assertEquals(listOf("app1", "app2", "app3", "app4", "app5", "More", "app6"), ordered)
+        assertEquals(6, FanLayout.innerTileCount(6, 5, FanLayout.LAYERS_DOUBLE))
+        assertEquals(13, FanLayout.tilesPerPage(5, FanLayout.LAYERS_DOUBLE))
     }
 
     @Test

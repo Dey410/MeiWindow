@@ -181,7 +181,7 @@ class PinManageModel(
 
     /**
      * 分区折叠状态（见 [Sections.visible]）：某一区超过 [Sections.VISIBLE_MAX] 个时默认只铺 20 个，
-     * 点那一枚「展开全部」才全放出来。**不放进 [cells]**：折叠只是显示层的事，改它不该重跑推荐。
+     * 点那一枚「展开更多」才全放出来。**不放进 [cells]**：折叠只是显示层的事，改它不该重跑推荐。
      *
      * 存在 model 上而不是 composable 的 `remember` 里：面板里切一次 Tab（应用 ↔ 功能）整棵内容树
      * 会重建，状态挂在内容上就会被重置回折叠态。

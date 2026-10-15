@@ -57,16 +57,36 @@ object FanLayout {
         if (isDouble(layers)) innerApps(iconCount, layers) + 1 else 0
 
     /**
-     * 这一页前几枚 tile 归**外圈**。
+     * 这一页的内圈装几个应用：**前 [iconCount] 个**。
      *
-     * 满页时就是 `outerApps`；页尾不满（最后一页、或「收藏不足且没开自动填充」的第一页）时可能
-     * 连外圈都填不满，那时返回 **0 = 整页按单圈画**：一圈 2 枚应用 + 一枚孤零零的「更多」挂在内圈
-     * 比现在难看，而原来单层的样子本来就支持任意枚数的环。
+     * 用户 2026-10-15 改的规则：「内圈显示 1-5 个应用，外圈显示第 6 个+的应用」（原来是反的：外层
+     * 拿前几个）。内层 5 个、外层 7 个这个数量关系没变，变的是谁在前。
      */
-    fun outerSplit(tiles: Int, iconCount: Int, layers: Int): Int {
-        if (!isDouble(layers)) return 0
-        val outer = outerApps(iconCount, layers)
-        return if (tiles > outer) outer else 0
+    fun innerAppsOnPage(appsOnPage: Int, iconCount: Int, layers: Int): Int =
+        if (isDouble(layers)) minOf(appsOnPage, iconCount) else 0
+
+    /**
+     * 这一页前几枚 tile 归**内圈**（内圈 = 它的应用 + 末尾那枚「更多」）。
+     *
+     * 双层时恒 ≥ 1（哪怕整页只有一枚「更多」，它也在内圈）；单层返回 0 = 整页一圈，走移植版那套。
+     */
+    fun innerTileCount(appsOnPage: Int, iconCount: Int, layers: Int): Int =
+        if (isDouble(layers)) innerAppsOnPage(appsOnPage, iconCount, layers) + 1 else 0
+
+    /**
+     * 把一页的 item 重排成「**内圈在前、外圈在后**」：[iconCount] 个应用 + 「更多」在内圈，剩下的
+     * 应用在外圈。双层时「更多」因此会从页尾挪到页中间（内圈的最后一格）。
+     *
+     * 单层、找不到「更多」、或页内应用本来就装得进内圈时原样返回 —— 后两种情况下重排等于没重排
+     * （内圈就是整页），不必动它。
+     */
+    fun <T> ringOrder(page: List<T>, iconCount: Int, layers: Int, isMore: (T) -> Boolean): List<T> {
+        if (!isDouble(layers)) return page
+        val moreIndex = page.indexOfLast(isMore)
+        if (moreIndex < 0) return page
+        val apps = page.filterIndexed { index, _ -> index != moreIndex }
+        if (apps.size <= iconCount) return page
+        return apps.take(iconCount) + page[moreIndex] + apps.drop(iconCount)
     }
 
     fun isDouble(layers: Int): Boolean = layers >= LAYERS_DOUBLE
@@ -92,6 +112,10 @@ object FanLayout {
 
     /**
      * 算出这一页要画的圈。[innerTiles] ≤ 0 表示单层（只返回外圈）。
+     *
+     * 传 **满页时**的 tile 数（[outerTiles]/[innerTiles] 按设置算），不要传"这一页实际有几枚" ——
+     * 半径只由设置决定，翻页时图标才不会忽远忽近（用户 2026-10-15 报的「最后一页的图标跑到内圈」
+     * 就是旧写法按页算、末页退化成单圈造成的）。
      *
      * @param baseRadiusPx 用户设置的半径 —— **它就是外圈半径**（单层时不再改动）。
      * @param iconPx 图标边长（px）。相邻图标的圆心距至少要 [iconPx] + [ringGapPx] 才不会叠。

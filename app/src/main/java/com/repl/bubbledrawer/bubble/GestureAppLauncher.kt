@@ -91,6 +91,9 @@ class GestureAppLauncher @JvmOverloads constructor(
      */
     private var fanLayers = FanLayout.LAYERS_SINGLE
 
+    /** 图标数量设置（[setFanLayout]）：算双层半径时要按"满页"算，所以要它。 */
+    private var fanIconCount = 6
+
     // ---------------- adapter (C2937F "SlideGestureAdapter" analog) ----------------
 
     sealed class AdapterItem {
@@ -112,12 +115,12 @@ class GestureAppLauncher @JvmOverloads constructor(
     class SlideAdapter(
         val items: List<AdapterItem>,
         /**
-         * 「外圈」占前几枚 tile（见 [FanLayout.outerSplit]）：0 = 单圈，整页走移植版那一套。
+         * 「内圈」占前几枚 tile（见 [FanLayout.innerTileCount]）：0 = 单圈，整页走移植版那一套。
          *
-         * 放在 adapter 上而不是 launcher 上，是因为**每一页的分配可能不同**：满页时前面
-         * `iconCount + 2` 枚给外圈，末页只剩两三枚时整页退回单圈（那时内圈会是"一枚孤零零的更多"）。
+         * 放在 adapter 上而不是 launcher 上，是因为**每一页的分配不同**：内圈 = 页内前 [iconCount]
+         * 个应用 + 「更多」，所以末页应用少时内圈就短、外圈空着。
          */
-        val outerSplit: Int = 0,
+        val innerSplit: Int = 0,
         private val factory: ViewFactory,
     ) {
         val count: Int get() = items.size
@@ -139,7 +142,7 @@ class GestureAppLauncher @JvmOverloads constructor(
         var radiusMax = 0f    // f10732c
 
         /**
-         * 双层扇形（[setFanLayers]）加的两个字段 —— 单层时它们的取值与移植版的算法**逐个相等**，
+         * 双层扇形（[setFanLayout]）加的两个字段 —— 单层时它们的取值与移植版的算法**逐个相等**，
          * 只是把原来"整圈共用一个半径、命中半宽按 childCount 现算"改成"每个 child 自己带一份"。
          *
          *  - [ringRadius] = 这个 child 所在那一圈的半径（0 = 还没算过，用 [GestureAppLauncher.setRadiusPx] 的全局值）；
@@ -179,21 +182,23 @@ class GestureAppLauncher @JvmOverloads constructor(
     }
 
     /**
-     * 按当前 adapter 的 [SlideAdapter.outerSplit] 给每个 child 定圈、定角度。
+     * 按当前 adapter 的 [SlideAdapter.innerSplit] 给每个 child 定圈、定角度。
      *
-     * 单圈（`split <= 0` 或 `split >= childCount`）：`angleFor(i, childCount)` + 半宽 `45/childCount`
-     * —— 与移植版 `setAdapter`/`aimAt` 的算法逐位相同，单层用户感觉不到任何变化。
-     * 双层：外圈占前 `split` 枚、内圈占其余，各自套同一套公式，只是"本圈枚数"不同。
+     * 单圈（`innerSplit <= 0`）：`angleFor(i, childCount)` + 半宽 `45/childCount` —— 与移植版
+     * `setAdapter`/`aimAt` 的算法逐位相同，单层用户感觉不到任何变化。
+     * 双层：**前 `innerSplit` 枚归内圈**（用户 2026-10-15：内圈显示前几个应用），其余归外圈，
+     * 各自套同一套公式，只是"本圈枚数"不同。
      */
     private fun assignAngles() {
-        val split = adapter?.outerSplit ?: 0
+        val split = adapter?.innerSplit ?: 0
         val total = childCount
+        val double = FanLayout.isDouble(fanLayers) && split in 1..total
         for (i in 0 until total) {
             val lp = getChildAt(i).layoutParams as LayoutParams
-            if (FanLayout.isDouble(fanLayers) && split in 1 until total) {
-                val inOuter = i < split
-                val ringCount = if (inOuter) split else total - split
-                val indexInRing = if (inOuter) i else i - split
+            if (double) {
+                val inInner = i < split
+                val ringCount = if (inInner) split else total - split
+                val indexInRing = if (inInner) i else i - split
                 lp.angle = angleFor(indexInRing, ringCount)
                 lp.angleHalf = 45f / ringCount
             } else {
@@ -217,14 +222,16 @@ class GestureAppLauncher @JvmOverloads constructor(
         }
 
     /**
-     * 扇形层数（1 = 单层原样，2 = 双层）。与 [BubbleDockController.show] 传进来的设置同源。
+     * 扇形层数与图标数量（1 = 单层原样，2 = 双层）。与 [BubbleDockController.show] 传进来的设置同源。
      *
-     * 只改几何，不改 item：哪几枚在外圈由 adapter 的 [SlideAdapter.outerSplit] 决定，这里只负责
-     * 把「圈」翻译成角度与半径。
+     * 只改几何，不改 item：哪几枚在内圈由 adapter 的 [SlideAdapter.innerSplit] 决定，这里只负责
+     * 把「圈」翻译成角度与半径。[iconCount] 用来算**满页**时的两圈半径 —— 半径只跟设置有关，
+     * 翻页（每页应用数不同）时不会变。
      */
-    fun setFanLayers(layers: Int) {
-        if (fanLayers == layers) return
+    fun setFanLayout(layers: Int, iconCount: Int) {
+        if (fanLayers == layers && fanIconCount == iconCount) return
         fanLayers = layers
+        fanIconCount = iconCount
         assignAngles()
         requestLayout()
     }
@@ -298,12 +305,16 @@ class GestureAppLauncher @JvmOverloads constructor(
      * @return `[外圈半径, 内圈半径?]`；单圈时只有一项（就等于 [radius]，原样）。
      *
      * 单层分支**刻意不算弦长**：半径是用户自己调的（180–360dp），哪怕图标挤一点也轮不到我们替他改
-     * —— 移植版就是这么放的。双层才需要算，因为外圈比内圈多一枚，「照搬用户的半径」会让两圈重叠。
+     * —— 移植版就是这么放的。双层才需要算，因为两圈加起来十几枚，「照搬用户的半径」会让两圈重叠。
+     *
+     * 双层时半径按**满页**（`iconCount + 2` 外圈 / `iconCount + 1` 内圈）算，与这一页实际装了几枚
+     * 无关：末页应用少时只是外圈空着，图标仍落在与其它页相同的那两条弧上（用户 2026-10-15 报的
+     * 「最后一页的 6 个应用跑到内圈」）。
      */
     private fun resolveRingRadii(): List<Float> {
-        val split = adapter?.outerSplit ?: 0
+        val split = adapter?.innerSplit ?: 0
         val total = childCount
-        val double = FanLayout.isDouble(fanLayers) && split in 1 until total
+        val double = FanLayout.isDouble(fanLayers)
         if (!double) {
             for (i in 0 until total) {
                 (getChildAt(i).layoutParams as LayoutParams).ringRadius = radius
@@ -317,8 +328,8 @@ class GestureAppLauncher @JvmOverloads constructor(
         // 图标在 90° 那一端会甩到离侧边 `半径` 的位置：留半个图标，别把最外侧那枚推出屏幕。
         val maxRadius = maxOf(measuredWidth - iconPx / 2f, iconPx * 2f)
         val rings = FanLayout.rings(
-            outerTiles = split,
-            innerTiles = total - split,
+            outerTiles = FanLayout.outerApps(fanIconCount, fanLayers),
+            innerTiles = FanLayout.innerTiles(fanIconCount, fanLayers),
             baseRadiusPx = radius,
             iconPx = iconPx,
             ringGapPx = ringGap,
@@ -326,9 +337,12 @@ class GestureAppLauncher @JvmOverloads constructor(
             safeDegrees = safeDegrees,
         )
         if (rings.isEmpty()) return listOf(radius)
+        val outerPx = rings[0].radiusPx
+        val innerPx = rings.getOrNull(1)?.radiusPx ?: outerPx
         for (i in 0 until total) {
             val lp = getChildAt(i).layoutParams as LayoutParams
-            lp.ringRadius = if (i < split) rings[0].radiusPx else rings.getOrNull(1)?.radiusPx ?: rings[0].radiusPx
+            // split <= 0 理论上到不了这儿（双层时恒 ≥ 1），真到了就整页按内圈画，别把图标甩到外圈。
+            lp.ringRadius = if (i < split) innerPx else outerPx
         }
         return rings.map { it.radiusPx }
     }

@@ -447,6 +447,7 @@ class FanHost(
                     dock.show(
                         currentCorner(), screenW(), screenH(),
                         snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
+                        snap.recommendEnabled,
                     )
                 }
             }
@@ -736,6 +737,7 @@ class FanHost(
                     dock.show(
                         currentCorner(), screenW(), screenH(),
                         snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
+                        snap.recommendEnabled,
                     )
                 }
             }
@@ -777,6 +779,7 @@ class FanHost(
         dock.show(
             activeCorner, screenW, screenH,
             snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
+            snap.recommendEnabled,
         )
         lastTouchX = downX
         lastTouchY = downY
@@ -825,6 +828,7 @@ class FanHost(
                 dock.show(
                     currentCorner(), screenW(), screenH(),
                     snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
+                    snap.recommendEnabled,
                 )
             }
         }

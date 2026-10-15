@@ -4,6 +4,7 @@ import android.content.res.Configuration
 import android.graphics.drawable.Drawable
 import androidx.compose.animation.core.Animatable
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -21,6 +23,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridState
@@ -45,8 +48,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.toArgb
@@ -95,7 +100,6 @@ import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.InputField
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.ListView
 import top.yukonga.miuix.kmp.icon.extended.Search
@@ -324,8 +328,13 @@ fun PinManageScreen(
                             is Cell.EmptyHint -> EmptyHintRow(emptyText)
                             is Cell.Label -> LabelRow(cell.text)
                             is Cell.Expand -> SectionExpandRow(
-                                cell = cell,
-                                onToggle = { if (cell.section == Sections.PIN_SECTION) model.togglePinsExpanded() else model.toggleRecommendExpanded() },
+                                onToggle = {
+                                    if (cell.section == Sections.PIN_SECTION) {
+                                        model.togglePinsExpanded()
+                                    } else {
+                                        model.toggleRecommendExpanded()
+                                    }
+                                },
                             )
                             is Cell.Pin -> PinCell(
                                 app = cell.app,
@@ -438,7 +447,6 @@ fun PinManageScreen(
                                 when (cell) {
                                     is Cell.Label -> LabelRow(cell.text)
                                     is Cell.Expand -> SectionExpandRow(
-                                        cell = cell,
                                         onToggle = {
                                             if (cell.section == Sections.PIN_SECTION) {
                                                 model.togglePinsExpanded()
@@ -732,7 +740,7 @@ private fun SharedPinsSection(
     val pinnedApps = remember(cells) {
         cells.takeWhile { it !is Cell.Label }.filterIsInstance<Cell.Pin>()
     }
-    // 收藏超过 Sections.VISIBLE_MAX 个时那一枚「展开全部」，垫在第 20 个下面（用户 2026-10-14）。
+    // 收藏超过 Sections.VISIBLE_MAX 个时那一枚「展开更多」，垫在第 20 个下面（用户 2026-10-14）。
     val expandCell = remember(cells) {
         cells.takeWhile { it !is Cell.Label }.filterIsInstance<Cell.Expand>()
             .firstOrNull { it.section == Sections.PIN_SECTION }
@@ -808,9 +816,9 @@ private fun SharedPinsSection(
             }
         }
 
-        // 收藏超过一屏时的那一枚「展开全部」，垫在第 N 个（= 上面这些行）下面。
+        // 收藏超过一屏时的那一枚「展开更多」，垫在第 N 个（= 上面这些行）下面。
         if (expandCell != null) {
-            SectionExpandRow(cell = expandCell, onToggle = model::togglePinsExpanded)
+            SectionExpandRow(onToggle = model::togglePinsExpanded)
         }
     }
 }
@@ -948,31 +956,59 @@ private fun LabelRow(text: String) {
 }
 
 /**
- * 「展开全部（还有 N 个）」/「收起」。
+ * 「展开更多 ▾」。
  *
- * 用户 2026-10-14：某一区超过 [Sections.VISIBLE_MAX] 个时**默认不显示**多出来的部分，在第 20 个下面
- * 放这一枚按钮，点了才放出来。做成整行宽的 miuix `TextButton`：位置固定在列表尾部，点哪儿都算，
- * 不用瞄准一个小图标。
+ * 用户 2026-10-14：某一区超过 [Sections.VISIBLE_MAX] 个时默认不显示多出来的部分，在第 20 个下面放
+ * 一枚按钮，点了才放出来。2026-10-15 按用户给的样子改过（他 P 了一版）：
+ *
+ *  - **不用 miuix `TextButton`**：整块灰底圆角按钮太抢眼，压过了下面的应用列表；
+ *  - 只有文字 + 一个小三角，**居中**、**低透明度**，像"这一区还没完"的提示而不是按钮；
+ *  - 文案不带数量（原来那对"（还有 N 个）"括号是用户点名去掉的）；
+ *  - **没有「收起」**：展开后这一行整个消失。
+ *
+ * 三角自己画（`Canvas` + Path）而不是用字形或图标：▼ 这个字符在不同字体下胖瘦不一，图标又要挑一个
+ * 语义勉强合适的；一个 Path 就三行，形状完全可控。
  */
 @Composable
-private fun SectionExpandRow(cell: Cell.Expand, onToggle: () -> Unit) {
-    Box(
+private fun SectionExpandRow(onToggle: () -> Unit) {
+    val tint = MiuixTheme.colorScheme.onSurfaceVariantSummary
+    Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(top = 4.dp, bottom = 8.dp),
-        contentAlignment = Alignment.Center,
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onToggle,
+            )
+            .padding(vertical = 14.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        TextButton(
-            text = if (cell.expanded) {
-                stringResource(R.string.panel_section_collapse)
-            } else {
-                stringResource(R.string.panel_section_expand, cell.remaining)
-            },
-            onClick = onToggle,
-            modifier = Modifier.fillMaxWidth(),
+        Text(
+            text = stringResource(R.string.panel_section_expand),
+            color = tint,
+            style = MiuixTheme.textStyles.body2,
+            modifier = Modifier.alpha(ExpandRowAlpha),
         )
+        Spacer(Modifier.width(6.dp))
+        Canvas(
+            modifier = Modifier
+                .size(11.dp, 6.dp)
+                .alpha(ExpandRowAlpha),
+        ) {
+            val path = Path().apply {
+                moveTo(0f, 0f)
+                lineTo(size.width, 0f)
+                lineTo(size.width / 2f, size.height)
+                close()
+            }
+            drawPath(path, tint)
+        }
     }
 }
+
+/** 展开提示的透明度：比正文浅一档，不跟应用列表抢注意力（用户 P 的那版就是这个观感）。 */
+private const val ExpandRowAlpha = 0.55f
 
 /**
  * ★ pinned cell: same tile as [AppCell] plus the long-press drag handle.

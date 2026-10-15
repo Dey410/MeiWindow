@@ -43,10 +43,7 @@ class SectionsVisibleTest {
         val expands = expandCells(visible)
         assertEquals(2, expands.size)
         assertEquals(Sections.PIN_SECTION, expands[0].section)
-        assertEquals(1, expands[0].remaining)
-        assertFalse(expands[0].expanded)
         assertEquals(Sections.RECOMMEND_SECTION, expands[1].section)
-        assertEquals(1, expands[1].remaining)
     }
 
     @Test
@@ -56,24 +53,20 @@ class SectionsVisibleTest {
         // [0] = 「推荐」小标题，[1..20] = 前 20 个应用，[21] = 展开按钮（用户要的「在 20 个下面」）
         assertTrue(visible[0] is Cell.Label)
         assertEquals(20, visible.subList(1, 21).count { it is Cell.App })
-        val expand = visible[21]
-        assertTrue(expand is Cell.Expand)
-        assertEquals(5, (expand as Cell.Expand).remaining)
+        assertTrue(visible[21] is Cell.Expand)
         assertEquals(22, visible.size)
         // 展开按钮之前不该漏出第 21 个应用
         assertFalse(visible.any { it is Cell.App && it.app.packageName == "pkg.rec21" })
     }
 
     @Test
-    fun expandedShowsEverythingAndOffersCollapse() {
+    fun expandedShowsEverythingAndHasNoCollapseButton() {
+        // 用户 2026-10-15：不需要「收起」按钮 —— 展开后那一行整个消失。
         val cells = recommends(25)
         val visible = Sections.visible(cells, pinnedExpanded = false, recommendExpanded = true)
         assertEquals(25, visible.filterIsInstance<Cell.App>().size)
-        val expand = expandCells(visible).single()
-        assertTrue(expand.expanded)
-        assertEquals(0, expand.remaining)
-        // 全部铺开时按钮在最后一项之后
-        assertTrue(visible.last() is Cell.Expand)
+        assertTrue(expandCells(visible).isEmpty())
+        assertEquals(cells, visible)
     }
 
     @Test
@@ -82,12 +75,14 @@ class SectionsVisibleTest {
         val visible = Sections.visible(cells, pinnedExpanded = false, recommendExpanded = false)
         assertEquals(Cell.PinHead, visible.first())
         assertEquals(20, visible.filterIsInstance<Cell.Pin>().size)
-        assertEquals(Cell.PinHead, visible[0])
         assertTrue(visible[1] is Cell.Pin)
-        val expand = expandCells(visible).single()
-        assertEquals(10, expand.remaining)
+        assertEquals(Sections.PIN_SECTION, expandCells(visible).single().section)
         assertEquals("pkg.pin1", (visible[1] as Cell.Pin).app.packageName)
         assertEquals("pkg.pin20", (visible[20] as Cell.Pin).app.packageName)
+        // 展开后是全部 30 个，且不再有那一行
+        val expandedPins = Sections.visible(cells, pinnedExpanded = true, recommendExpanded = false)
+        assertEquals(30, expandedPins.filterIsInstance<Cell.Pin>().size)
+        assertTrue(expandCells(expandedPins).isEmpty())
     }
 
     @Test
