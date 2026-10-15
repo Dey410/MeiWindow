@@ -95,6 +95,7 @@ import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.InputField
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.ListView
 import top.yukonga.miuix.kmp.icon.extended.Search
@@ -126,7 +127,12 @@ fun PinManageScreen(
 ) {
     val appsGridState = rememberLazyGridState()
     val fnsGridState = rememberLazyGridState()
-    val drag = remember(model) { PinDragState(model) }
+    // 折叠后的 cell 列表（推荐 / 收藏各最多 Sections.VISIBLE_MAX 个）：网格、收藏区、字母条、
+    // 拖拽落点**必须用同一份**，否则字母条按下标跳转、拖拽按下标换位都会落到别的地方去。
+    val visibleCells = remember(model.cells, model.pinsExpanded, model.recommendExpanded) { model.visibleCells }
+    val drag = remember(model) {
+        PinDragState(model) { visibleCells.filterIsInstance<Cell.Pin>() }
+    }
     val title = stringResource(R.string.slide_launch_app_settings_title)
     // 顶部共用收藏区在功能页上装的是「已选功能」，提示语跟着换 —— 否则功能页写着「暂无收藏应用」。
     val headText = if (model.selectedTab == 1) {
@@ -187,9 +193,9 @@ fun PinManageScreen(
     val topContentPadding = if (chrome == Chrome.PANEL) 56.dp else topPadding.calculateTopPadding()
     val topContentPaddingPx = with(density) { topContentPadding.toPx() }
 
-    // 估算收藏区域高度，确保首帧布局零抖动
-    val pinnedAppsCount = remember(model.cells) {
-        model.cells.takeWhile { it !is Cell.Label }.count { it is Cell.Pin }
+    // 估算收藏区域高度，确保首帧布局零抖动（用折叠后的列表：折叠时高度就是 20 个那么大）
+    val pinnedAppsCount = remember(visibleCells) {
+        visibleCells.takeWhile { it !is Cell.Label }.count { it is Cell.Pin }
     }
     val pinnedFnsCount = model.pinnedFunctions.size
     val totalPinned = pinnedAppsCount + pinnedFnsCount
@@ -305,6 +311,7 @@ fun PinManageScreen(
                                 is Cell.Label -> 2
                                 is Cell.Pin -> 3
                                 is Cell.App -> 4
+                                is Cell.Expand -> 5
                             }
                         },
                         span = { _, cell ->
@@ -316,6 +323,10 @@ fun PinManageScreen(
                             is Cell.PinHead -> HeadRow(headText)
                             is Cell.EmptyHint -> EmptyHintRow(emptyText)
                             is Cell.Label -> LabelRow(cell.text)
+                            is Cell.Expand -> SectionExpandRow(
+                                cell = cell,
+                                onToggle = { if (cell.section == Sections.PIN_SECTION) model.togglePinsExpanded() else model.toggleRecommendExpanded() },
+                            )
                             is Cell.Pin -> PinCell(
                                 app = cell.app,
                                 model = model,
@@ -407,7 +418,7 @@ fun PinManageScreen(
                                 bottom = topContentPadding + 16.dp,
                             ),
                         ) {
-                            val unpinnedSection = model.cells.dropWhile { it !is Cell.Label }
+                            val unpinnedSection = visibleCells.dropWhile { it !is Cell.Label }
                             itemsIndexed(
                                 items = unpinnedSection,
                                 key = { _, cell -> cellKey(cell) },
@@ -415,6 +426,7 @@ fun PinManageScreen(
                                     when (cell) {
                                         is Cell.Label -> 2
                                         is Cell.App -> 4
+                                        is Cell.Expand -> 5
                                         else -> 0
                                     }
                                 },
@@ -425,6 +437,16 @@ fun PinManageScreen(
                                 val cellModifier = if (model.manageMode) Modifier.animateItem() else Modifier
                                 when (cell) {
                                     is Cell.Label -> LabelRow(cell.text)
+                                    is Cell.Expand -> SectionExpandRow(
+                                        cell = cell,
+                                        onToggle = {
+                                            if (cell.section == Sections.PIN_SECTION) {
+                                                model.togglePinsExpanded()
+                                            } else {
+                                                model.toggleRecommendExpanded()
+                                            }
+                                        },
+                                    )
                                     is Cell.App -> AppCell(
                                         app = cell.app,
                                         manageMode = model.manageMode,
@@ -511,11 +533,16 @@ fun PinManageScreen(
                         onMeasuredHeight = { h ->
                             if (h != sharedPinsContentHeightPx) {
                                 sharedPinsContentHeightPx = h
+                                // 收藏区高度会变（展开/收起「全部」、收藏/取消收藏）：把上滑累积的
+                                // 偏移夹回新范围。不夹的话会留下"高度已经缩了、偏移还停在旧高度"的
+                                // 悬空状态 —— 列表被顶到 y=0 而收藏区还在负偏移处，看着像两层叠一起。
+                                headerOffsetPx = headerOffsetPx.coerceIn(-h, 0f)
                             }
                         },
                     ) {
                         SharedPinsSection(
                             model = model,
+                            cells = visibleCells,
                             drag = drag,
                             gridSpan = gridSpan,
                             headText = headText,
@@ -569,8 +596,8 @@ fun PinManageScreen(
         // 5. 右侧快速字母条浮层：在应用页显示应用字母，在功能页显示功能分组首字母，两端完全一致
         if (!model.isSearching) {
             if (pagerState.currentPage == 0) {
-                val unpinnedSection = remember(model.cells) {
-                    model.cells.dropWhile { it !is Cell.Label }
+                val unpinnedSection = remember(visibleCells) {
+                    visibleCells.dropWhile { it !is Cell.Label }
                 }
                 val visibleLetter by remember(unpinnedSection) {
                     derivedStateOf {
@@ -690,6 +717,8 @@ private fun MeasuredHeader(
 @Composable
 private fun SharedPinsSection(
     model: PinManageModel,
+    /** 折叠后的 cell 列表（与网格、字母条同一份，见 [PinManageScreen] 里的 `visibleCells`）。 */
+    cells: List<Cell>,
     drag: PinDragState,
     gridSpan: Int,
     headText: String,
@@ -700,8 +729,13 @@ private fun SharedPinsSection(
     onLaunchShortcut: ((ShortcutItem) -> Unit)?,
 ) {
     var sectionCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
-    val pinnedApps = remember(model.cells) {
-        model.cells.takeWhile { it !is Cell.Label }.filterIsInstance<Cell.Pin>()
+    val pinnedApps = remember(cells) {
+        cells.takeWhile { it !is Cell.Label }.filterIsInstance<Cell.Pin>()
+    }
+    // 收藏超过 Sections.VISIBLE_MAX 个时那一枚「展开全部」，垫在第 20 个下面（用户 2026-10-14）。
+    val expandCell = remember(cells) {
+        cells.takeWhile { it !is Cell.Label }.filterIsInstance<Cell.Expand>()
+            .firstOrNull { it.section == Sections.PIN_SECTION }
     }
     val pinnedFns = model.pinnedFunctions
 
@@ -773,6 +807,11 @@ private fun SharedPinsSection(
                 }
             }
         }
+
+        // 收藏超过一屏时的那一枚「展开全部」，垫在第 N 个（= 上面这些行）下面。
+        if (expandCell != null) {
+            SectionExpandRow(cell = expandCell, onToggle = model::togglePinsExpanded)
+        }
     }
 }
 
@@ -782,6 +821,7 @@ private fun cellKey(cell: Cell): String = when (cell) {
     is Cell.Label -> "label:${cell.text}"
     is Cell.Pin -> "pin:${cell.app.packageName}#${cell.app.userId}"
     is Cell.App -> "app:${cell.app.packageName}#${cell.app.userId}@${cell.section}"
+    is Cell.Expand -> "expand:${cell.section}"
 }
 
 /**
@@ -905,6 +945,33 @@ private fun LabelRow(text: String) {
         color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
         style = MiuixTheme.textStyles.body2,
     )
+}
+
+/**
+ * 「展开全部（还有 N 个）」/「收起」。
+ *
+ * 用户 2026-10-14：某一区超过 [Sections.VISIBLE_MAX] 个时**默认不显示**多出来的部分，在第 20 个下面
+ * 放这一枚按钮，点了才放出来。做成整行宽的 miuix `TextButton`：位置固定在列表尾部，点哪儿都算，
+ * 不用瞄准一个小图标。
+ */
+@Composable
+private fun SectionExpandRow(cell: Cell.Expand, onToggle: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp, bottom = 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        TextButton(
+            text = if (cell.expanded) {
+                stringResource(R.string.panel_section_collapse)
+            } else {
+                stringResource(R.string.panel_section_expand, cell.remaining)
+            },
+            onClick = onToggle,
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
 }
 
 /**
@@ -1048,7 +1115,20 @@ private fun AppTile(
     }
 }
 
-private class PinDragState(private val model: PinManageModel) {
+private class PinDragState(
+    private val model: PinManageModel,
+    /**
+     * 当前**画出来的**收藏项（折叠时只有前 [Sections.VISIBLE_MAX] 个）。
+     *
+     * 拖拽的落点只能在"看得见的格子"之间换算：`onDragStart` 拿 [centers] 反查每个格子的中心点，
+     * 而 [centers] 是渲染时登记的 —— 用全量 `model.cells` 去数，格子数对不上，`initialSlots.size ==
+     * pins.size` 这个前提一破，拖拽就会退化成"跟着手指飘但不换位"，甚至落到看不见的位置上。
+     *
+     * 传 lambda 而不是列表：状态本身按 `remember(model)` 复用（`movePin` 会改 `cells`，把它当 key
+     * 会让每次换位都重建状态、拖到一半断掉），所以列表要在**按下那一刻**现取。
+     */
+    private val visiblePins: () -> List<Cell.Pin>,
+) {
 
     var draggingKey: String? by mutableStateOf(null)
         private set
@@ -1075,7 +1155,7 @@ private class PinDragState(private val model: PinManageModel) {
 
     fun onDragStart(key: String) {
         draggingKey = key
-        val pins = model.cells.filterIsInstance<Cell.Pin>()
+        val pins = visiblePins()
         initialSlots = pins.mapNotNull { centers[cellKey(it)] }
         val myPos = pins.indexOfFirst { cellKey(it) == key }
         if (myPos >= 0 && initialSlots.size == pins.size) {

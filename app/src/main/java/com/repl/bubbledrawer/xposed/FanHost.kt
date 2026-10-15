@@ -444,7 +444,10 @@ class FanHost(
             mainHandler.post {
                 if (dock.isBusy) {
                     val snap = RemotePrefs.read(prefs)
-                    dock.show(currentCorner(), screenW(), screenH(), snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend)
+                    dock.show(
+                        currentCorner(), screenW(), screenH(),
+                        snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
+                    )
                 }
             }
         }
@@ -509,7 +512,7 @@ class FanHost(
                 mainHandler.post { if (moreUp) moreContent?.refreshFunctionPins() }
             } else if (key == RemotePrefs.KEY_FAN_ICON_COUNT || key == RemotePrefs.KEY_FAN_RADIUS_DP ||
                 key == RemotePrefs.KEY_FAN_AUTO_FILL_RECOMMEND || key == RemotePrefs.KEY_FAN_ICON_DP ||
-                key == RemotePrefs.KEY_FAN_ICON_SHAPE
+                key == RemotePrefs.KEY_FAN_ICON_SHAPE || key == RemotePrefs.KEY_FAN_LAYERS
             ) {
                 rebindFanIfBusy()
             } else if (key == RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_ACTIVE) {
@@ -730,7 +733,10 @@ class FanHost(
                     // The panel is reading the old list: rebuild it in place.
                     moreContent?.reload()
                 } else if (dock.isBusy) {
-                    dock.show(currentCorner(), screenW(), screenH(), snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend)
+                    dock.show(
+                        currentCorner(), screenW(), screenH(),
+                        snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
+                    )
                 }
             }
             scanShortcuts("APP_LIST_RELOAD")
@@ -768,7 +774,10 @@ class FanHost(
         raiseFanWindows()
         dock.previewMode = false
         val snap = RemotePrefs.read(prefs)
-        dock.show(activeCorner, screenW, screenH, snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend)
+        dock.show(
+            activeCorner, screenW, screenH,
+            snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
+        )
         lastTouchX = downX
         lastTouchY = downY
         pressureDetector.startListening(settleMs = 280L)
@@ -813,7 +822,10 @@ class FanHost(
         val snap = RemotePrefs.read(prefs)
         mainHandler.post {
             if (dock.isBusy) {
-                dock.show(currentCorner(), screenW(), screenH(), snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend)
+                dock.show(
+                    currentCorner(), screenW(), screenH(),
+                    snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
+                )
             }
         }
     }

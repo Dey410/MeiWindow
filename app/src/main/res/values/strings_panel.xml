@@ -13,5 +13,17 @@
     <string name="recommend_apps_enable">启用推荐应用</string>
     <string name="recommend_apps_count">推荐显示数量</string>
     <string name="recommend_apps_count_format">%1$d 个</string>
+    <string name="recommend_apps_count_summary">点击手动输入，默认 12；超过 20 个的部分在面板里默认折叠</string>
     <string name="recommend_apps_hint">复刻小米安全服务预测算法：结合5维朴素贝叶斯、2阶马尔可夫转移概率及RRF倒数排名融合，按使用习惯自适应推荐。</string>
+
+    <!-- 面板分区折叠：推荐 / 收藏应用超过 20 个时，先只铺 20 个 -->
+    <string name="panel_section_expand">展开全部（还有 %1$d 个）</string>
+    <string name="panel_section_collapse">收起</string>
+
+    <!-- 数字输入弹窗 -->
+    <string name="int_input_field_hint">数量</string>
+    <string name="int_input_range">可输入 %1$d–%2$d 的整数</string>
+    <string name="int_input_invalid">请输入 %1$d–%2$d 之间的整数</string>
+    <string name="dialog_cancel">取消</string>
+    <string name="dialog_confirm">确认</string>
 </resources>

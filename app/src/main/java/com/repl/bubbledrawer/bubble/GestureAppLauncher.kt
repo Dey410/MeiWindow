@@ -82,6 +82,15 @@ class GestureAppLauncher @JvmOverloads constructor(
 
     private var pageTurnAnimator: ValueAnimator? = null
 
+    /**
+     * 扇形层数（1 = 单层，2 = 双层；见 [FanLayout]）。
+     *
+     * 移植版只有一圈，所以 `angleFor`/`layoutChildren` 里"整圈一个半径"是写死的。这一项为 2 时改成
+     * 按 [LayoutParams.ringRadius] 逐 child 摆位；为 1 时**每一处计算都与移植版逐位相同**（半径就是
+     * [radius]，角度与命中半宽都按 childCount 算），所以这次改动对单层用户是零行为变化。
+     */
+    private var fanLayers = FanLayout.LAYERS_SINGLE
+
     // ---------------- adapter (C2937F "SlideGestureAdapter" analog) ----------------
 
     sealed class AdapterItem {
@@ -100,7 +109,17 @@ class GestureAppLauncher @JvmOverloads constructor(
 
     fun interface ViewFactory { fun create(item: AdapterItem, index: Int): View }
 
-    class SlideAdapter(val items: List<AdapterItem>, private val factory: ViewFactory) {
+    class SlideAdapter(
+        val items: List<AdapterItem>,
+        /**
+         * 「外圈」占前几枚 tile（见 [FanLayout.outerSplit]）：0 = 单圈，整页走移植版那一套。
+         *
+         * 放在 adapter 上而不是 launcher 上，是因为**每一页的分配可能不同**：满页时前面
+         * `iconCount + 2` 枚给外圈，末页只剩两三枚时整页退回单圈（那时内圈会是"一枚孤零零的更多"）。
+         */
+        val outerSplit: Int = 0,
+        private val factory: ViewFactory,
+    ) {
         val count: Int get() = items.size
         fun getView(position: Int, parent: ViewGroup): View = factory.create(items[position], position)
     }
@@ -118,6 +137,18 @@ class GestureAppLauncher @JvmOverloads constructor(
         var angle = 0f        // f10730a
         var radiusMin = 0f    // f10731b
         var radiusMax = 0f    // f10732c
+
+        /**
+         * 双层扇形（[setFanLayers]）加的两个字段 —— 单层时它们的取值与移植版的算法**逐个相等**，
+         * 只是把原来"整圈共用一个半径、命中半宽按 childCount 现算"改成"每个 child 自己带一份"。
+         *
+         *  - [ringRadius] = 这个 child 所在那一圈的半径（0 = 还没算过，用 [GestureAppLauncher.setRadiusPx] 的全局值）；
+         *  - [angleHalf] = 命中判定的角度半宽，= `90 / 本圈 tile 数 * 0.5`（移植版是 `90 / childCount * 0.5`，
+         *    单层时两者相同）。两圈 tile 数不同，必须各算各的。
+         */
+        var ringRadius = 0f
+        var angleHalf = 0f
+
         constructor() : super(
             android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
             android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -141,10 +172,39 @@ class GestureAppLauncher @JvmOverloads constructor(
         for (i in 0 until n) {
             val v = a.getView(i, this)
             addView(v)
-            (v.layoutParams as LayoutParams).angle = angleFor(i, n)  // :840
         }
+        assignAngles()      // :840（原来是逐个 angleFor(i, n)）
         requestLayout()
         laidOut = false // :843 (f10704q = false)
+    }
+
+    /**
+     * 按当前 adapter 的 [SlideAdapter.outerSplit] 给每个 child 定圈、定角度。
+     *
+     * 单圈（`split <= 0` 或 `split >= childCount`）：`angleFor(i, childCount)` + 半宽 `45/childCount`
+     * —— 与移植版 `setAdapter`/`aimAt` 的算法逐位相同，单层用户感觉不到任何变化。
+     * 双层：外圈占前 `split` 枚、内圈占其余，各自套同一套公式，只是"本圈枚数"不同。
+     */
+    private fun assignAngles() {
+        val split = adapter?.outerSplit ?: 0
+        val total = childCount
+        for (i in 0 until total) {
+            val lp = getChildAt(i).layoutParams as LayoutParams
+            if (FanLayout.isDouble(fanLayers) && split in 1 until total) {
+                val inOuter = i < split
+                val ringCount = if (inOuter) split else total - split
+                val indexInRing = if (inOuter) i else i - split
+                lp.angle = angleFor(indexInRing, ringCount)
+                lp.angleHalf = 45f / ringCount
+            } else {
+                lp.angle = angleFor(i, total)
+                lp.angleHalf = 45f / total
+            }
+        }
+        // 半径要等测量之后才知道（图标 px 是用户可调的），所以这里只清掉缓存。
+        for (i in 0 until total) {
+            (getChildAt(i).layoutParams as LayoutParams).ringRadius = 0f
+        }
     }
 
     /** m9726m (:507-514). */
@@ -156,16 +216,31 @@ class GestureAppLauncher @JvmOverloads constructor(
             i * step + step * 0.5f + safeDegrees
         }
 
+    /**
+     * 扇形层数（1 = 单层原样，2 = 双层）。与 [BubbleDockController.show] 传进来的设置同源。
+     *
+     * 只改几何，不改 item：哪几枚在外圈由 adapter 的 [SlideAdapter.outerSplit] 决定，这里只负责
+     * 把「圈」翻译成角度与半径。
+     */
+    fun setFanLayers(layers: Int) {
+        if (fanLayers == layers) return
+        fanLayers = layers
+        assignAngles()
+        requestLayout()
+    }
+
     /** setSafeDegrees (:882-890). */
     fun setSafeDegrees(deg: Int) {
         if (safeDegrees == deg) return
         safeDegrees = deg
-        for (i in 0 until childCount) {
-            (getChildAt(i).layoutParams as LayoutParams).angle = angleFor(i, childCount)
-        }
+        assignAngles()
     }
 
-    fun setRadiusPx(px: Float) { radius = px }                 // setRadius :878-880
+    fun setRadiusPx(px: Float) {
+        radius = px                                             // setRadius :878-880
+        // 半径变了要重摆：双层的内圈半径是从外圈推出来的。
+        requestLayout()
+    }
     fun setCenterPosition(y: Float) { centerY = y; requestLayout() } // :863-866
     fun setLayoutSide(s: Int) { side = s; requestLayout() }    // setLayoutDirection :868-872
     fun setCallback(cb: Callback?) { callback = cb }           // :892-897
@@ -183,8 +258,8 @@ class GestureAppLauncher @JvmOverloads constructor(
         for (i in 0 until n) {
             val v = a.getView(i, this)
             addView(v)
-            (v.layoutParams as LayoutParams).angle = angleFor(i, n)
         }
+        assignAngles()
         if (measuredWidth > 0 && measuredHeight > 0) {
             val wSpec = MeasureSpec.makeMeasureSpec(measuredWidth, MeasureSpec.EXACTLY)
             val hSpec = MeasureSpec.makeMeasureSpec(measuredHeight, MeasureSpec.EXACTLY)
@@ -200,18 +275,62 @@ class GestureAppLauncher @JvmOverloads constructor(
 
     private fun layoutChildren() {
         val w = measuredWidth
+        val rings = resolveRingRadii()
+        val ringPx = rings.firstOrNull() ?: radius
         for (i in 0 until childCount) {
             val child = getChildAt(i)
             val lp = child.layoutParams as LayoutParams
+            val r = if (lp.ringRadius > 0f) lp.ringRadius else ringPx
             val rad = Math.toRadians(lp.angle.toDouble())
-            val px = if (side == 0) sin(rad) * radius else w - sin(rad) * radius
-            val py = centerY - cos(rad) * radius
+            val px = if (side == 0) sin(rad) * r else w - sin(rad) * r
+            val py = centerY - cos(rad) * r
             val left = (px - child.measuredWidth / 2.0).roundToInt()
             val top = (py - child.measuredHeight / 2.0).roundToInt()
-            lp.radiusMin = radius - child.measuredWidth / 2f
-            lp.radiusMax = radius + child.measuredWidth / 2f + touchSlop
+            lp.radiusMin = r - child.measuredWidth / 2f
+            lp.radiusMax = r + child.measuredWidth / 2f + touchSlop
             child.layout(left, top, left + child.measuredWidth, top + child.measuredHeight)
         }
+    }
+
+    /**
+     * 定这一页两圈的半径，并把结果写进每个 child 的 [LayoutParams.ringRadius]。
+     *
+     * @return `[外圈半径, 内圈半径?]`；单圈时只有一项（就等于 [radius]，原样）。
+     *
+     * 单层分支**刻意不算弦长**：半径是用户自己调的（180–360dp），哪怕图标挤一点也轮不到我们替他改
+     * —— 移植版就是这么放的。双层才需要算，因为外圈比内圈多一枚，「照搬用户的半径」会让两圈重叠。
+     */
+    private fun resolveRingRadii(): List<Float> {
+        val split = adapter?.outerSplit ?: 0
+        val total = childCount
+        val double = FanLayout.isDouble(fanLayers) && split in 1 until total
+        if (!double) {
+            for (i in 0 until total) {
+                (getChildAt(i).layoutParams as LayoutParams).ringRadius = radius
+            }
+            return listOf(radius)
+        }
+        var iconPx = 0f
+        for (i in 0 until total) iconPx = maxOf(iconPx, getChildAt(i).measuredWidth.toFloat())
+        if (iconPx <= 0f) iconPx = radius * 0.2f
+        val ringGap = maxOf(touchSlop.toFloat(), MotionSpec.FAN_RING_GAP_PX)
+        // 图标在 90° 那一端会甩到离侧边 `半径` 的位置：留半个图标，别把最外侧那枚推出屏幕。
+        val maxRadius = maxOf(measuredWidth - iconPx / 2f, iconPx * 2f)
+        val rings = FanLayout.rings(
+            outerTiles = split,
+            innerTiles = total - split,
+            baseRadiusPx = radius,
+            iconPx = iconPx,
+            ringGapPx = ringGap,
+            maxRadiusPx = maxRadius,
+            safeDegrees = safeDegrees,
+        )
+        if (rings.isEmpty()) return listOf(radius)
+        for (i in 0 until total) {
+            val lp = getChildAt(i).layoutParams as LayoutParams
+            lp.ringRadius = if (i < split) rings[0].radiusPx else rings.getOrNull(1)?.radiusPx ?: rings[0].radiusPx
+        }
+        return rings.map { it.radiusPx }
     }
 
     private fun playPageTurnAnimation() {
@@ -537,10 +656,13 @@ class GestureAppLauncher @JvmOverloads constructor(
         val dist = hoverDistance
         val n = childCount
         if (n == 0) return false
-        val half = 90.0f / n * 0.5f
+        // 移植版是 `val half = 90.0f / n * 0.5f`（整页共用一个半宽）。双层时两圈 tile 数不同，
+        // 半宽改由 assignAngles() 逐 child 写进 LayoutParams.angleHalf —— 单层时两者恒等。
+        val fallbackHalf = 90.0f / n * 0.5f
         var hit = -1
         for (i in 0 until n) {
             val lp = getChildAt(i).layoutParams as LayoutParams
+            val half = if (lp.angleHalf > 0f) lp.angleHalf else fallbackHalf
             if (angle >= lp.angle - half && angle < lp.angle + half && dist >= lp.radiusMin && dist <= lp.radiusMax) {
                 hit = i
                 break

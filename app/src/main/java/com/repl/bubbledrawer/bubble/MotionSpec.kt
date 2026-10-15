@@ -48,6 +48,16 @@ object MotionSpec {
     const val SCALE_OVERSHOOT = 1.05f
     const val X_JITTER_PX = 18f                           // f10706s = 18 (px, not dp) :936
 
+    /**
+     * 双层扇形两圈之间的径向间隙（px），同时也是同一圈里相邻图标的**最小空隙**。
+     *
+     * 移植版没有这一项（只有一圈）。定 26px = 8dp：既要**不小于触摸 slop**（内圈的 `radiusMax`
+     * = r + 图标/2 + slop，外圈的 `radiusMin` = r − 图标/2，两圈挨太近时同一根手指会同时落进两条
+     * 命中带），又要尽量小 —— 这个值直接决定双层要把半径撑开多少（弦长 = 2R·sin(步长/2)，一圈 8 枚
+     * 时步长只有 10°，每多要 1px 空隙，半径就要多 5.7px）。
+     */
+    const val FAN_RING_GAP_PX = 26f
+
     // ---- aiming ring (SlideGestureItemView) ----
     val RING_INTERPOLATOR = pi(0.33f, 0.0f, 0.66f, 1.0f)  // f10833m :25
     const val RING_DURATION = 130L                        // :174 / :192

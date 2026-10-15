@@ -7,52 +7,28 @@ import org.junit.Test
 
 class FanPaginationTest {
 
+    /**
+     * 跑的是**生产实现**（[FanPagination.pages]）。
+     *
+     * 这份测试以前自带一份镜像实现，生产代码改了它不会跟着改 —— 加分层容量时正好撞上：容量从
+     * 「maxApps 个应用 + 更多」变成「[FanLayout.tilesPerPage]」，镜像那份就会悄悄继续绿着。
+     */
     private fun paginate(
         pinnedCount: Int,
         recommendCount: Int,
         maxApps: Int,
         autoFillRecommend: Boolean,
+        layers: Int = FanLayout.LAYERS_SINGLE,
     ): List<List<String>> {
         val pinned = (1..pinnedCount).map { "pinned_$it" }
         val rec = (1..recommendCount).map { "rec_$it" }
-        val pages = ArrayList<List<String>>()
-
-        if (pinned.isEmpty() && rec.isEmpty()) {
-            return listOf(listOf("More"))
-        }
-
-        if (pinned.isEmpty()) {
-            var idx = 0
-            while (idx < rec.size) {
-                val chunk = rec.subList(idx, minOf(idx + maxApps, rec.size))
-                pages.add(chunk + "More")
-                idx += maxApps
-            }
-            return pages
-        }
-
-        if (!autoFillRecommend && pinned.size <= maxApps) {
-            pages.add(pinned + "More")
-            var rIdx = 0
-            while (rIdx < rec.size) {
-                val chunk = rec.subList(rIdx, minOf(rIdx + maxApps, rec.size))
-                pages.add(chunk + "More")
-                rIdx += maxApps
-            }
-            return pages
-        }
-
-        val pool = ArrayList<String>()
-        pool.addAll(pinned)
-        pool.addAll(rec)
-
-        var idx = 0
-        while (idx < pool.size) {
-            val chunk = pool.subList(idx, minOf(idx + maxApps, pool.size))
-            pages.add(chunk + "More")
-            idx += maxApps
-        }
-        return pages
+        return FanPagination.pages(
+            pinned = pinned,
+            recommended = rec,
+            capacity = FanLayout.tilesPerPage(maxApps, layers),
+            autoFillRecommend = autoFillRecommend,
+            more = { "More" },
+        )
     }
 
     @Test
@@ -88,6 +64,45 @@ class FanPaginationTest {
         assertEquals(listOf("pinned_1", "pinned_2", "rec_1", "rec_2", "rec_3", "More"), pages[0])
         // Page 1 has rec 4..7 + More
         assertEquals(listOf("rec_4", "rec_5", "rec_6", "rec_7", "More"), pages[1])
+    }
+
+    @Test
+    fun testEmptyPinnedAndRecommendations() {
+        // 什么都没有时也要留一页「更多」—— 它是唯一的出口
+        val pages = FanPagination.pages(
+            pinned = emptyList<String>(),
+            recommended = emptyList(),
+            capacity = FanLayout.tilesPerPage(5, FanLayout.LAYERS_DOUBLE),
+            autoFillRecommend = false,
+            more = { "More" },
+        )
+        assertEquals(listOf(listOf("More")), pages)
+    }
+
+    @Test
+    fun testDoubleLayerFitsMoreAppsPerPage() {
+        // 内层 5 应用 + 外层 7 应用 = 12 应用 + 更多 = 13 枚 tile 一页
+        val pages = paginate(pinnedCount = 12, recommendCount = 8, maxApps = 5, autoFillRecommend = false, layers = FanLayout.LAYERS_DOUBLE)
+        // 20 个应用原来要 4 页（每页 5 个），双层后只要 2 页
+        assertEquals(2, pages.size)
+        assertEquals(
+            (1..12).map { "pinned_$it" } + "More",
+            pages[0],
+        )
+        // 第 2 页：8 个推荐 + 更多
+        assertEquals((1..8).map { "rec_$it" } + "More", pages[1])
+    }
+
+    @Test
+    fun testDoubleLayerPageSplitsOuterFirst() {
+        // 满页 13 枚 tile：前 [FanLayout.outerApps] 枚给外圈，剩下给内圈（含「更多」）。
+        val pages = paginate(pinnedCount = 20, recommendCount = 0, maxApps = 5, autoFillRecommend = true, layers = FanLayout.LAYERS_DOUBLE)
+        assertEquals(13, pages[0].size)
+        assertEquals(7, FanLayout.outerSplit(pages[0].size, 5, FanLayout.LAYERS_DOUBLE))
+        assertEquals("More", pages[0].last())
+        // 12 枚应用：外圈 7 枚 = pinned_1..7，内圈 5 枚 + 更多 = pinned_8..12
+        assertEquals((1..7).map { "pinned_$it" }, pages[0].take(7))
+        assertEquals((8..12).map { "pinned_$it" } + "More", pages[0].drop(7))
     }
 
     @Test

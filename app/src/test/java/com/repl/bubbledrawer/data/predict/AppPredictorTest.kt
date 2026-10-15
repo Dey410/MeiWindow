@@ -141,25 +141,21 @@ class AppPredictorTest {
     }
 
     @Test
-    fun testRecommendCountSnapping() {
-        val steps = RemotePrefs.RECOMMEND_COUNT_STEP
-        val min = RemotePrefs.RECOMMEND_COUNT_MIN
-        val max = RemotePrefs.RECOMMEND_COUNT_MAX
+    fun testRecommendCountIsManualInput() {
+        // 用户 2026-10-14：4–20 的档位滑块改成手输，默认 12、上限 50（面板里超过 20 的默认折叠）。
+        assertEquals(12, RemotePrefs.DEFAULT_RECOMMEND_COUNT)
+        assertEquals(4, RemotePrefs.RECOMMEND_COUNT_MIN)
+        assertEquals(50, RemotePrefs.RECOMMEND_COUNT_MAX)
 
-        fun snap(value: Int): Int {
-            val raw = value.coerceIn(min, max)
-            return (((raw - min + (steps / 2)) / steps) * steps + min).coerceIn(min, max)
-        }
+        // 手输：范围内的值原样保留 —— 不再吸附到 4 的倍数（7 就是 7，不是 8）。
+        assertEquals(7, RemotePrefs.clampRecommendCount(7))
+        assertEquals(13, RemotePrefs.clampRecommendCount(13))
+        assertEquals(37, RemotePrefs.clampRecommendCount(37))
 
-        assertEquals(4, snap(4))
-        assertEquals(4, snap(5))
-        assertEquals(8, snap(6))
-        assertEquals(8, snap(8))
-        assertEquals(12, snap(10))
-        assertEquals(12, snap(12))
-        assertEquals(16, snap(15))
-        assertEquals(20, snap(19))
-        assertEquals(20, snap(20))
-        assertEquals(20, snap(25))
+        // 越界只钳位，不报错（弹窗那边还有一道「确认置灰」，这里是最后一道）
+        assertEquals(4, RemotePrefs.clampRecommendCount(0))
+        assertEquals(4, RemotePrefs.clampRecommendCount(-3))
+        assertEquals(50, RemotePrefs.clampRecommendCount(51))
+        assertEquals(50, RemotePrefs.clampRecommendCount(999))
     }
 }

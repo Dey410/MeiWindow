@@ -22,6 +22,9 @@ interface SettingsActions {
     fun setPanelTextSp(sp: Int)
     fun setPanelDismissOutside(mode: Int)
     fun setFanIconCount(count: Int)
+
+    /** 扇形层数：1 = 单层，2 = 双层（内层 = 图标数量 + 更多，外层比内层多 2 个应用）。 */
+    fun setFanLayers(layers: Int)
     fun setFanRadiusDp(dp: Int)
     fun setFanShowVibrate(enabled: Boolean)
     fun setFanAutoRetractSec(sec: Int)
@@ -83,6 +86,7 @@ class StoreSettingsActions(private val context: Context) : SettingsActions {
     override fun setPanelTextSp(sp: Int) = SettingsStore.setPanelTextSp(context, sp)
     override fun setPanelDismissOutside(mode: Int) = SettingsStore.setPanelDismissOutside(context, mode)
     override fun setFanIconCount(count: Int) = SettingsStore.setFanIconCount(context, count)
+    override fun setFanLayers(layers: Int) = SettingsStore.setFanLayers(context, layers)
     override fun setFanRadiusDp(dp: Int) = SettingsStore.setFanRadiusDp(context, dp)
     override fun setFanShowVibrate(enabled: Boolean) = SettingsStore.setFanShowVibrate(context, enabled)
     override fun setFanAutoRetractSec(sec: Int) = SettingsStore.setFanAutoRetractSec(context, sec)

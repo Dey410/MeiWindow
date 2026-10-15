@@ -86,6 +86,18 @@ object RemotePrefs {
     const val KEY_FAN_ICON_COUNT = "fan_icon_count"
     const val DEFAULT_FAN_ICON_COUNT = 6
 
+    /**
+     * 扇形层数：1 = 单层（原样），2 = 双层。
+     *
+     * 双层时 [KEY_FAN_ICON_COUNT] 是**内层**的应用数：内层再带一枚「更多」，外层比内层多 2 个应用
+     * （内层 5 应用 → 外层 7 应用），外层没有「更多」入口。规则与几何见
+     * [com.repl.bubbledrawer.bubble.FanLayout]。
+     */
+    const val KEY_FAN_LAYERS = "fan_layers"
+    const val DEFAULT_FAN_LAYERS = 1
+    const val FAN_LAYERS_SINGLE = 1
+    const val FAN_LAYERS_DOUBLE = 2
+
     /** 展开扇形半径（dp） */
     const val KEY_FAN_RADIUS_DP = "fan_radius_dp"
     const val DEFAULT_FAN_RADIUS_DP = 260
@@ -183,14 +195,28 @@ object RemotePrefs {
     /** 上一次会话的结果（[com.repl.bubbledrawer.bubble.PressureCalibration.Outcome]）。 */
     const val KEY_FAN_PRESSURE_CALIBRATION_OUTCOME = "fan_pressure_calibration_outcome"
 
-    /** 更多面板推荐应用开关与显示数量（4个为一组，最多20个） */
+    /**
+     * 更多面板推荐应用开关与显示数量。
+     *
+     * 原来是 4–20 的档位滑块（4/8/12/16/20），用户 2026-10-14 要求「开放为用户手动输入」：现在任意
+     * 整数都收，默认 [DEFAULT_RECOMMEND_COUNT]，范围 [RECOMMEND_COUNT_MIN]–[RECOMMEND_COUNT_MAX]。
+     * 面板里一次最多铺 20 个（`pin/Sections.kt` 的 `VISIBLE_MAX`），其余折在「展开」后面 —— 所以上限
+     * 可以比 20 大。
+     */
     const val KEY_RECOMMEND_ENABLED = "recommend_enabled"
     const val KEY_RECOMMEND_COUNT = "recommend_count"
     const val DEFAULT_RECOMMEND_ENABLED = true
-    const val DEFAULT_RECOMMEND_COUNT = 8
+    const val DEFAULT_RECOMMEND_COUNT = 12
     const val RECOMMEND_COUNT_MIN = 4
-    const val RECOMMEND_COUNT_MAX = 20
-    const val RECOMMEND_COUNT_STEP = 4
+    const val RECOMMEND_COUNT_MAX = 50
+
+    /**
+     * 推荐数量的唯一收口：**只钳位，不吸附档位**。
+     *
+     * 抽成函数是为了让「手输了 7 就该是 7」这条规则可测 —— 读取（[read]）、写入
+     * （`SettingsStore.setRecommendCount`）两边各写一遍 `coerceIn` 迟早会分叉。
+     */
+    fun clampRecommendCount(value: Int): Int = value.coerceIn(RECOMMEND_COUNT_MIN, RECOMMEND_COUNT_MAX)
     /** 实验性：Flyme 样式轻量小窗设置 */
     const val KEY_FLYME_FREEFORM_ENABLED = "flyme_freeform_enabled"
     const val KEY_FLYME_FREEFORM_CENTER = "flyme_freeform_center"
@@ -303,6 +329,8 @@ object RemotePrefs {
         val panelDismissOutside: Int = DEFAULT_PANEL_DISMISS_OUTSIDE,
         /** 扇形面板应用图标数量（5 或 6） */
         val fanIconCount: Int = DEFAULT_FAN_ICON_COUNT,
+        /** 扇形层数：1 = 单层，2 = 双层（见 [KEY_FAN_LAYERS]） */
+        val fanLayers: Int = DEFAULT_FAN_LAYERS,
         /** 展开扇形半径（dp） */
         val fanRadiusDp: Int = DEFAULT_FAN_RADIUS_DP,
         /** 扇形滑出时振动 */
@@ -329,7 +357,7 @@ object RemotePrefs {
         val fanPressureCalibrationLastDelta: Float = 0f,
         val fanPressureCalibrationLastValid: Boolean = false,
         val fanPressureCalibrationOutcome: Int = com.repl.bubbledrawer.bubble.PressureCalibration.Outcome.NONE,
-        /** 推荐应用开关与显示数量（4, 8, 12, 16, 20） */
+        /** 推荐应用开关与显示数量（4–50，默认 12） */
         val recommendEnabled: Boolean = DEFAULT_RECOMMEND_ENABLED,
         val recommendCount: Int = DEFAULT_RECOMMEND_COUNT,
         /** 实验性：Flyme 样式轻量小窗设置 */
@@ -403,9 +431,8 @@ object RemotePrefs {
             return Snapshot(false, false, false, DEFAULT_RANGE_DP, DEFAULT_RANGE_DP, DEFAULT_RANGE_DP, false, "")
         }
         val range = sp.getInt(KEY_RANGE_DP, DEFAULT_RANGE_DP).coerceIn(MIN_DP, MAX_DP)
-        val rawRecCount = sp.getInt(KEY_RECOMMEND_COUNT, DEFAULT_RECOMMEND_COUNT).coerceIn(RECOMMEND_COUNT_MIN, RECOMMEND_COUNT_MAX)
-        val snappedRecCount = (((rawRecCount - RECOMMEND_COUNT_MIN + (RECOMMEND_COUNT_STEP / 2)) / RECOMMEND_COUNT_STEP) * RECOMMEND_COUNT_STEP + RECOMMEND_COUNT_MIN)
-            .coerceIn(RECOMMEND_COUNT_MIN, RECOMMEND_COUNT_MAX)
+        // 手输的整数直接收（不再吸附到 4 的倍数）：越界只钳位，档位由用户自己给。
+        val recommendCount = clampRecommendCount(sp.getInt(KEY_RECOMMEND_COUNT, DEFAULT_RECOMMEND_COUNT))
         return Snapshot(
             enabled = sp.getBoolean(KEY_ENABLED, DEFAULT_ENABLED),
             left = sp.getBoolean(KEY_LEFT, DEFAULT_LEFT),
@@ -422,6 +449,7 @@ object RemotePrefs {
             panelTextSp = sp.getInt(KEY_PANEL_TEXT_SP, DEFAULT_PANEL_TEXT_SP).let { if (it <= 0) DEFAULT_PANEL_TEXT_SP else it.coerceIn(PANEL_TEXT_MIN, PANEL_TEXT_MAX) },
             panelDismissOutside = sp.getInt(KEY_PANEL_DISMISS_OUTSIDE, DEFAULT_PANEL_DISMISS_OUTSIDE).coerceIn(0, 1),
             fanIconCount = sp.getInt(KEY_FAN_ICON_COUNT, DEFAULT_FAN_ICON_COUNT).coerceIn(5, 6),
+            fanLayers = sp.getInt(KEY_FAN_LAYERS, DEFAULT_FAN_LAYERS).coerceIn(FAN_LAYERS_SINGLE, FAN_LAYERS_DOUBLE),
             fanRadiusDp = sp.getInt(KEY_FAN_RADIUS_DP, DEFAULT_FAN_RADIUS_DP).let { if (it <= 0) DEFAULT_FAN_RADIUS_DP else it.coerceIn(FAN_RADIUS_MIN, FAN_RADIUS_MAX) },
             fanShowVibrate = sp.getBoolean(KEY_FAN_SHOW_VIBRATE, DEFAULT_FAN_SHOW_VIBRATE),
             fanAutoRetractSec = sp.getInt(KEY_FAN_AUTO_RETRACT_SEC, DEFAULT_FAN_AUTO_RETRACT_SEC)
@@ -453,7 +481,7 @@ object RemotePrefs {
                 com.repl.bubbledrawer.bubble.PressureCalibration.Outcome.UNSUPPORTED,
             ),
             recommendEnabled = sp.getBoolean(KEY_RECOMMEND_ENABLED, DEFAULT_RECOMMEND_ENABLED),
-            recommendCount = snappedRecCount,
+            recommendCount = recommendCount,
             flymeFreeformEnabled = sp.getBoolean(KEY_FLYME_FREEFORM_ENABLED, DEFAULT_FLYME_FREEFORM_ENABLED),
             flymeFreeformCenter = sp.getBoolean(KEY_FLYME_FREEFORM_CENTER, DEFAULT_FLYME_FREEFORM_CENTER),
             flymeFreeformVerticalPct = sp.getInt(KEY_FLYME_FREEFORM_VERTICAL_PCT, DEFAULT_FLYME_FREEFORM_VERTICAL_PCT)

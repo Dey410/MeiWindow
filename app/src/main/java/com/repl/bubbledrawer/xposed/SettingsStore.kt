@@ -111,6 +111,10 @@ object SettingsStore {
     /** 扇形面板应用图标数量（5 或 6）。 */
     fun setFanIconCount(context: Context, count: Int) = putInt(context, RemotePrefs.KEY_FAN_ICON_COUNT, count.coerceIn(5, 6))
 
+    /** 扇形层数（1 = 单层，2 = 双层）。 */
+    fun setFanLayers(context: Context, layers: Int) =
+        putInt(context, RemotePrefs.KEY_FAN_LAYERS, layers.coerceIn(RemotePrefs.FAN_LAYERS_SINGLE, RemotePrefs.FAN_LAYERS_DOUBLE))
+
     /** 展开扇形半径（dp）。 */
     fun setFanRadiusDp(context: Context, dp: Int) = putInt(context, RemotePrefs.KEY_FAN_RADIUS_DP, dp.coerceIn(RemotePrefs.FAN_RADIUS_MIN, RemotePrefs.FAN_RADIUS_MAX))
 
@@ -292,18 +296,14 @@ object SettingsStore {
         }
     }
 
-    /** 更多面板推荐应用开关与数量（4, 8, 12, 16, 20）。 */
+    /** 更多面板推荐应用开关与数量（4–50，默认 12；手输，不再吸附档位）。 */
     fun setRecommendEnabled(context: Context, enabled: Boolean) {
         RemoteBridge.local(context).edit().putBoolean(RemotePrefs.KEY_RECOMMEND_ENABLED, enabled).apply()
         RemoteBridge.remote?.edit()?.putBoolean(RemotePrefs.KEY_RECOMMEND_ENABLED, enabled)?.apply()
     }
 
-    fun setRecommendCount(context: Context, count: Int) {
-        val raw = count.coerceIn(RemotePrefs.RECOMMEND_COUNT_MIN, RemotePrefs.RECOMMEND_COUNT_MAX)
-        val snapped = (((raw - RemotePrefs.RECOMMEND_COUNT_MIN + (RemotePrefs.RECOMMEND_COUNT_STEP / 2)) / RemotePrefs.RECOMMEND_COUNT_STEP) * RemotePrefs.RECOMMEND_COUNT_STEP + RemotePrefs.RECOMMEND_COUNT_MIN)
-            .coerceIn(RemotePrefs.RECOMMEND_COUNT_MIN, RemotePrefs.RECOMMEND_COUNT_MAX)
-        putInt(context, RemotePrefs.KEY_RECOMMEND_COUNT, snapped)
-    }
+    fun setRecommendCount(context: Context, count: Int) =
+        putInt(context, RemotePrefs.KEY_RECOMMEND_COUNT, RemotePrefs.clampRecommendCount(count))
 
     /** 实验性：Flyme 样式轻量小窗设置 */
     fun setFlymeFreeformEnabled(context: Context, enabled: Boolean) =

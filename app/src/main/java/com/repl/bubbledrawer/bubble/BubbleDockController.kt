@@ -146,6 +146,10 @@ class BubbleDockController(
         private set
     private var pages: List<List<GestureAppLauncher.AdapterItem>> = emptyList()
 
+    /** 这一轮 [show] 用的图标数量与层数 —— 翻页时要按同一套规则给每一页算圈（见 [adapterFor]）。 */
+    private var pageIconCount = 6
+    private var pageLayers = FanLayout.LAYERS_SINGLE
+
     fun resetPage() {
         currentPage = 0
     }
@@ -153,28 +157,39 @@ class BubbleDockController(
     fun nextPage(): Boolean {
         if (pages.size <= 1) return false
         currentPage = (currentPage + 1) % pages.size
-        val items = pages[currentPage]
-        launcher.switchToAdapter(
-            GestureAppLauncher.SlideAdapter(items) { item, index ->
-                viewFactory?.create(item, index) ?: itemView(item)
-            },
-            animated = true,
-        )
+        launcher.switchToAdapter(adapterFor(pages[currentPage]), animated = true)
         return true
     }
 
+    /**
+     * 一页的 adapter：item 顺序就是 [FanPagination] 给的顺序，**外圈占前几枚**由
+     * [FanLayout.outerSplit] 现算 —— 满页时是 `iconCount + 2`，末页装不满时退回单圈。
+     */
+    private fun adapterFor(items: List<GestureAppLauncher.AdapterItem>): GestureAppLauncher.SlideAdapter =
+        GestureAppLauncher.SlideAdapter(
+            items = items,
+            outerSplit = FanLayout.outerSplit(items.size, pageIconCount, pageLayers),
+        ) { item, index -> viewFactory?.create(item, index) ?: itemView(item) }
+
     /** @param screenH full-screen height in px (the launcher window is MATCH_PARENT). */
-    fun show(corner: Corner, screenW: Int, screenH: Int, maxApps: Int = 6, radiusDp: Int = 0, autoFillRecommend: Boolean = false) {
+    fun show(
+        corner: Corner,
+        screenW: Int,
+        screenH: Int,
+        maxApps: Int = 6,
+        radiusDp: Int = 0,
+        autoFillRecommend: Boolean = false,
+        layers: Int = FanLayout.LAYERS_SINGLE,
+    ) {
         currentPage = 0
-        pages = buildPages(maxApps, autoFillRecommend)
+        pageIconCount = maxApps
+        pageLayers = layers
+        pages = buildPages(maxApps, autoFillRecommend, layers)
         totalPages = pages.size
         val items = pages.firstOrNull() ?: listOf(GestureAppLauncher.AdapterItem.More)
         val side = if (corner == Corner.BOTTOM_RIGHT || corner == Corner.SIDE_RIGHT) 1 else 0
-        launcher.setAdapter(
-            GestureAppLauncher.SlideAdapter(items) { item, index ->
-                viewFactory?.create(item, index) ?: itemView(item)
-            },
-        )
+        launcher.setAdapter(adapterFor(items))
+        launcher.setFanLayers(layers)
         launcher.setLayoutSide(side)
         val navbar = hasNavBar()
         val defaultRadius = context.resources.getDimension(
@@ -207,9 +222,17 @@ class BubbleDockController(
      * Sequences:
      * 1. Pinned apps, then pinned functions (快捷方式)
      * 2. Recommended apps
-     * Wraps each batch of [maxApps] items with a trailing "更多" tile.
+     *
+     * 切页与容量本身在 [FanPagination]（纯函数、有单测）；这里只负责取数。
+     *
+     * 容量随层数变：单层 = [maxApps] 个应用 + 「更多」；双层 = 内层 `maxApps` + 外层
+     * `maxApps + 2`（外层没有「更多」），见 [FanLayout.tilesPerPage]。
      */
-    fun buildPages(maxApps: Int, autoFillRecommend: Boolean): List<List<GestureAppLauncher.AdapterItem>> {
+    fun buildPages(
+        maxApps: Int,
+        autoFillRecommend: Boolean,
+        layers: Int = FanLayout.LAYERS_SINGLE,
+    ): List<List<GestureAppLauncher.AdapterItem>> {
         val all = repo.cachedAll()
         val pinnedApps = ArrayList<com.repl.bubbledrawer.pinyin.BubbleApp>()
         val pinnedKeys = HashSet<String>()
@@ -228,53 +251,19 @@ class BubbleDockController(
         pinnedApps.forEach { pinned.add(GestureAppLauncher.AdapterItem.AppItem(it)) }
         pinnedFunctions.forEach { pinned.add(GestureAppLauncher.AdapterItem.FunctionItem(it)) }
 
-        val recCount = maxOf(15, maxApps * 3)
+        val capacity = FanLayout.tilesPerPage(maxApps, layers)
+        val recCount = maxOf(15, capacity * 3)
         val recommendations = com.repl.bubbledrawer.data.predict.AppPredictor.getRecommendations(
             context, all, pinnedKeys, recCount,
         )
 
-        val resultPages = ArrayList<List<GestureAppLauncher.AdapterItem>>()
-
-        if (pinned.isEmpty() && recommendations.isEmpty()) {
-            resultPages.add(listOf(GestureAppLauncher.AdapterItem.More))
-            return resultPages
-        }
-
-        if (pinned.isEmpty()) {
-            var idx = 0
-            while (idx < recommendations.size) {
-                val chunk = recommendations.subList(idx, minOf(idx + maxApps, recommendations.size))
-                resultPages.add(chunk.map { GestureAppLauncher.AdapterItem.AppItem(it) } + GestureAppLauncher.AdapterItem.More)
-                idx += maxApps
-            }
-            return resultPages
-        }
-
-        if (!autoFillRecommend && pinned.size <= maxApps) {
-            // First page contains only the pinned items without filling
-            resultPages.add(pinned + GestureAppLauncher.AdapterItem.More)
-            // Subsequent pages contain recommendations
-            var rIdx = 0
-            while (rIdx < recommendations.size) {
-                val chunk = recommendations.subList(rIdx, minOf(rIdx + maxApps, recommendations.size))
-                resultPages.add(chunk.map { GestureAppLauncher.AdapterItem.AppItem(it) } + GestureAppLauncher.AdapterItem.More)
-                rIdx += maxApps
-            }
-            return resultPages
-        }
-
-        // Pinned items + recommendations combined pool
-        val pool = ArrayList<GestureAppLauncher.AdapterItem>(pinned.size + recommendations.size)
-        pool.addAll(pinned)
-        recommendations.forEach { pool.add(GestureAppLauncher.AdapterItem.AppItem(it)) }
-
-        var idx = 0
-        while (idx < pool.size) {
-            val chunk = pool.subList(idx, minOf(idx + maxApps, pool.size))
-            resultPages.add(chunk + GestureAppLauncher.AdapterItem.More)
-            idx += maxApps
-        }
-        return resultPages
+        return FanPagination.pages(
+            pinned = pinned,
+            recommended = recommendations.map { GestureAppLauncher.AdapterItem.AppItem(it) },
+            capacity = capacity,
+            autoFillRecommend = autoFillRecommend,
+            more = { GestureAppLauncher.AdapterItem.More },
+        )
     }
 
     /** Inflates the verbatim port of slide_gesture_list_item.xml. */

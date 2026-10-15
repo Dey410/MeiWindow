@@ -9,7 +9,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.repl.bubbledrawer.R
+import com.repl.bubbledrawer.bubble.FanLayout
 import com.repl.bubbledrawer.ui.component.CardItem
+import com.repl.bubbledrawer.ui.component.IntInputRow
 import com.repl.bubbledrawer.ui.component.StatusCard
 import com.repl.bubbledrawer.ui.component.groupedCardItems
 import com.repl.bubbledrawer.ui.util.BlurredBar
@@ -335,9 +337,36 @@ fun FanSettingsScreen(
             groupedCardItems(
                 keyPrefix = "fan",
                 items = buildList {
+                    add(CardItem("layers") {
+                        DropdownRow(
+                            title = stringResource(R.string.fan_layers),
+                            summary = stringResource(R.string.fan_layers_summary),
+                            items = listOf(
+                                stringResource(R.string.fan_layers_single),
+                                stringResource(R.string.fan_layers_double),
+                            ),
+                            selectedIndex = if (snap.fanLayers == RemotePrefs.FAN_LAYERS_DOUBLE) 1 else 0,
+                            onSelect = {
+                                actions.setFanLayers(
+                                    if (it == 1) RemotePrefs.FAN_LAYERS_DOUBLE else RemotePrefs.FAN_LAYERS_SINGLE,
+                                )
+                            },
+                        )
+                    })
                     add(CardItem("icon_count") {
                         DropdownRow(
                             title = stringResource(R.string.fan_icon_count),
+                            // 双层时这一项管的是内层：把外层会跟着变成几个直接写在描述里，
+                            // 否则「内层 5 个」看不出整页到底放得下多少。
+                            summary = if (snap.fanLayers == RemotePrefs.FAN_LAYERS_DOUBLE) {
+                                stringResource(
+                                    R.string.fan_icon_count_summary_double,
+                                    snap.fanIconCount,
+                                    FanLayout.outerApps(snap.fanIconCount, snap.fanLayers),
+                                )
+                            } else {
+                                null
+                            },
                             items = listOf(
                                 stringResource(R.string.fan_icon_count_5),
                                 stringResource(R.string.fan_icon_count_6),
@@ -606,12 +635,12 @@ fun MorePanelSettingsScreen(
                         )
                     })
                     add(CardItem("count") {
-                        StepIntSliderRow(
+                        IntInputRow(
                             title = stringResource(R.string.recommend_apps_count),
+                            summary = stringResource(R.string.recommend_apps_count_summary),
                             value = snap.recommendCount,
                             min = RemotePrefs.RECOMMEND_COUNT_MIN,
                             max = RemotePrefs.RECOMMEND_COUNT_MAX,
-                            step = RemotePrefs.RECOMMEND_COUNT_STEP,
                             enabled = snap.recommendEnabled,
                             valueText = { stringResource(R.string.recommend_apps_count_format, it) },
                             onCommit = actions::setRecommendCount,

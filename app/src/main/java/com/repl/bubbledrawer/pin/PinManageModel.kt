@@ -30,7 +30,7 @@ class PinManageModel(
     private val pinsOf: () -> List<PinnedRef>,
     /** Persisted on drag end / unpin. */
     private val onOrderChange: (List<PinnedRef>) -> Unit,
-    private val recommendConfig: () -> Pair<Boolean, Int> = { true to 8 },
+    private val recommendConfig: () -> Pair<Boolean, Int> = { true to com.repl.bubbledrawer.xposed.RemotePrefs.DEFAULT_RECOMMEND_COUNT },
     private val loadRecommendations: (suspend (List<BubbleApp>, Set<String>, Int) -> List<BubbleApp>)? = null,
     /**
      * 分身角标开关（[com.repl.bubbledrawer.xposed.RemotePrefs.KEY_CLONE_BADGE]）—— 由宿主读设置后传进来：
@@ -178,6 +178,31 @@ class PinManageModel(
     /** false = view mode (tap launches); true = edit mode (tap pins, long-press drags). */
     var manageMode: Boolean by mutableStateOf(false)
         private set
+
+    /**
+     * 分区折叠状态（见 [Sections.visible]）：某一区超过 [Sections.VISIBLE_MAX] 个时默认只铺 20 个，
+     * 点那一枚「展开全部」才全放出来。**不放进 [cells]**：折叠只是显示层的事，改它不该重跑推荐。
+     *
+     * 存在 model 上而不是 composable 的 `remember` 里：面板里切一次 Tab（应用 ↔ 功能）整棵内容树
+     * 会重建，状态挂在内容上就会被重置回折叠态。
+     */
+    var pinsExpanded: Boolean by mutableStateOf(false)
+        private set
+
+    var recommendExpanded: Boolean by mutableStateOf(false)
+        private set
+
+    fun togglePinsExpanded() {
+        pinsExpanded = !pinsExpanded
+    }
+
+    fun toggleRecommendExpanded() {
+        recommendExpanded = !recommendExpanded
+    }
+
+    /** 按当前折叠状态铺到界面上的 cell 列表（搜索不经过这里，搜索结果不折叠）。 */
+    val visibleCells: List<Cell>
+        get() = Sections.visible(cells, pinsExpanded, recommendExpanded)
 
     var cells: List<Cell> by mutableStateOf(emptyList())
         private set
