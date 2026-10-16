@@ -122,12 +122,13 @@ object FanLayout {
      * **设置就是半径本身，谁也不许把它悄悄改掉**：
      *  - 单层：那一圈 = [innerRadiusPx]；
      *  - 双层：**内圈 = [innerRadiusPx]**；外圈 = [outerRadiusPx]（用户单独指定，**比内圈小时按内圈算**），
-     *    没指定（null）时自动 = `max(内圈 + 一圈图标 + 间隙, 外圈自己的弦长下限)`。
+     *    没指定（null）时自动 = 内圈 + 一圈图标 + 径向间隙 —— 内圈怎么缩放，外圈就跟着缩放。
      *
      * 旧写法把「这一圈自己的弦长要求」也算进用户设置里（`max(设置, 弦长, 内圈弦长 + 间隙)`），
      * 后果是双层时半径被钉死在 284dp 一带：设置从 180 拖到 284 完全没反应，只有 284→360 那一小段
-     * 有变化 —— 那正是「根本控制不了半径」。弦长从此只用来决定**自动**外圈要撑到哪，挤不挤由用户
-     * 自己调（单层一直就是这个规矩）。
+     * 有变化 —— 那正是「根本控制不了半径」。弦长从此不再参与（用户 2026-10-16 第二轮：
+     * 「即使不启用单独条件，外圈半径也要跟随内圈缩放，不是完全不动」—— 弦长下限会让外圈在小半径
+     * 区间原地不动）；挤不挤由用户自己调，单层一直就是这个规矩。
      *
      * @param innerRadiusPx 用户设置的半径 = 内圈（单层时就是唯一那一圈）。
      * @param outerRadiusPx 外圈半径（用户单独设定）；null = 自动跟着内圈走。
@@ -160,8 +161,8 @@ object FanLayout {
         val wantedOuter = outerRadiusPx?.takeIf { it > 0f }
             // 用户单独设的：**不小于内圈**（比内圈小的自动回到内圈半径，用户 2026-10-16 的规则）。
             ?.let { max(it, innerRadiusPx) }
-            // 自动：内圈 + 一圈图标 + 径向间隙（两圈刚好不叠），再和"外圈自己不挤"的弦长下限取大。
-            ?: max(innerRadiusPx + need, chordRadius(need, stepOuter))
+            // 自动：内圈 + 一圈图标 + 径向间隙 —— 内圈缩放多少，外圈就跟着缩放多少。
+            ?: (innerRadiusPx + need)
         val outer = wantedOuter.coerceAtMost(maxRadiusPx)
         // 内圈就是用户设的那个；只有外圈被屏幕夹到它里面去时才跟着降下来 —— 两圈不能颠倒，
         // 但**也不替用户维持间距**：他把外圈拉得贴着内圈，就照他说的那样贴着（命中带会略微重叠，
@@ -176,11 +177,5 @@ object FanLayout {
     fun stepDeg(tiles: Int, safeDegrees: Int): Float {
         if (tiles <= 0) return 0f
         return if (safeDegrees == 0) 90f / (tiles + 1) else (90f - safeDegrees * 2f) / tiles
-    }
-
-    /** 弦长 [chordPx] 对应多大的半径（相邻圆心距 = 2R·sin(步长/2)）。 */
-    fun chordRadius(chordPx: Float, stepDeg: Float): Float {
-        if (stepDeg <= 0f) return chordPx
-        return chordPx / (2f * sin(Math.toRadians(stepDeg / 2.0)).toFloat())
     }
 }

@@ -159,25 +159,33 @@ class FanLayersTest {
         assertTrue(rings[2][0].radiusPx > rings[1][0].radiusPx)
     }
     @Test
+    fun theAutomaticOuterRingFollowsTheInnerEverywhere() {
+        // 自动外圈 = 内圈 + 一圈图标 + 间隙，**整条滑条上都成立**。
+        //
+        // 用户 2026-10-16 第二轮：「即使不启用单独条件，外圈半径也要跟随内圈缩放，不是完全不动」——
+        // 中间那版给自动外圈留了一条"外圈自己的弦长下限"（862px），于是内圈在 180–213dp 之间拖动时
+        // 外圈原地不动。弦长下限因此整个删掉：跟着设置缩放比"理想间距"重要。
+        //
+        // 上限只到 300dp：再往右是屏幕装不下（`maxRadius` 夹外圈），间距会被吃掉，那是物理限制。
+        for (dp in listOf(180, 200, 232, 260, 300)) {
+            val inner = dp * 3.25f
+            val rings = doubleRings(innerPx = inner)
+            assertEquals("inner=$dp", inner, rings[1].radiusPx, 0.001f)
+            assertEquals("inner=$dp", icon + gap, rings[0].radiusPx - rings[1].radiusPx, 0.5f)
+        }
+        // 内圈怎么缩放，外圈就跟着缩放
+        assertTrue(doubleRings(innerPx = 200f * 3.25f)[0].radiusPx < doubleRings(innerPx = 260f * 3.25f)[0].radiusPx)
+    }
+
+    @Test
     fun theAutomaticOuterRingSitsOneIconOutsideTheInner() {
         val rings = doubleRings()
         val outer = rings[0]
         val inner = rings[1]
-        // 自动外圈 = max(内圈 + 图标 + 间隙, 外圈自己的弦长下限)：默认这一档是前者，正好空出一格。
+        // 默认这一档：外圈 = 内圈 + 一格
         assertEquals(icon + gap, outer.radiusPx - inner.radiusPx, 0.5f)
         // 内圈不许被"自动撑开"顶走 —— 它必须还是用户设的那个数。
         assertEquals(base, inner.radiusPx, 0.001f)
-    }
-
-    @Test
-    fun theAutomaticOuterRingStillRespectsItsOwnChordFloor() {
-        // 内圈拉到最小（180dp）：`内圈 + 一格` 只剩 754px，而 7 枚外圈自己就要 862px 才不挤 ——
-        // 这时按弦长下限来（旧的"自动撑开"只剩这一条，且不再改用户的半径）。
-        val small = 180f * 3.25f
-        val rings = doubleRings(innerPx = small)
-        assertEquals(small, rings[1].radiusPx, 0.001f)
-        assertEquals(FanLayout.chordRadius(icon + gap, rings[0].stepDeg), rings[0].radiusPx, 0.5f)
-        assertTrue(rings[0].radiusPx - rings[1].radiusPx > icon + gap)
     }
 
     @Test
@@ -234,14 +242,5 @@ class FanLayersTest {
         assertEquals((90f - 6f) / 7f, rings[1].stepDeg, 0.001f)
         // safeDegrees 下第一枚不在 0°：内圈第一枚 = 半格 + safe
         assertEquals(rings[1].stepDeg * 0.5f + 3f, rings[1].angleOf(0, 3), 0.001f)
-    }
-
-    @Test
-    fun chordRadiusIsTheInverseOfTheChordFormula() {
-        val step = 90f / 7f
-        val r = FanLayout.chordRadius(180f, step)
-        assertEquals(180f, 2f * r * kotlin.math.sin(Math.toRadians(step / 2.0)).toFloat(), 0.01f)
-        // 步长退化时不除零
-        assertEquals(180f, FanLayout.chordRadius(180f, 0f), 0.001f)
     }
 }

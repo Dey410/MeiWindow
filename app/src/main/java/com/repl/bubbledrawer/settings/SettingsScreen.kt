@@ -337,6 +337,9 @@ fun FanSettingsScreen(
             groupedCardItems(
                 keyPrefix = "fan",
                 items = buildList {
+                    // 双层才谈得上"内圈 / 外圈"：单层时下面与外圈有关的两项一律**置灰**
+                    // （藏起来会让人以为功能没做，用户 2026-10-16）。
+                    val isDoubleLayer = snap.fanLayers == RemotePrefs.FAN_LAYERS_DOUBLE
                     add(CardItem("layers") {
                         DropdownRow(
                             title = stringResource(R.string.fan_layers),
@@ -358,7 +361,7 @@ fun FanSettingsScreen(
                             title = stringResource(R.string.fan_icon_count),
                             // 双层时这一项管的是内层：把外层会跟着变成几个直接写在描述里，
                             // 否则「内层 5 个」看不出整页到底放得下多少。
-                            summary = if (snap.fanLayers == RemotePrefs.FAN_LAYERS_DOUBLE) {
+                            summary = if (isDoubleLayer) {
                                 stringResource(
                                     R.string.fan_icon_count_summary_double,
                                     snap.fanIconCount,
@@ -380,7 +383,7 @@ fun FanSettingsScreen(
                             title = stringResource(R.string.fan_radius),
                             // 双层时这一项是**内圈**半径（用户 2026-10-16 起）：外圈要么跟在内圈外面一格，
                             // 要么由下面那个开关单独设定 —— 不写清楚会让人以为"半径没生效"。
-                            summary = if (snap.fanLayers == RemotePrefs.FAN_LAYERS_DOUBLE) {
+                            summary = if (isDoubleLayer) {
                                 stringResource(R.string.fan_radius_summary_double)
                             } else {
                                 null
@@ -398,25 +401,27 @@ fun FanSettingsScreen(
                             title = stringResource(R.string.fan_outer_radius_enabled),
                             summary = stringResource(R.string.fan_outer_radius_enabled_summary),
                             checked = snap.fanOuterRadiusEnabled,
+                            // 单层没有"外圈"这回事：**置灰**而不是藏起来 —— 藏起来会让人以为这个功能
+                            // 没做（用户 2026-10-16）。
+                            enabled = isDoubleLayer,
                             onCheckedChange = actions::setFanOuterRadiusEnabled,
                         )
                     })
-                    // 滑条只在双层且开关打开时出现：单层没有"外圈"这回事，露出来只会让人以为它坏了。
-                    // 下限就是**内圈半径** —— 滑到更小时滑条自己就停在那一格（用户 2026-10-16 的规则）。
-                    if (snap.fanOuterRadiusEnabled && snap.fanLayers == RemotePrefs.FAN_LAYERS_DOUBLE) {
-                        add(CardItem("outer_radius") {
-                            DefaultableIntSliderRow(
-                                title = stringResource(R.string.fan_outer_radius),
-                                summary = stringResource(R.string.fan_outer_radius_summary),
-                                value = snap.fanOuterRadiusDp,
-                                defaultValue = RemotePrefs.DEFAULT_FAN_OUTER_RADIUS_DP,
-                                min = maxOf(RemotePrefsFanRadiusMin, snap.fanRadiusDp),
-                                max = RemotePrefsFanRadiusMax,
-                                valueText = { stringResource(R.string.dp_value, it) },
-                                onCommit = actions::setFanOuterRadiusDp,
-                            )
-                        })
-                    }
+                    // 滑条同样常驻、置灰：开关没开（或单层）时它不生效，但位置固定，不会让下面的行跳来跳去。
+                    // 下限就是**内圈半径** —— 滑到更小时滑条自己停在那一格（用户 2026-10-16 的规则）。
+                    add(CardItem("outer_radius") {
+                        DefaultableIntSliderRow(
+                            title = stringResource(R.string.fan_outer_radius),
+                            summary = stringResource(R.string.fan_outer_radius_summary),
+                            value = snap.fanOuterRadiusDp,
+                            defaultValue = RemotePrefs.DEFAULT_FAN_OUTER_RADIUS_DP,
+                            min = maxOf(RemotePrefsFanRadiusMin, snap.fanRadiusDp),
+                            max = RemotePrefsFanRadiusMax,
+                            enabled = isDoubleLayer && snap.fanOuterRadiusEnabled,
+                            valueText = { stringResource(R.string.dp_value, it) },
+                            onCommit = actions::setFanOuterRadiusDp,
+                        )
+                    })
                     add(CardItem("show_vibrate") {
                         SwitchRow(
                             title = stringResource(R.string.fan_show_vibrate),
