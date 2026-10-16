@@ -89,7 +89,8 @@ E:\Android\Sdk\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app
 **数据来源与 HyperOS 的关键差异**：头像/标题取自**通知**（Flyme 原版同样如此），但 HyperOS
 在应用被打开时会清掉该应用的全部通知（任意方式打开，包括小窗）。因此模块把通知当"发现渠道"：
 每条聊天通知都会写入一份**会话记忆**（标题 / 头像 / 点击意图 / 最近时间），通知被清掉后仍然保留
-—— 否则小窗一出现列表就空了。记忆上限：每应用 12 条、总计 60 条、12 小时未再出现则过期。
+—— 否则小窗一出现列表就空了。记忆按**会话**归档（主键 `包名|会话名`，见 A19）而不是按通知标题：
+每应用 20 条、总计 60 条、12 小时未再出现则过期。
 
 - [ ] 先让微信来消息（通知栏有微信通知）→ 再把微信以小窗打开 → 小窗**正下方**浮出「头像 + 名称」条
       （名称 = 通知标题；日志 `CONTACT_BAR_DATA pkg=com.tencent.mm items=N live=0 remembered=N`：
@@ -98,11 +99,16 @@ E:\Android\Sdk\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app
 - [ ] **圆角与小窗一致**（ROM 的 `getCornerRadius()`；日志里 `CONTACT_BAR_GEOM` 可对照），不是胶囊形
 - [ ] **实时拉伸小窗**：拖右下角改尺寸时，条宽逐帧跟随，不出现错位/滞后（日志
       `CONTACT_BAR_GEOM … visual=… bar=… animating=true`，`bar` 的 width 始终 == `visual` 的 width）；
-      变宽后能多显示几个头像
+      窗口变宽/变窄只影响条本身（头像不再按宽度增减，见下一条）
+- [ ] **左右滑动**（用户 2026-10-16：「联系人条无法左右滑动」）：会话比条宽时整行可以横着拖（Flyme
+      的原版就是水平 `RecyclerView`），松手带惯性；会话少时头像**居中**；横滑**不会**把头像划掉
+      （日志里不出现 `CONTACT_BAR_FORGET`），竖滑仍然是移除
+- [ ] 条上的头像数 = 该应用的会话数（最多 20，Flyme 的上限），不再只画撑得下的 6 个
 - [ ] **尺寸阈值**：设置页滑块（默认 60%，= 小窗宽度须达到屏幕宽度的 60%）—— 把小窗拖到比阈值更窄 → 条消失（`CONTACT_BAR_HIDE reason=TOO_SMALL`）；
       拖回来 → 条回来；滑到 0 → 不再按尺寸隐藏
-- [ ] **上滑/下拉头像 → 移除该联系人**（`CONTACT_BAR_FORGET pkg=… title=…`）；移除最后一个后整条消失
-      （`CONTACT_BAR_HIDE reason=EMPTY_AFTER_REMOVE`）；该会话来了**新消息**后应重新出现
+- [ ] **上滑/下拉头像 → 移除该联系人**（`CONTACT_BAR_FORGET pkg=… label=… title=…`）；移除最后一个后整条消失
+      （`CONTACT_BAR_HIDE reason=EMPTY_AFTER_REMOVE`）；该会话来了**新消息**后应重新出现。
+      斜着划（先竖后横、手势被横滑抢走 → `ACTION_CANCEL`）只复原、**不删人**
 - [ ] 小窗**移动**（拖顶部把手）时条跟着走
 - [ ] **两个小窗并存**：操作另一个小窗 → 条消失（`CONTACT_BAR_HIDE reason=UNFOCUSED` /
       `CONTACT_BAR_LOST_FOCUS` 或 `CONTACT_BAR_FOCUS_SWITCH`）；**点回微信小窗 → 条回来**
@@ -478,8 +484,23 @@ Telegram 的聊天通知不带大图标，只认 `getLargeIcon` 的话条上只�
 - [ ] 1:1 会话显示对方的名字（标题里没有分隔符 → 整个标题就是会话名）
 - [ ] 日志 `CONTACT_BAR_LIST pkg=… n=N live=M 会话名* | …`（`*` = 还在通知栏里）；
       合并发生时有 `CONTACT_BAR_MERGED pkg=… notifications=3 conversations=2 keep=…`
-- [ ] 划掉一条 → 该会话的其它标题也一起消失（`forget` 按 `conversationName` 扫），不会立刻回来
-- [ ] 新消息到达后（更晚的 `postTime`）能重新出现
+- [ ] 划掉一条 → 该会话整条消失（`CONTACT_BAR_FORGET pkg=… label=会话名 title=…`），不会立刻回来；
+      同一个会话换了标题（`(3条新消息)`）也不算新消息，来了**更晚的 postTime** 才回来
+
+### 第二种形状：QQ 的未读数后缀（用户 2026-10-16）
+现象（用户反馈 + 设备 `CONTACT_BAR_LIST` 原样，注意同一个会话占了三行）：
+`通信12301潘宇锋 | 电院23级年级群 | 通信12301潘宇锋(2条新消息) | 通信12301潘宇锋(3条新消息) | …` ——
+QQ 把未读数挂在标题**末尾**，每来一条消息它就变，于是记忆里、条上各占好几条
+（45dp 的名字列全截成「通信123…」，看上去仍是"重复的联系人"）。
+
+做法：会话名的规范化 `normalizeConversationName()` 剪掉末尾的 `(N条新消息)`
+（全角/半角括号、`[]`／`【】` 都认；括号里没有「条新消息」的群名照旧不动），
+`conversationTitle` / `EXTRA_CONVERSATION_TITLE` / 标题前半段**三个来源都过一遍**；
+并且 `remembered`/`forgotten` 的主键从**通知标题**改成**会话名**（`包名|会话名`）——
+一个会话一条记忆，划掉就是划掉，不会因为下一条消息换了个标题就复活。
+
+- [ ] QQ 会话的标题带未读数（`…(2条新消息)`）时只占**一条**（`CONTACT_BAR_LIST` 里再看不到 `(N条新消息)`）
+- [ ] 划掉它 → 下一条消息（标题变成 `(3条新消息)`）**不会**立刻把它摆回来（要更新的 `postTime`）
 
 白名单里补了 Telegram（`org.telegram.messenger`）：它发的就是标准 MessagingStyle 聊天通知，群消息标题
 正是 `群名：发送者` —— 也就是这条反馈的形状，而模块作者日常只用它（不在白名单里，这个功能在本机上

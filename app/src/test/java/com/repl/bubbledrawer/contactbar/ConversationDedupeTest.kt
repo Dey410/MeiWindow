@@ -107,6 +107,49 @@ class ConversationDedupeTest {
         assertEquals(listOf("新会话", "中间", "老会话"), dedupeByConversation(items).map { it.title })
     }
 
+    // ------------------------------------------------------- 未读数不是会话名的一部分（QQ）
+
+    @Test
+    fun theUnreadCountQqHangsOffTheTitleIsNotPartOfTheName() {
+        // **用户 2026-10-16 的复现**：`CONTACT_BAR_LIST` 里同一个 QQ 会话占了三行 ——
+        // `通信12301潘宇锋 | … | 通信12301潘宇锋(2条新消息) | 通信12301潘宇锋(3条新消息)`。
+        assertEquals("通信12301潘宇锋", conversationName("通信12301潘宇锋(2条新消息)"))
+        assertEquals("通信12301潘宇锋", conversationName("通信12301潘宇锋(3条新消息)"))
+        // 括号的几种写法都可能出现（QQ 版本 / ROM 不同），数字位数也不固定。
+        assertEquals("通信12301潘宇锋", conversationName("通信12301潘宇锋（12条新消息）"))
+        assertEquals("通信12301潘宇锋", conversationName("通信12301潘宇锋[2条新消息]"))
+        assertEquals("通信12301潘宇锋", conversationName("通信12301潘宇锋【2条新消息】"))
+        // 后缀跟着发送者（`群名：发送者(2条新消息)`）时也要去掉（取前半段之后再去一次）。
+        assertEquals("群名", conversationName("群名：发送者(2条新消息)"))
+        // 反向：后缀夹在分隔符之前（`群名(2条新消息)：发送者`）。
+        assertEquals("群名", conversationName("群名(2条新消息)：发送者"))
+    }
+
+    @Test
+    fun aTitleThatOnlyLooksLikeAnUnreadCountIsLeftAlone() {
+        // 括号里没有「条新消息」的都不是未读数 —— 群名自带括号很常见，别误伤。
+        assertEquals("电院23级(2023)", conversationName("电院23级(2023)"))
+        assertEquals("奶茶群(2个)", conversationName("奶茶群(2个)"))
+        assertEquals("版本(2条消息)", conversationName("版本(2条消息)"))
+        // 整个标题就是后缀时不能剪成空名字（条上宁可显示这串东西，也不能没有名字）。
+        assertEquals("(2条新消息)", normalizeConversationName("(2条新消息)"))
+    }
+
+    @Test
+    fun theSameQqChatCountedThreeTimesIsOneEntry() {
+        // 设备日志的三条（同一会话，未读数不同）→ 一条，显示去掉后缀的会话名。
+        val items = listOf(
+            conversationFromTitle("通信12301潘宇锋(3条新消息)", postTime = 30),
+            conversationFromTitle("通信12301潘宇锋(2条新消息)", postTime = 20),
+            conversationFromTitle("通信12301潘宇锋", postTime = 10),
+        )
+
+        val kept = dedupeByConversation(items)
+        assertEquals("同一个会话只能占一条", 1, kept.size)
+        assertEquals("通信12301潘宇锋", kept[0].displayLabel)
+        assertEquals("留下的应该是最新的那条", "通信12301潘宇锋(3条新消息)", kept[0].title)
+    }
+
     // ------------------------------------------------------------------ 通知事件的过滤
 
     @Test
@@ -123,6 +166,7 @@ class ConversationDedupeTest {
 
     // ------------------------------------------------------------------ helpers
 
+    /** 通知里的那条会话（[label] 就是 `Conversation` 构造时的会话名）。 */
     private fun conversation(
         title: String,
         label: String?,
@@ -138,4 +182,11 @@ class ConversationDedupeTest {
         live = live,
         label = label,
     )
+
+    /**
+     * 生产里 `toConversation` 的算法：会话名 = [conversationName]（MessagingStyle /
+     * `EXTRA_CONVERSATION_TITLE` 拿不到时的退路，QQ 与 Telegram 都走这一条）。
+     */
+    private fun conversationFromTitle(title: String, postTime: Long, live: Boolean = false) =
+        conversation(title, label = conversationName(title), postTime = postTime, live = live)
 }

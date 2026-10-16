@@ -12,6 +12,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -32,12 +33,34 @@ import kotlin.math.abs
  * Gestures mirror `ContactListView`'s `ItemTouchHelper` (`C2929d`): a vertical swipe on an avatar
  * removes that conversation from the bar. Flyme removes the row and calls the store's remove; here the
  * controller forgets the conversation (see [ContactBarController.onRemoveConversation]).
+ *
+ * 整条**可以左右滑动**，因为 Flyme 的原版就是：`ContactListView extends RecyclerView`
+ * （`out/SystemUITools_src/sources/com/flyme/systemuitools/windowmode/widget/ContactListView.java:29`）
+ * 配一个方向 0（水平）的 `LinearLayoutManager`（`setOrientation`，:535-548）—— 会话比窗口宽时列表自己
+ * 滚。移植的第一版把行直接放进 `FrameLayout`、按条宽截断（只画撑得下的 6 个），
+ * 用户 2026-10-16 的反馈正是「联系人条无法左右滑动」。
  */
 class ContactBarView(context: Context) : FrameLayout(context) {
 
     private val row = LinearLayout(context).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER
+    }
+
+    /**
+     * 滑动容器。Flyme 那边是水平 `RecyclerView`，这里用 `HorizontalScrollView` 包同一个 `LinearLayout`
+     * 行 —— 行为一样，不用背上 adapter 那一套（行里的 View 本来就是复用着 bind 的）。
+     *
+     * `isFillViewport` 是**居中**的关键：内容比视口窄时它会把行撑到视口宽，行的 `gravity=CENTER` 再把
+     * 头像居中（Flyme 也居中 —— `ContactListView.m9677t` 里那串 `f10647z` / `getPaddingParent()`
+     * 算的就是"内容没占满时两侧各留多少"）。
+     */
+    private val scroll = HorizontalScrollView(context).apply {
+        isHorizontalScrollBarEnabled = false
+        // 63dp 的浮条被 MIUI 的拉伸回弹（over-scroll）拉一下就像"整条坏掉"—— 宁可没有回弹。
+        overScrollMode = OVER_SCROLL_NEVER
+        isFillViewport = true
+        addView(row, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
     }
 
     /** 36dp avatar, 45dp-wide name, 8dp padding per item — Flyme's `notification_list_item.xml`. */
@@ -58,8 +81,8 @@ class ContactBarView(context: Context) : FrameLayout(context) {
         background = backgroundDrawable
         clipToPadding = false
         addView(
-            row,
-            LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.CENTER),
+            scroll,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT, Gravity.CENTER),
         )
     }
 
@@ -90,17 +113,19 @@ class ContactBarView(context: Context) : FrameLayout(context) {
         backgroundDrawable.cornerRadius = radiusPx ?: dp(DEFAULT_CORNER_DP).toFloat()
     }
 
-    /** [maxCount] is what fits inside the window width; the rest stays for the next resize. */
+    /**
+     * 把 [items] 全部铺进行里，超出条宽的部分靠左右滑动看到 —— 不再按宽度截断（第一版只画撑得下的
+     * 6 个，用户 2026-10-16：「联系人条无法左右滑动」）。条数上限在数据层
+     * （`RecentConversations.MAX_ITEMS` = Flyme 的 20）。
+     */
     fun bind(
         items: List<Conversation>,
-        maxCount: Int,
         fallback: Drawable?,
         onClick: (Conversation) -> Unit,
         onRemove: (Conversation) -> Unit,
     ) {
-        val shown = items.take(maxCount.coerceAtLeast(1))
-        while (row.childCount > shown.size) row.removeViewAt(row.childCount - 1)
-        shown.forEachIndexed { index, conversation ->
+        while (row.childCount > items.size) row.removeViewAt(row.childCount - 1)
+        items.forEachIndexed { index, conversation ->
             val item = row.getChildAt(index) ?: newItem().also { row.addView(it) }
             bindItem(item, conversation, fallback, onClick, onRemove)
         }
@@ -175,11 +200,16 @@ class ContactBarView(context: Context) : FrameLayout(context) {
                 }
 
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    val cancelled = event.actionMasked == MotionEvent.ACTION_CANCEL
                     item.animate().scaleX(1f).scaleY(1f).setDuration(110).start()
                     val dy = event.rawY - downY
                     val dx = event.rawX - downX
                     val quick = event.eventTime - downAt
                     when {
+                        // CANCEL = 手势被上层拿走了（条的左右滑动、窗口拖动…）—— 只复原，绝不当成移除：
+                        // 斜着划一下（先竖后横）会先满足"竖向拖动"，随后被 ScrollView 抢走手势，
+                        // 那时若按 dy 判定就会把这个人**划掉**。
+                        cancelled -> item.animate().translationY(0f).alpha(1f).setDuration(120).start()
                         dragging && abs(dy) >= removeThreshold -> flyOut(dy > 0)
                         dragging -> item.animate().translationY(0f).alpha(1f).setDuration(120).start()
                         // A plain tap: the touch stream is ours, so the click is decided here.
@@ -274,14 +304,6 @@ class ContactBarView(context: Context) : FrameLayout(context) {
         }
     }
 
-    /** How many items fit in [widthPx], so a resize drag never clips a half avatar. */
-    fun capacityFor(widthPx: Int): Int {
-        val itemWidth = avatarSize + itemPadding * 2
-        val usable = widthPx - paddingLeft - paddingRight
-        if (usable <= itemWidth) return 1
-        return (usable / itemWidth).coerceIn(1, MAX_ITEMS)
-    }
-
     fun setPaddingDp(horizontal: Int, vertical: Int) {
         setPadding(dp(horizontal), dp(vertical), dp(horizontal), dp(vertical))
     }
@@ -306,9 +328,6 @@ class ContactBarView(context: Context) : FrameLayout(context) {
     }
 
     private companion object {
-        /** Flyme caps the list at 20 but only a handful fit a portrait window. */
-        const val MAX_ITEMS = 6
-
         /** Fallback when the ROM does not report a window radius (user-measured ≈13dp). */
         const val DEFAULT_CORNER_DP = 13
 

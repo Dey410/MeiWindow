@@ -56,6 +56,10 @@ data class Conversation(
      * 人是后半段；条上按会话名去重、按会话名显示。
      *
      * 拿不到（没有 MessagingStyle，标题里也没有分隔符）时退回 [title]。
+     *
+     * 它同时是记忆里的**主键**（`RecentConversations` 的 `remembered`/`forgotten`）：一个会话一条，
+     * 而不是一条通知一条 —— QQ 会把未读数挂在标题末尾（`通信12301潘宇锋(2条新消息)`），
+     * 按标题归档就是一个会话好几条（见 [normalizeConversationName]）。
      */
     val label: String? = null,
 ) {
@@ -98,6 +102,14 @@ data class Conversation(
  * itself. The bar shows the merge — live first, remembered after — and [TTL_MS] plus the per-app cap
  * keep a stale chat from living forever. Consequence worth knowing: swiping a notification away no
  * longer removes an avatar (Flyme's rule); only time and the caps do.
+ *
+ * ## 记忆的主键是**会话名**，不是通知标题（2026-10-16）
+ *
+ * 一个会话可能有好几条标题不同的通知：Telegram 的群里两个人说话是 `群名：甲` / `群名：乙`，
+ * QQ 则把未读数挂在标题末尾（`通信12301潘宇锋(2条新消息)`）。按标题归档就会**一个会话好几条记忆**
+ * —— 条上是几个一样的头像（名字列只有 45dp，全截成同一个前缀），每个应用的配额也被吃掉。
+ * 所以 `remembered`/`forgotten` 的键是 `包名|会话名`（[conversationId]），会话名由
+ * [normalizeConversationName] 把那些**会变的东西**剪掉（未读数）、[conversationName] 再剪掉发送者。
  */
 class RecentConversations(
     private val context: Context,
@@ -114,8 +126,15 @@ class RecentConversations(
 
     /** Conversation memory that survives MIUI's "opening the app clears its notifications". */
     private class Remembered(
+        /**
+         * `包名|会话名` —— 记忆的**主键**，一个会话一条。不是通知标题：同一个会话的通知标题会变
+         * （群里的不同发送者、QQ 的 `(2条新消息)`），按标题存就会一个会话攒出好几条记忆
+         * （条上是几个一样的头像，而且把每个应用 20 条的配额吃掉）。
+         */
+        val id: String,
         val pkg: String,
-        val title: String,
+        /** 最近一条通知的**原始标题**（诊断与无障碍用；未读数后缀一变它就跟着变，所以不做身份）。 */
+        var title: String,
         var key: String?,
         var icon: Drawable?,
         var pendingIntent: PendingIntent?,
@@ -124,7 +143,7 @@ class RecentConversations(
         var postTime: Long,
         var lastSeenAt: Long,
         /** 条上显示的名字（见 [Conversation.label]）：会话名，群消息就是群名。 */
-        var label: String? = null,
+        var label: String,
     )
 
     private val remembered = HashMap<String, Remembered>()
@@ -172,9 +191,12 @@ class RecentConversations(
             if (conv.pkg != pkg || isForgotten(conv)) continue
             // One avatar per conversation: a chat that re-posts (or a summary line) keeps the
             // newest notification only — Flyme keeps a per-key bucket with the same effect.
-            // (同一个会话的几条通知在 [dedupeByConversation] 里再合成一条。）
-            val previous = live[conv.title]
-            if (previous == null || conv.postTime >= previous.postTime) live[conv.title] = conv.copy(live = true)
+            // 键是**会话名**而不是通知标题：同一个会话的几条通知标题不同（群里的两个人、
+            // QQ 的 `(2条新消息)`），按标题存就是几条并排站着（[dedupeByConversation] 只是兜底）。
+            val previous = live[conv.displayLabel]
+            if (previous == null || conv.postTime >= previous.postTime) {
+                live[conv.displayLabel] = conv.copy(live = true)
+            }
         }
         lastLiveCount = live.size
         prune(now)
@@ -209,35 +231,28 @@ class RecentConversations(
      */
     fun forget(conversation: Conversation) {
         val now = android.os.SystemClock.elapsedRealtime()
-        // 条上那一条代表**一个会话**（见 [dedupeByConversation]），而记忆是按标题存的：同一个群的几条
-        // 通知标题不同（`群名：发送者`）。所以划掉时要连这个会话的所有标题一起划掉，
-        // 否则下一次重建会把同一个群从另一条消息里再摆回来。
-        val label = conversation.displayLabel
-        val sameConversation = remembered.values.filter { record ->
-            record.title == conversation.title || conversationName(record.title) == label
-        }
-        val targets = sameConversation.ifEmpty { null }
-            ?.map { it.title to it.postTime }
-            ?: listOf(conversation.title to conversation.postTime)
-        targets.forEach { (title, postTime) ->
-            val entry = key(conversation.pkg, title)
-            remembered.remove(entry)
-            forgotten[entry] = Forgotten(postTime, now)
-        }
+        // 条上那一条代表**一个会话**（见 [dedupeByConversation]），记忆也是按会话存的 —— 所以划掉就是
+        // 划掉这一个会话。以前按通知标题扫（记忆是按标题存的），扫不到的那些标题
+        // （QQ 的 `(4条新消息)` 还没出现过）照样能把同一个会话从另一条消息里摆回来。
+        val id = conversationId(conversation.pkg, conversation.displayLabel)
+        val postTime = remembered[id]?.postTime ?: conversation.postTime
+        remembered.remove(id)
+        forgotten[id] = Forgotten(postTime, now)
         cachedPkg = null
         log(
             Log.INFO,
-            "CONTACT_BAR_FORGET pkg=${conversation.pkg} title=${conversation.title} " +
-                "entries=${targets.size}",
+            "CONTACT_BAR_FORGET pkg=${conversation.pkg} label=${conversation.displayLabel} " +
+                "title=${conversation.title}",
             null,
         )
     }
 
     private fun isForgotten(conv: Conversation): Boolean {
-        val entry = forgotten[key(conv.pkg, conv.title)] ?: return false
+        val id = conversationId(conv.pkg, conv.displayLabel)
+        val entry = forgotten[id] ?: return false
         // A newer notification means the chat has something to say again.
         if (conv.postTime > entry.postTime) {
-            forgotten.remove(key(conv.pkg, conv.title))
+            forgotten.remove(id)
             return false
         }
         return true
@@ -260,15 +275,17 @@ class RecentConversations(
 
     private fun remember(conv: Conversation, now: Long) {
         if (isForgotten(conv)) return
-        val record = remembered.getOrPut(key(conv.pkg, conv.title)) {
-            Remembered(conv.pkg, conv.title, null, null, null, null, conv.userId, 0L, now)
+        val id = conversationId(conv.pkg, conv.displayLabel)
+        val record = remembered.getOrPut(id) {
+            Remembered(id, conv.pkg, conv.title, null, null, null, null, conv.userId, 0L, now, conv.displayLabel)
         }
         if (conv.icon != null) record.icon = conv.icon
         if (conv.pendingIntent != null) record.pendingIntent = conv.pendingIntent
         if (conv.launchIntent != null) record.launchIntent = conv.launchIntent
         record.userId = conv.userId
         record.key = conv.key
-        record.label = conv.label ?: record.label
+        record.title = conv.title
+        record.label = conv.displayLabel
         record.postTime = maxOf(record.postTime, conv.postTime)
         record.lastSeenAt = now
     }
@@ -278,7 +295,7 @@ class RecentConversations(
         val merged = LinkedHashMap<String, Conversation>()
         for (record in remembered.values) {
             if (record.pkg != pkg) continue
-            merged[record.title] = Conversation(
+            merged[record.id] = Conversation(
                 pkg = record.pkg,
                 key = record.key.orEmpty(),
                 title = record.title,
@@ -324,17 +341,18 @@ class RecentConversations(
             if (list.size > MAX_REMEMBERED_PER_APP) {
                 list.sortedByDescending { it.lastSeenAt }
                     .drop(MAX_REMEMBERED_PER_APP)
-                    .forEach { remembered.remove(key(it.pkg, it.title)) }
+                    .forEach { remembered.remove(it.id) }
             }
         }
         if (remembered.size <= MAX_REMEMBERED_TOTAL) return
         remembered.values
             .sortedByDescending { it.lastSeenAt }
             .drop(MAX_REMEMBERED_TOTAL)
-            .forEach { remembered.remove(key(it.pkg, it.title)) }
+            .forEach { remembered.remove(it.id) }
     }
 
-    private fun key(pkg: String, title: String) = "$pkg|$title"
+    /** 记忆的主键：`包名|会话名`。同一个会话的几条通知（标题各不同）落在同一格。 */
+    private fun conversationId(pkg: String, label: String) = "$pkg|$label"
 
     /**
      * `Notification.MessagingStyle.extractMessagingStyleFromNotification(Notification)` —— **@hide**，
@@ -377,11 +395,13 @@ class RecentConversations(
         // **这是哪个会话**（条上的身份与名字）：MessagingStyle 的 `conversationTitle` 是权威答案
         // （群名；1:1 会话为 null）。没有它就看 `EXTRA_CONVERSATION_TITLE`（@hide，用字面量），
         // 再不行才从标题的 `群名：发送者` 里取前半段 —— 用户 2026-10-12 的裁定「群通知应该用群名啊」。
-        val label = runCatching { style?.conversationTitle?.toString()?.trim() }
-            .getOrNull()?.takeIf { it.isNotEmpty() }
+        // 三个来源都过一遍 [normalizeConversationName]：QQ 的未读数后缀可能挂在标题上，
+        // 也可能挂在会话名字段里（设备日志里它是从标题进来的，但没必要赌这一点）。
+        val label = runCatching { style?.conversationTitle?.toString() }
+            .getOrNull()?.let(::normalizeConversationName)?.takeIf { it.isNotEmpty() }
             ?: runCatching {
-                n.extras?.getCharSequence(EXTRA_CONVERSATION_TITLE)?.toString()?.trim()
-            }.getOrNull()?.takeIf { it.isNotEmpty() }
+                n.extras?.getCharSequence(EXTRA_CONVERSATION_TITLE)?.toString()
+            }.getOrNull()?.let(::normalizeConversationName)?.takeIf { it.isNotEmpty() }
             ?: conversationName(title)
 
         if (!cachedIcons.containsKey(key)) {
@@ -487,8 +507,11 @@ class RecentConversations(
         /** How long a swiped-away conversation stays away even if no new notification arrives. */
         private const val FORGET_TTL_MS = 60 * 60 * 1000L
 
-        /** Memory bounds: the bar shows at most 6 avatars, so 12 per app / 60 overall is plenty. */
-        private const val MAX_REMEMBERED_PER_APP = 12
+        /**
+         * Memory bounds. Flyme caps its list at 20 (`C2763k.java:405`) and the bar shows the same 20
+         * (`MAX_ITEMS`) —— 条现在能左右滑动，所以每个应用真的可能有 20 条要显示。
+         */
+        private const val MAX_REMEMBERED_PER_APP = 20
         private const val MAX_REMEMBERED_TOTAL = 60
 
         /** 头像副本/指纹的上限（超出时只留还有记忆引用的那些），见 [prune]。 */
@@ -828,8 +851,13 @@ fun imPackageOfKey(key: String): String? =
  *    条上显示群名（用户 2026-10-12 的裁定「群通知应该用群名啊」；他复现的
  *    `YuKongA | Chat：Perlinkca` 与 `YuKongA | Chat：Yife Playte` 就是同一个群里的两个人，
  *    名字列只有 45dp，两条都截成 `YuKongA | Chat`，看起来像两条重复的联系人）；
+ *  - QQ 把未读数挂在标题末尾（`通信12301潘宇锋(2条新消息)`，用户 2026-10-16 的复现）→
+ *    [normalizeConversationName] 剪掉之后同一个会话名 → 合成一条；
  *  - 同一个人在两个群里说话 = 两个会话名 → 两条，各显示自己的群名；
  *  - 被合并掉的标题不是丢了：划掉这一条会连它一起划掉（见 `RecentConversations.forget`）。
+ *
+ * 记忆已经按会话名归档（见 `RecentConversations` 的类注释），这里是最后一道兜底：任何两条显示名字
+ * 相同的记录都只留一条。
  */
 fun dedupeByConversation(items: List<Conversation>): List<Conversation> {
     val sorted = items.sortedWith(
@@ -847,6 +875,7 @@ fun dedupeByConversation(items: List<Conversation>): List<Conversation> {
 /**
  * 标题里**会话名**的那一半：`群名：发送者` → `群名`（群通知的标题形状，设备日志实例：
  * `StarVoyager Ideal：ksm`、`YuKongA | Chat：Perlinkca`）。没有分隔符时就是标题本身（1:1 会话）。
+ * 两边都过一遍 [normalizeConversationName]（未读数后缀可能在整个标题末尾，也可能在前半段末尾）。
  *
  * 只在 `MessagingStyle.conversationTitle` 与 `EXTRA_CONVERSATION_TITLE` 都拿不到时才走这里 ——
  * 那两个是权威答案，这个只是退路。
@@ -855,8 +884,29 @@ fun conversationName(title: String): String {
     for (separator in listOf('：', ':')) {
         val index = title.indexOf(separator)
         if (index <= 0) continue
-        val name = title.substring(0, index).trim()
+        val name = normalizeConversationName(title.substring(0, index))
         if (name.isNotEmpty()) return name
     }
-    return title
+    return normalizeConversationName(title)
+}
+
+/**
+ * QQ 挂在标题末尾的未读数：`通信12301潘宇锋(2条新消息)`（**用户 2026-10-16 的复现**，
+ * `CONTACT_BAR_LIST` 里原样三行同一个人：
+ * `通信12301潘宇锋 | … | 通信12301潘宇锋(2条新消息) | 通信12301潘宇锋(3条新消息) | …`）。
+ *
+ * 它随每条新消息变化，于是**同一个会话**在记忆里、在条上各占好几条 —— 而名字列只有 45dp，
+ * 几条都截成「通信123…」，看上去就是"重复的联系人"（2026-10-12 那次是 Telegram 的
+ * `群名：发送者`，形状不同，病根一样：把**会变的东西**当成了身份）。
+ */
+private val UNREAD_COUNT_SUFFIX = Regex("[（(\\[【]\\s*\\d+\\s*条新消息\\s*[）)\\]】]\\s*$")
+
+/**
+ * 会话名的规范化：去掉末尾那些"每来一条消息就变"的装饰（[UNREAD_COUNT_SUFFIX]）。纯算术，见
+ * `ConversationDedupeTest`。全去掉会变空（标题本身就是这串装饰）时退回原样，绝不返回空串。
+ */
+fun normalizeConversationName(raw: String): String {
+    val trimmed = raw.trim()
+    val stripped = UNREAD_COUNT_SUFFIX.replace(trimmed, "").trim()
+    return stripped.ifEmpty { trimmed }
 }

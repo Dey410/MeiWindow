@@ -95,7 +95,6 @@ class ContactBarController(
     private var idleMode = false
     private var hideReason: String? = null
     private var fastUntil = 0L
-    private var capacityShown = 0
     private var cornerShown = Float.NaN
 
     /** While set, the bar stays hidden: the window is closing, so it must not ride the animation. */
@@ -489,9 +488,8 @@ class ContactBarController(
 
     private fun attach(info: Any, rect: Rect) {
         val v = ensureView()
-        capacityShown = v.capacityFor(rect.width())
         applyCorner(v, info)
-        v.bind(items, capacityShown, fallbackIcon(), ::openConversation, ::onRemoveConversation)
+        v.bind(items, fallbackIcon(), ::openConversation, ::onRemoveConversation)
         val shownType = runCatching {
             wm.addView(v, params(rect, barWindowType))
             barWindowType
@@ -523,12 +521,8 @@ class ContactBarController(
         runCatching { wm.updateViewLayout(v, params(rect, attachedType, attachedTrusted)) }
             .onFailure { logger(Log.WARN, "CONTACT_BAR_UPDATE_FAILED", it) }
         applyCorner(v, info)
-        // A wider window fits more avatars — re-bind so a resize changes the visible set too.
-        val capacity = v.capacityFor(rect.width())
-        if (capacity != capacityShown) {
-            capacityShown = capacity
-            v.bind(items, capacity, fallbackIcon(), ::openConversation, ::onRemoveConversation)
-        }
+        // 以前这里还要"宽度变了就按新容量重绑一次"（宽了多显示几个）。条改成可左右滑动之后，
+        // 哪些头像可见由手势决定，窗口变化只影响窗口本身 —— [attach] 时绑的那份列表继续用。
     }
 
     /**
@@ -638,8 +632,7 @@ class ContactBarController(
         lastDataReason = null
         items = list
         val v = view ?: return@onMain
-        val rect = lastRect ?: return@onMain
-        v.bind(items, v.capacityFor(rect.width()), fallbackIcon(), ::openConversation, ::onRemoveConversation)
+        v.bind(items, fallbackIcon(), ::openConversation, ::onRemoveConversation)
         log(
             Log.INFO,
             "CONTACT_BAR_DATA pkg=$pkg items=${items.size} live=${recent.lastLiveCount} " +
@@ -662,9 +655,7 @@ class ContactBarController(
             return
         }
         val v = view ?: return
-        val rect = lastRect ?: return
-        capacityShown = v.capacityFor(rect.width())
-        v.bind(items, capacityShown, fallbackIcon(), ::openConversation, ::onRemoveConversation)
+        v.bind(items, fallbackIcon(), ::openConversation, ::onRemoveConversation)
     }
 
     /** Flyme falls back to the app icon when a notification carries no avatar. */
