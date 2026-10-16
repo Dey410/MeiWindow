@@ -94,6 +94,12 @@ class GestureAppLauncher @JvmOverloads constructor(
     /** 图标数量设置（[setFanLayout]）：算双层半径时要按"满页"算，所以要它。 */
     private var fanIconCount = 6
 
+    /**
+     * 外圈半径（px，用户单独设定；≤ 0 = 自动）。见 [FanLayout.rings]：双层时 [radius] 是**内圈**，
+     * 外圈要么由这一项指定，要么自动 = 内圈 + 一圈图标 + 径向间隙。
+     */
+    private var outerRadius = 0f
+
     // ---------------- adapter (C2937F "SlideGestureAdapter" analog) ----------------
 
     sealed class AdapterItem {
@@ -245,7 +251,18 @@ class GestureAppLauncher @JvmOverloads constructor(
 
     fun setRadiusPx(px: Float) {
         radius = px                                             // setRadius :878-880
-        // 半径变了要重摆：双层的内圈半径是从外圈推出来的。
+        // 半径变了要重摆：双层时它是内圈，外圈的自动值也跟着变。
+        requestLayout()
+    }
+
+    /**
+     * 外圈半径（px）。≤ 0 = 不单独设定：外圈自动 = 内圈 + 一圈图标 + 径向间隙（见 [FanLayout.rings]）。
+     *
+     * 用户 2026-10-16：「加一个外圈半径单独控制的开关和滑条，滑到比内圈半径更小的自动弹回内圈半径」
+     * —— 钳位在 [FanLayout.rings] 里（比内圈小的一律按内圈算，配置页那边滑条的下限也是内圈半径）。
+     */
+    fun setOuterRadiusPx(px: Float) {
+        outerRadius = px
         requestLayout()
     }
     fun setCenterPosition(y: Float) { centerY = y; requestLayout() } // :863-866
@@ -305,7 +322,9 @@ class GestureAppLauncher @JvmOverloads constructor(
      * @return `[外圈半径, 内圈半径?]`；单圈时只有一项（就等于 [radius]，原样）。
      *
      * 单层分支**刻意不算弦长**：半径是用户自己调的（180–360dp），哪怕图标挤一点也轮不到我们替他改
-     * —— 移植版就是这么放的。双层才需要算，因为两圈加起来十几枚，「照搬用户的半径」会让两圈重叠。
+     * —— 移植版就是这么放的。双层同样如此（2026-10-16 之后）：**[radius] 是内圈半径**，外圈要么由
+     * [outerRadius] 指定，要么自动跟在内圈外面一格；弦长只用来算那个自动值，不再反过来改用户的设置
+     * （旧写法会把它钉死在 284dp 一带，用户实测「开双层根本控制不了半径」）。
      *
      * 双层时半径按**满页**（`iconCount + 2` 外圈 / `iconCount + 1` 内圈）算，与这一页实际装了几枚
      * 无关：末页应用少时只是外圈空着，图标仍落在与其它页相同的那两条弧上（用户 2026-10-15 报的
@@ -330,7 +349,8 @@ class GestureAppLauncher @JvmOverloads constructor(
         val rings = FanLayout.rings(
             outerTiles = FanLayout.outerApps(fanIconCount, fanLayers),
             innerTiles = FanLayout.innerTiles(fanIconCount, fanLayers),
-            baseRadiusPx = radius,
+            innerRadiusPx = radius,
+            outerRadiusPx = outerRadius.takeIf { it > 0f },
             iconPx = iconPx,
             ringGapPx = ringGap,
             maxRadiusPx = maxRadius,

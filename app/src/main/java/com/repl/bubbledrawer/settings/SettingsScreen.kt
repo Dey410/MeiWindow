@@ -378,6 +378,13 @@ fun FanSettingsScreen(
                     add(CardItem("radius") {
                         DefaultableIntSliderRow(
                             title = stringResource(R.string.fan_radius),
+                            // 双层时这一项是**内圈**半径（用户 2026-10-16 起）：外圈要么跟在内圈外面一格，
+                            // 要么由下面那个开关单独设定 —— 不写清楚会让人以为"半径没生效"。
+                            summary = if (snap.fanLayers == RemotePrefs.FAN_LAYERS_DOUBLE) {
+                                stringResource(R.string.fan_radius_summary_double)
+                            } else {
+                                null
+                            },
                             value = snap.fanRadiusDp,
                             defaultValue = RemotePrefs.DEFAULT_FAN_RADIUS_DP,
                             min = RemotePrefsFanRadiusMin,
@@ -386,6 +393,30 @@ fun FanSettingsScreen(
                             onCommit = actions::setFanRadiusDp,
                         )
                     })
+                    add(CardItem("outer_radius_enabled") {
+                        SwitchRow(
+                            title = stringResource(R.string.fan_outer_radius_enabled),
+                            summary = stringResource(R.string.fan_outer_radius_enabled_summary),
+                            checked = snap.fanOuterRadiusEnabled,
+                            onCheckedChange = actions::setFanOuterRadiusEnabled,
+                        )
+                    })
+                    // 滑条只在双层且开关打开时出现：单层没有"外圈"这回事，露出来只会让人以为它坏了。
+                    // 下限就是**内圈半径** —— 滑到更小时滑条自己就停在那一格（用户 2026-10-16 的规则）。
+                    if (snap.fanOuterRadiusEnabled && snap.fanLayers == RemotePrefs.FAN_LAYERS_DOUBLE) {
+                        add(CardItem("outer_radius") {
+                            DefaultableIntSliderRow(
+                                title = stringResource(R.string.fan_outer_radius),
+                                summary = stringResource(R.string.fan_outer_radius_summary),
+                                value = snap.fanOuterRadiusDp,
+                                defaultValue = RemotePrefs.DEFAULT_FAN_OUTER_RADIUS_DP,
+                                min = maxOf(RemotePrefsFanRadiusMin, snap.fanRadiusDp),
+                                max = RemotePrefsFanRadiusMax,
+                                valueText = { stringResource(R.string.dp_value, it) },
+                                onCommit = actions::setFanOuterRadiusDp,
+                            )
+                        })
+                    }
                     add(CardItem("show_vibrate") {
                         SwitchRow(
                             title = stringResource(R.string.fan_show_vibrate),

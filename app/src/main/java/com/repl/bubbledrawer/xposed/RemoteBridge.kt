@@ -163,6 +163,8 @@ object RemoteBridge {
             .putInt(RemotePrefs.KEY_FAN_ICON_COUNT, snap.fanIconCount)
             .putInt(RemotePrefs.KEY_FAN_LAYERS, snap.fanLayers)
             .putInt(RemotePrefs.KEY_FAN_RADIUS_DP, snap.fanRadiusDp)
+            .putBoolean(RemotePrefs.KEY_FAN_OUTER_RADIUS_ENABLED, snap.fanOuterRadiusEnabled)
+            .putInt(RemotePrefs.KEY_FAN_OUTER_RADIUS_DP, snap.fanOuterRadiusDp)
             .putBoolean(RemotePrefs.KEY_FAN_SHOW_VIBRATE, snap.fanShowVibrate)
             .putInt(RemotePrefs.KEY_FAN_AUTO_RETRACT_SEC, snap.fanAutoRetractSec)
             .putInt(RemotePrefs.KEY_FAN_ICON_DP, snap.fanIconDp)

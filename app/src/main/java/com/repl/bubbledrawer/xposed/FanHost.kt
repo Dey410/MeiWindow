@@ -447,7 +447,7 @@ class FanHost(
                     dock.show(
                         currentCorner(), screenW(), screenH(),
                         snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
-                        snap.recommendEnabled,
+                        snap.recommendEnabled, outerRadiusDpOf(snap),
                     )
                 }
             }
@@ -513,7 +513,8 @@ class FanHost(
                 mainHandler.post { if (moreUp) moreContent?.refreshFunctionPins() }
             } else if (key == RemotePrefs.KEY_FAN_ICON_COUNT || key == RemotePrefs.KEY_FAN_RADIUS_DP ||
                 key == RemotePrefs.KEY_FAN_AUTO_FILL_RECOMMEND || key == RemotePrefs.KEY_FAN_ICON_DP ||
-                key == RemotePrefs.KEY_FAN_ICON_SHAPE || key == RemotePrefs.KEY_FAN_LAYERS
+                key == RemotePrefs.KEY_FAN_ICON_SHAPE || key == RemotePrefs.KEY_FAN_LAYERS ||
+                key == RemotePrefs.KEY_FAN_OUTER_RADIUS_ENABLED || key == RemotePrefs.KEY_FAN_OUTER_RADIUS_DP
             ) {
                 rebindFanIfBusy()
             } else if (key == RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_ACTIVE) {
@@ -737,7 +738,7 @@ class FanHost(
                     dock.show(
                         currentCorner(), screenW(), screenH(),
                         snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
-                        snap.recommendEnabled,
+                        snap.recommendEnabled, outerRadiusDpOf(snap),
                     )
                 }
             }
@@ -755,6 +756,15 @@ class FanHost(
 
     private fun screenW(): Int = wm.currentWindowMetrics.bounds.width()
     private fun screenH(): Int = wm.currentWindowMetrics.bounds.height()
+
+    /**
+     * 外圈半径（dp）传给扇形：**开关关着就是 0 = 自动**（外圈 = 内圈 + 一圈图标 + 径向间隙）。
+     *
+     * 收在这里是因为 `dock.show` 有四条入口（角落手势 ×2、磁贴/广播、重绑），四处各写一遍三元只会
+     * 让"开关到底生没生效"变成四个可以走偏的地方。
+     */
+    private fun outerRadiusDpOf(snap: RemotePrefs.Snapshot): Int =
+        if (snap.fanOuterRadiusEnabled) snap.fanOuterRadiusDp else 0
 
     private var lastTouchX = 0f
     private var lastTouchY = 0f
@@ -779,7 +789,7 @@ class FanHost(
         dock.show(
             activeCorner, screenW, screenH,
             snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
-            snap.recommendEnabled,
+            snap.recommendEnabled, outerRadiusDpOf(snap),
         )
         lastTouchX = downX
         lastTouchY = downY
@@ -828,7 +838,7 @@ class FanHost(
                 dock.show(
                     currentCorner(), screenW(), screenH(),
                     snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
-                    snap.recommendEnabled,
+                    snap.recommendEnabled, outerRadiusDpOf(snap),
                 )
             }
         }

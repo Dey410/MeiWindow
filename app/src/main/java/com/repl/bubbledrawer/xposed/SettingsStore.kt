@@ -115,8 +115,35 @@ object SettingsStore {
     fun setFanLayers(context: Context, layers: Int) =
         putInt(context, RemotePrefs.KEY_FAN_LAYERS, layers.coerceIn(RemotePrefs.FAN_LAYERS_SINGLE, RemotePrefs.FAN_LAYERS_DOUBLE))
 
-    /** 展开扇形半径（dp）。 */
-    fun setFanRadiusDp(context: Context, dp: Int) = putInt(context, RemotePrefs.KEY_FAN_RADIUS_DP, dp.coerceIn(RemotePrefs.FAN_RADIUS_MIN, RemotePrefs.FAN_RADIUS_MAX))
+    /** 展开扇形半径（dp）—— 双层时它是**内圈**半径（外圈见 [setFanOuterRadiusDp]）。 */
+    fun setFanRadiusDp(context: Context, dp: Int) {
+        val inner = dp.coerceIn(RemotePrefs.FAN_RADIUS_MIN, RemotePrefs.FAN_RADIUS_MAX)
+        putInt(context, RemotePrefs.KEY_FAN_RADIUS_DP, inner)
+        // 内圈顶到外圈上面时把外圈一起抬起来：读侧也会夹（`RemotePrefs.read`），这里落盘是为了
+        // 不留一个"比内圈还小"的旧值 —— 否则用户之后再调小内圈，外圈会突然缩回那个旧值。
+        val storedOuter = RemoteBridge.local(context).getInt(
+            RemotePrefs.KEY_FAN_OUTER_RADIUS_DP,
+            RemotePrefs.DEFAULT_FAN_OUTER_RADIUS_DP,
+        )
+        if (storedOuter < inner) putInt(context, RemotePrefs.KEY_FAN_OUTER_RADIUS_DP, inner)
+    }
+
+    /** 外圈半径单独控制（见 `RemotePrefs.KEY_FAN_OUTER_RADIUS_ENABLED`）。 */
+    fun setFanOuterRadiusEnabled(context: Context, enabled: Boolean) {
+        RemoteBridge.local(context).edit().putBoolean(RemotePrefs.KEY_FAN_OUTER_RADIUS_ENABLED, enabled).apply()
+        RemoteBridge.remote?.edit()?.putBoolean(RemotePrefs.KEY_FAN_OUTER_RADIUS_ENABLED, enabled)?.apply()
+    }
+
+    /**
+     * 外圈半径（dp）。**落盘时就按内圈夹一次**：滑条滑到比内圈更小 → 存下来的就是内圈半径
+     * （用户 2026-10-16：「滑到了比内圈半径更小的会自动弹回内圈半径」）。
+     */
+    fun setFanOuterRadiusDp(context: Context, dp: Int) {
+        val inner = RemotePrefs.read(RemoteBridge.local(context)).fanRadiusDp
+        val outer = dp.coerceIn(RemotePrefs.FAN_OUTER_RADIUS_MIN, RemotePrefs.FAN_OUTER_RADIUS_MAX)
+            .coerceAtLeast(inner)
+        putInt(context, RemotePrefs.KEY_FAN_OUTER_RADIUS_DP, outer)
+    }
 
     /** 扇形滑出时振动一下。 */
     fun setFanShowVibrate(context: Context, enabled: Boolean) {

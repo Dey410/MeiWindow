@@ -30,6 +30,9 @@ interface SettingsActions {
     fun setFanAutoRetractSec(sec: Int)
     fun setFanIconDp(dp: Int)
     fun setFanIconShape(shape: Int)
+    /** 外圈半径单独控制：开关 + 滑条（滑条值低于内圈时自动回到内圈半径）。 */
+    fun setFanOuterRadiusEnabled(enabled: Boolean)
+    fun setFanOuterRadiusDp(dp: Int)
     fun setCloneBadge(enabled: Boolean)
     fun setFanAutoFillRecommend(enabled: Boolean)
     fun setFanPressurePageTurn(enabled: Boolean)
@@ -92,6 +95,8 @@ class StoreSettingsActions(private val context: Context) : SettingsActions {
     override fun setFanAutoRetractSec(sec: Int) = SettingsStore.setFanAutoRetractSec(context, sec)
     override fun setFanIconDp(dp: Int) = SettingsStore.setFanIconDp(context, dp)
     override fun setFanIconShape(shape: Int) = SettingsStore.setFanIconShape(context, shape)
+    override fun setFanOuterRadiusEnabled(enabled: Boolean) = SettingsStore.setFanOuterRadiusEnabled(context, enabled)
+    override fun setFanOuterRadiusDp(dp: Int) = SettingsStore.setFanOuterRadiusDp(context, dp)
     override fun setCloneBadge(enabled: Boolean) = SettingsStore.setCloneBadge(context, enabled)
     override fun setFanAutoFillRecommend(enabled: Boolean) = SettingsStore.setFanAutoFillRecommend(context, enabled)
     override fun setFanPressurePageTurn(enabled: Boolean) = SettingsStore.setFanPressurePageTurn(context, enabled)

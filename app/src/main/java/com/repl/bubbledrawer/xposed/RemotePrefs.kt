@@ -98,11 +98,31 @@ object RemotePrefs {
     const val FAN_LAYERS_SINGLE = 1
     const val FAN_LAYERS_DOUBLE = 2
 
-    /** 展开扇形半径（dp） */
+    /** 展开扇形半径（dp）。用户 2026-10-16 之后它的含义是**内圈**半径（见 [KEY_FAN_OUTER_RADIUS_ENABLED]）。 */
     const val KEY_FAN_RADIUS_DP = "fan_radius_dp"
     const val DEFAULT_FAN_RADIUS_DP = 260
     const val FAN_RADIUS_MIN = 180
     const val FAN_RADIUS_MAX = 360
+
+    /**
+     * 外圈半径单独控制（用户 2026-10-16：「加一个外圈半径单独控制的开关和滑条」）。
+     *
+     * 关（默认）：外圈跟着内圈走 —— 外圈 = 内圈 + 一圈图标 + 径向间隙（刚好不叠的那个位置）。
+     * 开：外圈用 [KEY_FAN_OUTER_RADIUS_DP] 那个滑条，**不会小于内圈**（比内圈小的自动回到内圈半径）。
+     */
+    const val KEY_FAN_OUTER_RADIUS_ENABLED = "fan_outer_radius_enabled"
+    const val DEFAULT_FAN_OUTER_RADIUS_ENABLED = false
+
+    /**
+     * 外圈半径（dp，只在上一个开关打开时生效）。
+     *
+     * 默认 312 = 内圈默认 260 + 一圈图标 44 + 间隙 8，也就是「自动」那条算出来的值 —— 打开开关的
+     * 一瞬间扇形不该跳一下。
+     */
+    const val KEY_FAN_OUTER_RADIUS_DP = "fan_outer_radius_dp"
+    const val DEFAULT_FAN_OUTER_RADIUS_DP = 312
+    const val FAN_OUTER_RADIUS_MIN = FAN_RADIUS_MIN
+    const val FAN_OUTER_RADIUS_MAX = FAN_RADIUS_MAX
 
     /** 扇形滑出时振动一下（默认开启，与 Flyme 的手感一致）。 */
     const val KEY_FAN_SHOW_VIBRATE = "fan_show_vibrate"
@@ -331,8 +351,18 @@ object RemotePrefs {
         val fanIconCount: Int = DEFAULT_FAN_ICON_COUNT,
         /** 扇形层数：1 = 单层，2 = 双层（见 [KEY_FAN_LAYERS]） */
         val fanLayers: Int = DEFAULT_FAN_LAYERS,
-        /** 展开扇形半径（dp） */
+        /** 展开扇形半径（dp）—— 双层时它是**内圈**；外圈见 [fanOuterRadiusDp] */
         val fanRadiusDp: Int = DEFAULT_FAN_RADIUS_DP,
+        /** 外圈半径单独控制（见 [KEY_FAN_OUTER_RADIUS_ENABLED]） */
+        val fanOuterRadiusEnabled: Boolean = DEFAULT_FAN_OUTER_RADIUS_ENABLED,
+        /**
+         * 外圈半径（dp，仅在上一个开关打开时生效）。
+         *
+         * **读出来就一定 ≥ [fanRadiusDp]**：内圈被调大时外圈跟着回到内圈半径（用户 2026-10-16：
+         * 「滑条滑到了比内圈半径更小的会自动弹回内圈半径」）。写侧也夹一次（`SettingsStore`），
+         * 这里再夹一次是为了兜住"先有外圈值、后被调大的内圈"这种顺序。
+         */
+        val fanOuterRadiusDp: Int = DEFAULT_FAN_OUTER_RADIUS_DP,
         /** 扇形滑出时振动 */
         val fanShowVibrate: Boolean = DEFAULT_FAN_SHOW_VIBRATE,
         /** 扇形滑出后不点选自动收回的秒数（0 = 不自动收回） */
@@ -433,6 +463,13 @@ object RemotePrefs {
         val range = sp.getInt(KEY_RANGE_DP, DEFAULT_RANGE_DP).coerceIn(MIN_DP, MAX_DP)
         // 手输的整数直接收（不再吸附到 4 的倍数）：越界只钳位，档位由用户自己给。
         val recommendCount = clampRecommendCount(sp.getInt(KEY_RECOMMEND_COUNT, DEFAULT_RECOMMEND_COUNT))
+        // 半径（dp）：双层时内圈 = 扇形半径设置，外圈另外一项。**外圈永远不小于内圈** ——
+        // 内圈后来被调大时外圈跟着回到内圈半径（用户 2026-10-16 的规则，写侧也夹一次）。
+        val fanRadius = sp.getInt(KEY_FAN_RADIUS_DP, DEFAULT_FAN_RADIUS_DP)
+            .let { if (it <= 0) DEFAULT_FAN_RADIUS_DP else it.coerceIn(FAN_RADIUS_MIN, FAN_RADIUS_MAX) }
+        val fanOuterRadius = sp.getInt(KEY_FAN_OUTER_RADIUS_DP, DEFAULT_FAN_OUTER_RADIUS_DP)
+            .let { if (it <= 0) DEFAULT_FAN_OUTER_RADIUS_DP else it.coerceIn(FAN_OUTER_RADIUS_MIN, FAN_OUTER_RADIUS_MAX) }
+            .coerceAtLeast(fanRadius)
         return Snapshot(
             enabled = sp.getBoolean(KEY_ENABLED, DEFAULT_ENABLED),
             left = sp.getBoolean(KEY_LEFT, DEFAULT_LEFT),
@@ -450,7 +487,9 @@ object RemotePrefs {
             panelDismissOutside = sp.getInt(KEY_PANEL_DISMISS_OUTSIDE, DEFAULT_PANEL_DISMISS_OUTSIDE).coerceIn(0, 1),
             fanIconCount = sp.getInt(KEY_FAN_ICON_COUNT, DEFAULT_FAN_ICON_COUNT).coerceIn(5, 6),
             fanLayers = sp.getInt(KEY_FAN_LAYERS, DEFAULT_FAN_LAYERS).coerceIn(FAN_LAYERS_SINGLE, FAN_LAYERS_DOUBLE),
-            fanRadiusDp = sp.getInt(KEY_FAN_RADIUS_DP, DEFAULT_FAN_RADIUS_DP).let { if (it <= 0) DEFAULT_FAN_RADIUS_DP else it.coerceIn(FAN_RADIUS_MIN, FAN_RADIUS_MAX) },
+            fanRadiusDp = fanRadius,
+            fanOuterRadiusEnabled = sp.getBoolean(KEY_FAN_OUTER_RADIUS_ENABLED, DEFAULT_FAN_OUTER_RADIUS_ENABLED),
+            fanOuterRadiusDp = fanOuterRadius,
             fanShowVibrate = sp.getBoolean(KEY_FAN_SHOW_VIBRATE, DEFAULT_FAN_SHOW_VIBRATE),
             fanAutoRetractSec = sp.getInt(KEY_FAN_AUTO_RETRACT_SEC, DEFAULT_FAN_AUTO_RETRACT_SEC)
                 .coerceIn(FAN_AUTO_RETRACT_MIN, FAN_AUTO_RETRACT_MAX),

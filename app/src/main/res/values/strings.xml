@@ -50,12 +50,17 @@
     <string name="fan_layers">扇形层数</string>
     <string name="fan_layers_single">单层</string>
     <string name="fan_layers_double">双层</string>
-    <string name="fan_layers_summary">双层：内层 = 应用图标数量 + 一个「更多」，外层比内层多 2 个应用（「更多」只在内层）；半径不够时自动向外撑开</string>
+    <string name="fan_layers_summary">双层：内层 = 应用图标数量 + 一个「更多」，外层比内层多 2 个应用（「更多」只在内层）；外圈跟着内圈走，也可以单独设定</string>
     <string name="fan_icon_count">扇形应用图标数量</string>
     <string name="fan_icon_count_5">5 个应用</string>
     <string name="fan_icon_count_6">6 个应用</string>
     <string name="fan_icon_count_summary_double">内层 %1$d 个 + 「更多」，外层 %2$d 个应用</string>
     <string name="fan_radius">展开扇形半径</string>
+    <string name="fan_radius_summary_double">双层时这是内圈半径；外圈自动跟在内圈外面一格，也可以在下面的开关里单独设定</string>
+    <string name="fan_outer_radius_enabled">外圈半径单独控制</string>
+    <string name="fan_outer_radius_enabled_summary">双层时把外圈半径从「展开扇形半径」里拆出来单独调（单层不起作用）</string>
+    <string name="fan_outer_radius">外圈半径</string>
+    <string name="fan_outer_radius_summary">不会小于内圈半径：滑到更小时自动回到内圈半径</string>
     <string name="fan_show_vibrate">滑出时振动</string>
     <string name="fan_show_vibrate_summary">扇形开始展开的那一帧轻振一下（Flyme 手感）</string>
     <string name="fan_auto_retract">不操作自动收起</string>

@@ -117,7 +117,20 @@ object FanLayout {
      * 半径只由设置决定，翻页时图标才不会忽远忽近（用户 2026-10-15 报的「最后一页的图标跑到内圈」
      * 就是旧写法按页算、末页退化成单圈造成的）。
      *
-     * @param baseRadiusPx 用户设置的半径 —— **它就是外圈半径**（单层时不再改动）。
+     * ## 半径的语义（用户 2026-10-16：「开双层根本控制不了半径」之后改的）
+     *
+     * **设置就是半径本身，谁也不许把它悄悄改掉**：
+     *  - 单层：那一圈 = [innerRadiusPx]；
+     *  - 双层：**内圈 = [innerRadiusPx]**；外圈 = [outerRadiusPx]（用户单独指定，**比内圈小时按内圈算**），
+     *    没指定（null）时自动 = `max(内圈 + 一圈图标 + 间隙, 外圈自己的弦长下限)`。
+     *
+     * 旧写法把「这一圈自己的弦长要求」也算进用户设置里（`max(设置, 弦长, 内圈弦长 + 间隙)`），
+     * 后果是双层时半径被钉死在 284dp 一带：设置从 180 拖到 284 完全没反应，只有 284→360 那一小段
+     * 有变化 —— 那正是「根本控制不了半径」。弦长从此只用来决定**自动**外圈要撑到哪，挤不挤由用户
+     * 自己调（单层一直就是这个规矩）。
+     *
+     * @param innerRadiusPx 用户设置的半径 = 内圈（单层时就是唯一那一圈）。
+     * @param outerRadiusPx 外圈半径（用户单独设定）；null = 自动跟着内圈走。
      * @param iconPx 图标边长（px）。相邻图标的圆心距至少要 [iconPx] + [ringGapPx] 才不会叠。
      * @param ringGapPx 两圈之间的径向间隙。必须 ≥ 触摸 slop，否则内外圈的命中带会互相咬住
      *   （`radiusMax = r + icon/2 + slop`）。
@@ -127,7 +140,8 @@ object FanLayout {
     fun rings(
         outerTiles: Int,
         innerTiles: Int,
-        baseRadiusPx: Float,
+        innerRadiusPx: Float,
+        outerRadiusPx: Float?,
         iconPx: Float,
         ringGapPx: Float,
         maxRadiusPx: Float,
@@ -135,31 +149,26 @@ object FanLayout {
     ): List<Ring> {
         if (outerTiles <= 0) return emptyList()
         val stepOuter = stepDeg(outerTiles, safeDegrees)
-        val outer: Float
-        val inner: Float
+        val list = ArrayList<Ring>(2)
         if (innerTiles <= 0) {
             // 单层：半径就是用户设的那个，不做任何"自动撑开" —— 他调过的半径不能被我们改掉。
-            outer = baseRadiusPx
-            inner = 0f
-        } else {
-            val stepInner = stepDeg(innerTiles, safeDegrees)
-            val need = iconPx + ringGapPx
-            // 外圈自己要够宽，还得给内圈留出「内圈所需半径 + 一圈图标 + 间隙」。
-            val wanted = max(
-                max(baseRadiusPx, chordRadius(need, stepOuter)),
-                chordRadius(need, stepInner) + need,
-            )
-            outer = min(wanted, maxRadiusPx)
-            // 半径的下限只在小到荒谬的屏（比一个图标还窄）上会碰到：内圈退到离轴心一个图标远处，
-            // 两圈命中带可能相交 —— 那时整页本来也画不出两层，不再为它加分支。
-            inner = max(outer - need, iconPx)
+            list.add(Ring(tiles = outerTiles, radiusPx = innerRadiusPx, stepDeg = stepOuter, angleHalfDeg = 45f / outerTiles))
+            return list
         }
-        val list = ArrayList<Ring>(2)
+        val need = iconPx + ringGapPx
+        val stepInner = stepDeg(innerTiles, safeDegrees)
+        val wantedOuter = outerRadiusPx?.takeIf { it > 0f }
+            // 用户单独设的：**不小于内圈**（比内圈小的自动回到内圈半径，用户 2026-10-16 的规则）。
+            ?.let { max(it, innerRadiusPx) }
+            // 自动：内圈 + 一圈图标 + 径向间隙（两圈刚好不叠），再和"外圈自己不挤"的弦长下限取大。
+            ?: max(innerRadiusPx + need, chordRadius(need, stepOuter))
+        val outer = wantedOuter.coerceAtMost(maxRadiusPx)
+        // 内圈就是用户设的那个；只有外圈被屏幕夹到它里面去时才跟着降下来 —— 两圈不能颠倒，
+        // 但**也不替用户维持间距**：他把外圈拉得贴着内圈，就照他说的那样贴着（命中带会略微重叠，
+        // 挑中的是内圈那一枚）。间距是"自动外圈"那条公式的职责。
+        val inner = innerRadiusPx.coerceIn(iconPx, max(outer, iconPx))
         list.add(Ring(tiles = outerTiles, radiusPx = outer, stepDeg = stepOuter, angleHalfDeg = 45f / outerTiles))
-        if (innerTiles > 0) {
-            val stepInner = stepDeg(innerTiles, safeDegrees)
-            list.add(Ring(tiles = innerTiles, radiusPx = inner, stepDeg = stepInner, angleHalfDeg = 45f / innerTiles))
-        }
+        list.add(Ring(tiles = innerTiles, radiusPx = inner, stepDeg = stepInner, angleHalfDeg = 45f / innerTiles))
         return list
     }
 

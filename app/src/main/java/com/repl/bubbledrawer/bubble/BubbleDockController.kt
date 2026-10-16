@@ -185,6 +185,13 @@ class BubbleDockController(
         autoFillRecommend: Boolean = false,
         layers: Int = FanLayout.LAYERS_SINGLE,
         recommendEnabled: Boolean = true,
+        /**
+         * 外圈半径（dp）；≤ 0 = 不单独设定，外圈跟着内圈走（见 [FanLayout.rings]）。
+         *
+         * 双层时 [radiusDp] 是**内圈**半径 —— 用户 2026-10-16 之前它是"两圈一起"的那个值，而旧几何
+         * 又会把它顶到弦长下限上去，于是双层下半径滑条基本没反应。
+         */
+        outerRadiusDp: Int = 0,
     ) {
         currentPage = 0
         pageIconCount = maxApps
@@ -207,6 +214,9 @@ class BubbleDockController(
             defaultRadius
         }
         launcher.setRadiusPx(radiusPx)
+        launcher.setOuterRadiusPx(
+            if (outerRadiusDp > 0) outerRadiusDp * context.resources.displayMetrics.density else 0f,
+        )
         launcher.setSafeDegrees(if (navbar) 0 else 3)
         launcher.setCenterPosition(screenH.toFloat())
     }

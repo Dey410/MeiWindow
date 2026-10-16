@@ -3,7 +3,6 @@ package com.repl.bubbledrawer.bubble
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import kotlin.math.abs
 
 /**
  * 扇形分层的数量规则与双环几何。
@@ -95,7 +94,7 @@ class FanLayersTest {
     @Test
     fun singleRingRadiusIsExactlyTheSetting() {
         val rings = FanLayout.rings(
-            outerTiles = 6, innerTiles = 0, baseRadiusPx = base,
+            outerTiles = 6, innerTiles = 0, innerRadiusPx = base, outerRadiusPx = null,
             iconPx = icon, ringGapPx = gap, maxRadiusPx = maxRadius(), safeDegrees = 0,
         )
         assertEquals(1, rings.size)
@@ -109,7 +108,7 @@ class FanLayersTest {
         for (safe in listOf(0, 3)) {
             for (tiles in listOf(5, 6, 7, 8)) {
                 val ring = FanLayout.rings(
-                    outerTiles = tiles, innerTiles = 0, baseRadiusPx = base,
+                    outerTiles = tiles, innerTiles = 0, innerRadiusPx = base, outerRadiusPx = null,
                     iconPx = icon, ringGapPx = gap, maxRadiusPx = maxRadius(), safeDegrees = safe,
                 ).first()
                 val step = if (safe == 0) 90.0f / (tiles + 1) else (90f - safe * 2f) / tiles
@@ -127,49 +126,98 @@ class FanLayersTest {
         }
     }
 
+    // --------------------------------------------------------------- 双层半径（用户 2026-10-16）
+
+    /** 一个常见设备状态：内圈默认 260dp、外圈自动。 */
+    private fun doubleRings(
+        innerPx: Float = base,
+        outerPx: Float? = null,
+        outerTiles: Int = 7,
+        innerTiles: Int = 6,
+        iconPx: Float = icon,
+    ) = FanLayout.rings(
+        outerTiles = outerTiles, innerTiles = innerTiles,
+        innerRadiusPx = innerPx, outerRadiusPx = outerPx,
+        iconPx = iconPx, ringGapPx = gap, maxRadiusPx = maxRadius(iconPx), safeDegrees = 0,
+    )
+
     @Test
-    fun doubleRingKeepsICsApartAtTheDefaultRadius() {
-        val rings = FanLayout.rings(
-            outerTiles = 7, innerTiles = 6, baseRadiusPx = base,
-            iconPx = icon, ringGapPx = gap, maxRadiusPx = maxRadius(), safeDegrees = 0,
-        )
-        assertEquals(2, rings.size)
+    fun theRadiusSettingMovesBothRings() {
+        // **用户 2026-10-16 报的 bug**：双层时半径滑条"根本控制不了"。
+        // 旧几何把用户设置当成"下限"再和一圈自己的弦长要求取大，于是 180→284dp 整段纹丝不动。
+        // 现在的规矩：设置就是半径本身。
+        val small = 200f * 3.25f
+        val medium = 260f * 3.25f
+        val large = 340f * 3.25f
+        val rings = listOf(small, medium, large).map { doubleRings(innerPx = it) }
+
+        assertEquals("内圈半径就是设置本身", small, rings[0][1].radiusPx, 0.001f)
+        assertEquals(medium, rings[1][1].radiusPx, 0.001f)
+        assertEquals(large, rings[2][1].radiusPx, 0.001f)
+        // 滑条一动两圈都要跟着动（外圈自动时 = 内圈 + 一圈图标 + 间隙）
+        assertTrue(rings[1][0].radiusPx > rings[0][0].radiusPx)
+        assertTrue(rings[2][0].radiusPx > rings[1][0].radiusPx)
+    }
+    @Test
+    fun theAutomaticOuterRingSitsOneIconOutsideTheInner() {
+        val rings = doubleRings()
         val outer = rings[0]
         val inner = rings[1]
-        // 两圈之间空得下「一个图标 + 间隙」，否则内外圈的命中带会互咬。
-        assertTrue(
-            "outer-inner=${outer.radiusPx - inner.radiusPx}",
-            outer.radiusPx - inner.radiusPx >= icon + gap - 0.001f,
-        )
-        // 每一圈自己也不许叠：相邻圆心距 ≥ 图标 + 间隙
-        assertTrue(chord(outer) >= icon + gap - 0.001f)
-        assertTrue(chord(inner) >= icon + gap - 0.001f)
-        // 内圈在里、外圈在外
-        assertTrue(inner.radiusPx < outer.radiusPx)
+        // 自动外圈 = max(内圈 + 图标 + 间隙, 外圈自己的弦长下限)：默认这一档是前者，正好空出一格。
+        assertEquals(icon + gap, outer.radiusPx - inner.radiusPx, 0.5f)
+        // 内圈不许被"自动撑开"顶走 —— 它必须还是用户设的那个数。
+        assertEquals(base, inner.radiusPx, 0.001f)
     }
 
     @Test
-    fun doubleRingExpandsTheRadiusWhenTheSettingIsTooSmall() {
-        // 用户把半径设成 180dp（最小的那一档）还要开双层：几何上装不下，只能把外圈撑开。
+    fun theAutomaticOuterRingStillRespectsItsOwnChordFloor() {
+        // 内圈拉到最小（180dp）：`内圈 + 一格` 只剩 754px，而 7 枚外圈自己就要 862px 才不挤 ——
+        // 这时按弦长下限来（旧的"自动撑开"只剩这一条，且不再改用户的半径）。
         val small = 180f * 3.25f
-        val rings = FanLayout.rings(
-            outerTiles = 7, innerTiles = 6, baseRadiusPx = small,
-            iconPx = icon, ringGapPx = gap, maxRadiusPx = maxRadius(), safeDegrees = 0,
-        )
-        assertTrue("radius must grow past the setting", rings[0].radiusPx > small)
-        assertTrue(chord(rings[0]) >= icon + gap - 0.001f)
-        assertTrue(chord(rings[1]) >= icon + gap - 0.001f)
-        // 但内圈仍然要在外圈里面
-        assertTrue(rings[1].radiusPx > 0f)
+        val rings = doubleRings(innerPx = small)
+        assertEquals(small, rings[1].radiusPx, 0.001f)
+        assertEquals(FanLayout.chordRadius(icon + gap, rings[0].stepDeg), rings[0].radiusPx, 0.5f)
+        assertTrue(rings[0].radiusPx - rings[1].radiusPx > icon + gap)
+    }
+
+    @Test
+    fun anExplicitOuterRadiusIsHonouredExactly() {
+        val wanted = 320f * 3.25f
+        val rings = doubleRings(outerPx = wanted)
+        assertEquals(wanted, rings[0].radiusPx, 0.001f)
+        assertEquals(base, rings[1].radiusPx, 0.001f)
+    }
+
+    @Test
+    fun anOuterRadiusBelowTheInnerSnapsBackToTheInner() {
+        // 用户 2026-10-16：「滑条滑到了比内圈半径更小的会自动弹回内圈半径」。
+        val inner = 300f * 3.25f
+        val rings = doubleRings(innerPx = inner, outerPx = 200f * 3.25f)
+        assertEquals("外圈回到内圈半径", inner, rings[0].radiusPx, 0.001f)
+        assertEquals("内圈不受影响，还是他设的那个", inner, rings[1].radiusPx, 0.001f)
+        // 0 / 负数同样是"没设"，走自动那条
+        val auto = doubleRings(innerPx = inner, outerPx = 0f)
+        assertTrue(auto[0].radiusPx > inner)
+    }
+
+    @Test
+    fun theScreenCapNeverInvertsTheRings() {
+        // 拖到最右：外圈会被"图标扫到 90° 还在屏幕内"夹住；内圈跟着一起停在边界上，绝不跑到外面去。
+        val rings = doubleRings(innerPx = 360f * 3.25f, outerPx = 360f * 3.25f)
+        assertTrue(rings[0].radiusPx <= maxRadius() + 0.001f)
+        assertTrue("内圈不能比外圈还远", rings[1].radiusPx <= rings[0].radiusPx + 0.001f)
+        assertTrue(rings[1].radiusPx >= icon)
     }
 
     @Test
     fun doubleRingNeverLeavesTheScreen() {
         // 64dp 图标 + 最小半径：几何想要更大，也只能停在"图标扫到 90° 还在屏幕内"。
         val bigIcon = 64f * 3.25f
-        val rings = FanLayout.rings(
-            outerTiles = 8, innerTiles = 7, baseRadiusPx = 180f * 3.25f,
-            iconPx = bigIcon, ringGapPx = gap, maxRadiusPx = maxRadius(bigIcon), safeDegrees = 0,
+        val rings = doubleRings(
+            innerPx = 180f * 3.25f,
+            outerTiles = 8,
+            innerTiles = 7,
+            iconPx = bigIcon,
         )
         assertTrue(rings[0].radiusPx <= maxRadius(bigIcon) + 0.001f)
         assertTrue(rings[0].radiusPx + bigIcon / 2f <= screen + 0.001f)
@@ -178,7 +226,7 @@ class FanLayersTest {
     @Test
     fun doubleRingUsesTheInnerCountForTheInnerStep() {
         val rings = FanLayout.rings(
-            outerTiles = 8, innerTiles = 7, baseRadiusPx = base,
+            outerTiles = 8, innerTiles = 7, innerRadiusPx = base, outerRadiusPx = null,
             iconPx = icon, ringGapPx = gap, maxRadiusPx = maxRadius(), safeDegrees = 3,
         )
         // 外层 8 枚、内层 7 枚：两圈步长不同（这正是半径要分开算的原因）。
@@ -196,8 +244,4 @@ class FanLayersTest {
         // 步长退化时不除零
         assertEquals(180f, FanLayout.chordRadius(180f, 0f), 0.001f)
     }
-
-    /** 相邻两个 tile 的圆心距。 */
-    private fun chord(ring: FanLayout.Ring): Float =
-        2f * ring.radiusPx * abs(kotlin.math.sin(Math.toRadians(ring.stepDeg / 2.0)).toFloat())
 }
