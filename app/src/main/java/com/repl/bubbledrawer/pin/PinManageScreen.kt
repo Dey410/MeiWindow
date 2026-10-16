@@ -3,7 +3,6 @@ package com.repl.bubbledrawer.pin
 import android.content.res.Configuration
 import android.graphics.drawable.Drawable
 import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.VectorConverter
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
@@ -100,6 +99,7 @@ import com.repl.bubbledrawer.ui.util.pageScroll
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.InputField
@@ -756,6 +756,15 @@ private fun SharedPinsSection(
     }
     val pinnedFns = model.pinnedFunctions
 
+    val density = LocalDensity.current
+    // 拖拽中的那一格：数据给"最上层再画一遍"用（见下面的 OverlayAt）。
+    val ghostKey = drag.draggingKey
+    val ghostApp = if (ghostKey == null) null else pinnedApps.firstOrNull { cellKey(it) == ghostKey }?.app
+    val ghostSize = drag.draggingSize()
+
+    // 外面这层 Box 只是给"拖拽图层"一个与收藏区重合的坐标原点（`centers` 也是这个坐标系），
+    // 高度仍然由里面的 Column 决定（拖拽图层是零尺寸的，见 [OverlayAt]）。
+    Box(modifier = Modifier.fillMaxWidth()) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -851,6 +860,57 @@ private fun SharedPinsSection(
         // 收藏超过一屏时的那一枚「展开更多」，垫在第 N 个（= 上面这些行）下面。
         if (expandCell != null) {
             SectionExpandRow(onToggle = model::togglePinsExpanded)
+        }
+    }
+
+        // 拖拽中的那一格画在**最上层**：格子是按行嵌套的（`Row` 里的 `Box` 里才是 `PinCell`），
+        // `zIndex` 只管同一层的兄弟，跨行根本管不到 —— 用户 2026-10-16：「手指拖动的图标图层在
+        // 动画下面」。所以在这里再画一遍（网格里那一格是透明的占位），它必然盖住所有格子与让位动画。
+        if (ghostApp != null && ghostSize != null) {
+            val widthDp = with(density) { ghostSize.width.toDp() }
+            val heightDp = with(density) { ghostSize.height.toDp() }
+            // 位置用 lambda 传：跟手位移是快照状态，在测量里读才不会每帧重组整个收藏区
+            // （每帧只重放这一个节点，30 个格子的重组在拖动时是纯浪费）。
+            OverlayAt(offset = { drag.draggingVisualOffset(ghostSize) }) {
+                Box(
+                    modifier = Modifier
+                        .size(widthDp, heightDp)
+                        .graphicsLayer {
+                            scaleX = 1.12f
+                            scaleY = 1.12f
+                            alpha = 0.9f
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    AppTile(
+                        app = ghostApp,
+                        manageMode = model.manageMode,
+                        pinned = true,
+                        iconDp = iconDp,
+                        textSp = textSp,
+                        cloneBadge = model.cloneBadge,
+                        onTap = {},
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 零尺寸的绝对定位图层：把 [content] 画在父节点坐标系里的 `offset()` 处，自己不占布局。
+ *
+ * 用途是让"拖拽中的那一格"出现在收藏区最上层（见 [SharedPinsSection]）；零尺寸是为了不给收藏区
+ * 加高度 —— `MeasuredHeader` 量到的高度直接决定上滑折叠的偏移，多出一格高度会让收起位置跳一下。
+ * [offset] 传 lambda：跟手位移每帧都变，在测量里读它就只重放这一个节点，不必重组整个收藏区。
+ */
+@Composable
+private fun OverlayAt(offset: () -> Offset, content: @Composable () -> Unit) {
+    androidx.compose.ui.layout.Layout(content = content) { measurables, constraints ->
+        val placeable = measurables.firstOrNull()?.measure(constraints)
+        layout(0, 0) {
+            val at = offset()
+            placeable?.place(at.x.roundToInt(), at.y.roundToInt())
         }
     }
 }
@@ -1067,32 +1127,22 @@ private fun PinCell(
     val isDragging = drag.draggingKey == key
     var centerInParent by remember { mutableStateOf(Offset.Zero) }
 
-    // 让位动画（用户 2026-10-16：「app 顺序一变就自己放下来了，也没有移动让位的动画」）：
-    // 顺序一变，这一格就被渲染到**新槽位**上 —— 从旧槽位滑过来。位移用按下那一刻登记的槽位中心
-    // 算（[PinDragState.shiftFor]），不必等布局，也因此不怕"这一格换了谁"（组合位置是位置，
-    // 身份靠 [cellKey]，两者的对应关系一变，这里就能看出来）。
+    // 让位动画（用户 2026-10-16：「app 顺序一变就自己放下来了，也没有移动让位的动画」）。
+    //
+    // 起始位移必须在**组合期**取，不能在 effect 里取：effect 要等这一帧组合完才跑，那时新槽位
+    // 已经按"位移 0"画过一帧了 —— 用户看到的就是"在终点闪一下，再重新放一遍让位动画"。
+    // `shiftOf` 是纯读（换位发生时就写好了），所以放在 `remember` 里算没有副作用。
     val slot = drag.slotOf(key)
-    val shift = remember { Animatable(Offset.Zero, Offset.VectorConverter) }
-    LaunchedEffect(key, slot, isDragging) {
-        if (isDragging) {
-            shift.snapTo(Offset.Zero)
-            return@LaunchedEffect
-        }
-        val delta = drag.shiftFor(key, slot)
-        if (delta != null) {
-            shift.snapTo(delta)
-            shift.animateTo(Offset.Zero, animationSpec = tween(SLOT_ANIM_MS))
-        } else if (shift.value != Offset.Zero) {
-            shift.snapTo(Offset.Zero)
-        }
+    val startShift = remember(key, slot, isDragging) {
+        if (isDragging) null else drag.shiftOf(key)
     }
-    // 这一格退出渲染（取消收藏、折叠到 20 个之外）时不用自己收落点：`onDragStart` 会按当前收藏
-    // 清掉多余的键（用 `DisposableEffect` 收反而会在换位时把**正在拖的那一格**误删 —— 格子是按位置
-    // 组合的，位置 A 换了主人就会触发旧主人的 onDispose）。
+    val progress = remember(key, slot, isDragging) { Animatable(if (startShift == null) 1f else 0f) }
+    LaunchedEffect(key, slot, isDragging) {
+        if (startShift != null) progress.animateTo(1f, animationSpec = tween(SLOT_ANIM_MS))
+    }
 
     Box(
         modifier = modifier
-            .zIndex(if (isDragging) 1f else 0f)
             .onGloballyPositioned { coords ->
                 // 拖拽期间也照登记：换位之后每一格都被摆到新槽位上，落点表跟着走才是对的
                 // （拖拽本身的参照系是按下那一刻的快照，见 [PinDragState.initialSlots]）。
@@ -1105,12 +1155,13 @@ private fun PinCell(
                 drag.register(key, centerInParent, Size(coords.size.width.toFloat(), coords.size.height.toFloat()))
             }
             .graphicsLayer {
-                // 拖拽中的那一格跟手指；其余格子只可能被"让位"推着走。
-                translationX = if (isDragging) drag.translationX else shift.value.x
-                translationY = if (isDragging) drag.translationY else shift.value.y
-                scaleX = if (isDragging) 1.12f else 1f
-                scaleY = if (isDragging) 1.12f else 1f
-                alpha = if (isDragging) 0.9f else 1f
+                // 拖拽中的那一格**不在这里画**：它由收藏区最上层的拖拽图层负责（见 SharedPinsSection
+                // 的 ghost）。格子是按行嵌套的，zIndex 跨不了行 —— 用户 2026-10-16：
+                // 「手指拖动的图标图层在动画下面」。这里留一个透明的占位，免得整行重排。
+                val remaining = 1f - progress.value
+                translationX = if (isDragging) 0f else (startShift?.x ?: 0f) * remaining
+                translationY = if (isDragging) 0f else (startShift?.y ?: 0f) * remaining
+                alpha = if (isDragging) 0f else 1f
             },
         contentAlignment = Alignment.Center,
     ) {
@@ -1238,8 +1289,11 @@ private class PinDragState(
     private var initialCenter = Offset.Zero
     private var totalDrag = Offset.Zero
 
-    /** key → 上一次被观察到的槽位（让位动画用，见 [shiftFor]）。 */
-    private val lastSlots = HashMap<String, Int>()
+    /**
+     * key → 待播的让位位移（旧槽位中心 − 新槽位中心）。换位那一刻由 [onDrag] 算好，格子在
+     * **组合期**取走（[shiftOf]）—— 在 effect 里算会先在新位置画一帧，就是"在终点闪一下"。
+     */
+    private val pendingShifts = HashMap<String, Offset>()
 
     fun register(key: String, center: Offset, size: Size) {
         centers[key] = center
@@ -1265,25 +1319,29 @@ private class PinDragState(
         return best
     }
 
-    /** 这一格现在在哪个槽位（不在拖拽中返回 -1）—— 让位动画与落点换算都用它。 */
+    /** 这一格现在在哪个槽位（不在拖拽中返回 -1）—— 让位动画的"换了位置没有"就用它判断。 */
     fun slotOf(key: String): Int {
         if (draggingKey == null) return -1
         return visiblePins().indexOfFirst { cellKey(it) == key }
     }
 
-    /**
-     * 让位动画：这一格从**上一次观察到的槽位**挪到现在这个槽位的像素差（旧 − 新）。
-     * 没挪过 / 不在拖拽中 = null。
-     *
-     * 槽位中心取按下那一刻的快照 [initialSlots]：拖拽期间布局怎么变都不影响这套算术，而且
-     * 一次拖拽里连挪两格（被别格推着走）也对 —— 每次观察到的槽位都跟上一比。
-     */
-    fun shiftFor(key: String, slot: Int): Offset? {
-        val previous = lastSlots.put(key, slot)
-        if (draggingKey == null || previous == null || previous == slot) return null
-        val from = initialSlots.getOrNull(previous) ?: return null
-        val to = initialSlots.getOrNull(slot) ?: return null
-        return from - to
+    /** 这一格的让位位移（旧 − 新）；没挪过 = null。纯读，组合期调用。 */
+    fun shiftOf(key: String): Offset? = pendingShifts[key]
+
+    /** 拖拽中那一格的**当前视觉中心**（槽位中心 + 跟手位移，收藏区坐标）；没在拖 = null。 */
+    fun draggingVisualCenter(): Offset? {
+        if (draggingKey == null) return null
+        val slotCenter = initialSlots.getOrNull(currentSlot) ?: initialCenter
+        return slotCenter + Offset(translationX, translationY)
+    }
+
+    /** 拖拽中那一格的尺寸（渲染时登记的）；没在拖 = null。 */
+    fun draggingSize(): Size? = draggingKey?.let { sizes[it] }
+
+    /** 拖拽中那一格的左上角（收藏区坐标，已含跟手位移）—— 在测量里读，别在组合期读。 */
+    fun draggingVisualOffset(size: Size): Offset {
+        val center = draggingVisualCenter() ?: return Offset.Zero
+        return Offset(center.x - size.width / 2f, center.y - size.height / 2f)
     }
 
     fun onDragStart(position: Offset) {
@@ -1304,7 +1362,7 @@ private class PinDragState(
             currentSlot = 0
             initialCenter = centers[key] ?: Offset.Zero
         }
-        lastSlots.clear()
+        pendingShifts.clear()
         totalDrag = Offset.Zero
         translationX = 0f
         translationY = 0f
@@ -1342,8 +1400,20 @@ private class PinDragState(
             val fromIndexInCells = model.cells.indexOfFirst { it is Cell.Pin && cellKey(it) == key }
             val pinIndices = model.cells.indices.filter { model.cells[it] is Cell.Pin }
             if (fromIndexInCells >= 0 && bestSlot in pinIndices.indices) {
+                // 换位前后各取一份顺序，才能算清"谁给谁让了位"：只知道自己挪到哪不够 —— 被推着走的
+                // 那些格子也要各自滑一格（用户 2026-10-16 要的就是这个）。
+                // 这里读 `model.visibleCells` 而不是组合用的 `visibleCells`：后者要等下一次组合才更新。
+                val before = model.visibleCells.filterIsInstance<Cell.Pin>().map { cellKey(it) }
                 val toIndexInCells = pinIndices[bestSlot]
                 model.movePin(fromIndexInCells, toIndexInCells)
+                val after = model.visibleCells.filterIsInstance<Cell.Pin>().map { cellKey(it) }
+                for ((index, movedKey) in after.withIndex()) {
+                    val previous = before.indexOf(movedKey)
+                    if (previous < 0 || previous == index) continue
+                    val from = initialSlots.getOrNull(previous) ?: continue
+                    val to = initialSlots.getOrNull(index) ?: continue
+                    pendingShifts[movedKey] = from - to
+                }
                 currentSlot = bestSlot
             }
         }
@@ -1360,7 +1430,7 @@ private class PinDragState(
         translationX = 0f
         translationY = 0f
         initialSlots = emptyList()
-        lastSlots.clear()
+        pendingShifts.clear()
         model.persistOrder()
         android.util.Log.i(
             "BubbleDrawer",
