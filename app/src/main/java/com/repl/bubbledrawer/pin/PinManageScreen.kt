@@ -3,6 +3,8 @@ package com.repl.bubbledrawer.pin
 import android.content.res.Configuration
 import android.graphics.drawable.Drawable
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.VectorConverter
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -51,6 +53,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
@@ -757,6 +760,29 @@ private fun SharedPinsSection(
         modifier = Modifier
             .fillMaxWidth()
             .onGloballyPositioned { sectionCoordinates = it }
+            // 长按拖动排序的手势挂在**整个收藏区**上，而不是每一格上。
+            //
+            // 挂在每一格上有个致命后果：换位之后"这一格"在组合里已经被别人占了（下面的格子按位置
+            // 组合，没有 key），`pointerInput` 的键（应用标识）跟着变 → 手势协程被取消 →
+            // `onDragCancel` → 拖拽在**第一次换位的那一瞬间**就被放下（用户 2026-10-16 的原话：
+            // 「app 顺序一变就自己放下来了」）。收藏区这个节点从头到尾不动，手势就不会被打断；
+            // 抓的是哪一格交给落点判定（[PinDragState.grabAt]）。
+            .pointerInput(model.manageMode, drag) {
+                if (!model.manageMode) return@pointerInput
+                detectDragGesturesAfterLongPress(
+                    onDragStart = { drag.onDragStart(it) },
+                    onDrag = { change, amount ->
+                        // 只有真抓住了某一格才吃手势：长按在标题行 / 功能格 / 展开行上时，
+                        // 不要替列表吞掉滚动。
+                        if (drag.isDragging) {
+                            change.consume()
+                            drag.onDrag(amount)
+                        }
+                    },
+                    onDragEnd = { drag.onDragEnd() },
+                    onDragCancel = { drag.onDragEnd() },
+                )
+            }
             .padding(horizontal = 14.dp),
     ) {
         HeadRow(headText)
@@ -1016,6 +1042,12 @@ private fun SectionExpandRow(onToggle: () -> Unit) {
 /** 展开提示的透明度：比正文浅一档，不跟应用列表抢注意力（用户 P 的那版就是这个观感）。 */
 private const val ExpandRowAlpha = 0.55f
 
+/** 长按落点判定的余量：格子之间本来没有缝，给一点容差让边缘也能抓住。 */
+private const val SLOT_SLOP_PX = 12f
+
+/** 让位动画时长：短到不拖沓，长到看得清"谁给谁让了位"（用户 2026-10-16 要的就是这个）。 */
+private const val SLOT_ANIM_MS = 180
+
 /**
  * ★ pinned cell: same tile as [AppCell] plus the long-press drag handle.
  */
@@ -1035,38 +1067,50 @@ private fun PinCell(
     val isDragging = drag.draggingKey == key
     var centerInParent by remember { mutableStateOf(Offset.Zero) }
 
+    // 让位动画（用户 2026-10-16：「app 顺序一变就自己放下来了，也没有移动让位的动画」）：
+    // 顺序一变，这一格就被渲染到**新槽位**上 —— 从旧槽位滑过来。位移用按下那一刻登记的槽位中心
+    // 算（[PinDragState.shiftFor]），不必等布局，也因此不怕"这一格换了谁"（组合位置是位置，
+    // 身份靠 [cellKey]，两者的对应关系一变，这里就能看出来）。
+    val slot = drag.slotOf(key)
+    val shift = remember { Animatable(Offset.Zero, Offset.VectorConverter) }
+    LaunchedEffect(key, slot, isDragging) {
+        if (isDragging) {
+            shift.snapTo(Offset.Zero)
+            return@LaunchedEffect
+        }
+        val delta = drag.shiftFor(key, slot)
+        if (delta != null) {
+            shift.snapTo(delta)
+            shift.animateTo(Offset.Zero, animationSpec = tween(SLOT_ANIM_MS))
+        } else if (shift.value != Offset.Zero) {
+            shift.snapTo(Offset.Zero)
+        }
+    }
+    // 这一格退出渲染（取消收藏、折叠到 20 个之外）时不用自己收落点：`onDragStart` 会按当前收藏
+    // 清掉多余的键（用 `DisposableEffect` 收反而会在换位时把**正在拖的那一格**误删 —— 格子是按位置
+    // 组合的，位置 A 换了主人就会触发旧主人的 onDispose）。
+
     Box(
-        modifier = (if (isDragging) Modifier else modifier)
+        modifier = modifier
             .zIndex(if (isDragging) 1f else 0f)
             .onGloballyPositioned { coords ->
-                if (!drag.isDragging) {
-                    val rootPos = if (sectionCoordinates != null && sectionCoordinates.isAttached && coords.isAttached) {
-                        sectionCoordinates.localPositionOf(coords, Offset.Zero)
-                    } else {
-                        coords.positionInParent()
-                    }
-                    centerInParent = rootPos + Offset(coords.size.width / 2f, coords.size.height / 2f)
-                    drag.register(key, centerInParent)
+                // 拖拽期间也照登记：换位之后每一格都被摆到新槽位上，落点表跟着走才是对的
+                // （拖拽本身的参照系是按下那一刻的快照，见 [PinDragState.initialSlots]）。
+                val rootPos = if (sectionCoordinates != null && sectionCoordinates.isAttached && coords.isAttached) {
+                    sectionCoordinates.localPositionOf(coords, Offset.Zero)
+                } else {
+                    coords.positionInParent()
                 }
+                centerInParent = rootPos + Offset(coords.size.width / 2f, coords.size.height / 2f)
+                drag.register(key, centerInParent, Size(coords.size.width.toFloat(), coords.size.height.toFloat()))
             }
             .graphicsLayer {
-                translationX = if (isDragging) drag.translationX else 0f
-                translationY = if (isDragging) drag.translationY else 0f
+                // 拖拽中的那一格跟手指；其余格子只可能被"让位"推着走。
+                translationX = if (isDragging) drag.translationX else shift.value.x
+                translationY = if (isDragging) drag.translationY else shift.value.y
                 scaleX = if (isDragging) 1.12f else 1f
                 scaleY = if (isDragging) 1.12f else 1f
                 alpha = if (isDragging) 0.9f else 1f
-            }
-            .pointerInput(model.manageMode, key) {
-                if (!model.manageMode) return@pointerInput
-                detectDragGesturesAfterLongPress(
-                    onDragStart = { drag.onDragStart(key) },
-                    onDrag = { change, amount ->
-                        change.consume()
-                        drag.onDrag(amount)
-                    },
-                    onDragEnd = { drag.onDragEnd() },
-                    onDragCancel = { drag.onDragEnd() },
-                )
             },
         contentAlignment = Alignment.Center,
     ) {
@@ -1186,21 +1230,71 @@ private class PinDragState(
     var translationY by mutableStateOf(0f)
         private set
 
+    /** key → 格子中心；[sizes] 是同一格的尺寸（长按落点判定用）。都是渲染时登记的。 */
     private val centers = HashMap<String, Offset>()
+    private val sizes = HashMap<String, Size>()
     private var initialSlots = emptyList<Offset>()
     private var currentSlot = 0
     private var initialCenter = Offset.Zero
     private var totalDrag = Offset.Zero
 
-    fun register(key: String, center: Offset) {
-        if (draggingKey == null) {
-            centers[key] = center
-        }
+    /** key → 上一次被观察到的槽位（让位动画用，见 [shiftFor]）。 */
+    private val lastSlots = HashMap<String, Int>()
+
+    fun register(key: String, center: Offset, size: Size) {
+        centers[key] = center
+        sizes[key] = size
     }
 
-    fun onDragStart(key: String) {
-        draggingKey = key
+    /** 长按落点抓的是哪一格：取最近的、且落在它自己那格范围里的中心点；没命中就 null。 */
+    private fun grabAt(position: Offset): String? {
+        var best: String? = null
+        var bestDist = Float.MAX_VALUE
+        for ((key, center) in centers) {
+            val size = sizes[key] ?: continue
+            val dx = position.x - center.x
+            val dy = position.y - center.y
+            if (dx < -(size.width / 2f + SLOT_SLOP_PX) || dx > size.width / 2f + SLOT_SLOP_PX) continue
+            if (dy < -(size.height / 2f + SLOT_SLOP_PX) || dy > size.height / 2f + SLOT_SLOP_PX) continue
+            val dist = dx * dx + dy * dy
+            if (dist < bestDist) {
+                bestDist = dist
+                best = key
+            }
+        }
+        return best
+    }
+
+    /** 这一格现在在哪个槽位（不在拖拽中返回 -1）—— 让位动画与落点换算都用它。 */
+    fun slotOf(key: String): Int {
+        if (draggingKey == null) return -1
+        return visiblePins().indexOfFirst { cellKey(it) == key }
+    }
+
+    /**
+     * 让位动画：这一格从**上一次观察到的槽位**挪到现在这个槽位的像素差（旧 − 新）。
+     * 没挪过 / 不在拖拽中 = null。
+     *
+     * 槽位中心取按下那一刻的快照 [initialSlots]：拖拽期间布局怎么变都不影响这套算术，而且
+     * 一次拖拽里连挪两格（被别格推着走）也对 —— 每次观察到的槽位都跟上一比。
+     */
+    fun shiftFor(key: String, slot: Int): Offset? {
+        val previous = lastSlots.put(key, slot)
+        if (draggingKey == null || previous == null || previous == slot) return null
+        val from = initialSlots.getOrNull(previous) ?: return null
+        val to = initialSlots.getOrNull(slot) ?: return null
+        return from - to
+    }
+
+    fun onDragStart(position: Offset) {
         val pins = visiblePins()
+        // 落点表只留"现在真的画着"的格子：取消收藏、折叠到 20 个之外的格子不会自己注销，
+        // 留着就是抓得住的幽灵格子（先清再抓，免得抓到一个已经不在的）。
+        val alive = pins.mapTo(HashSet()) { cellKey(it) }
+        centers.keys.retainAll(alive)
+        sizes.keys.retainAll(alive)
+        val key = grabAt(position) ?: return
+        draggingKey = key
         initialSlots = pins.mapNotNull { centers[cellKey(it)] }
         val myPos = pins.indexOfFirst { cellKey(it) == key }
         if (myPos >= 0 && initialSlots.size == pins.size) {
@@ -1210,6 +1304,7 @@ private class PinDragState(
             currentSlot = 0
             initialCenter = centers[key] ?: Offset.Zero
         }
+        lastSlots.clear()
         totalDrag = Offset.Zero
         translationX = 0f
         translationY = 0f
@@ -1265,6 +1360,7 @@ private class PinDragState(
         translationX = 0f
         translationY = 0f
         initialSlots = emptyList()
+        lastSlots.clear()
         model.persistOrder()
         android.util.Log.i(
             "BubbleDrawer",

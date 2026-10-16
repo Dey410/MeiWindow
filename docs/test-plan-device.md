@@ -93,6 +93,24 @@ E:\Android\Sdk\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app
 修法：`rememberUpdatedState(visibleCells)`，lambda 在**按下那一刻**读最新值（这也是它当初写成 lambda
 的理由 —— `remember(model)` 只跑一次，直接捕获局部变量就会把它冻结）。`PIN_DRAG_START` 那行日志就是
 为这个失败模式留的证据：`slots` 与 `pins` 不齐时它标 `SLOTS_MISMATCH`。
+
+### 拖到第一次换位就被"放下"（用户 2026-10-16 第二轮：「app 顺序一变就自己放下来了，也没有移动让位的动画」）
+
+两件事，都在同一次改动里：
+
+1. **手势原来挂在每一格上**。收藏区是按位置组合的（`Column{ Row{ Box{ PinCell } } }`，没有 `key`），
+   换位之后"这一格"在组合里已经被别人占了，`pointerInput(manageMode, key)` 的键（应用标识）跟着变
+   → 手势协程被取消 → `onDragCancel` → 刚换完一次位就被放下。现在手势挂在**收藏区**这个从头到尾
+   不动的节点上（它只驱动拖拽状态，不认具体哪一格），抓的是哪一格由长按落点判定：`grabAt()` 取
+   "最近的、且落在自己那格范围内"的中心点（落点表由每一格 `onGloballyPositioned` 登记，
+   `onDragStart` 先按当前收藏清掉多余的键 —— 取消收藏/折叠到 20 个之外的格子不会自己注销）。
+2. **没有让位动画**（普通 `Column` 没有 `animateItem`，那只对 lazy 列表有效）。现在每一格
+   `LaunchedEffect(key, slot, isDragging)` 盯着自己的槽位：一变就从旧槽位滑到新槽位
+   （位移 = 按下那一刻登记的两个槽位中心之差，`SLOT_ANIM_MS` = 180ms；拖拽中的那一格不参与，
+   它贴着手指）。
+
+判据：拖一个应用横跨两格 —— 让位的格子各滑一格（看得见"谁给谁让了位"）、拖的那一格始终贴着手指、
+**中途不会掉下来**、松手后顺序持久化。
 - [ ] 固定后回主界面 → 角落滑动气泡条即时更新
 
 ## A7 持久与保活
