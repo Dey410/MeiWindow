@@ -43,6 +43,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -134,8 +135,13 @@ fun PinManageScreen(
     // 折叠后的 cell 列表（推荐 / 收藏各最多 Sections.VISIBLE_MAX 个）：网格、收藏区、字母条、
     // 拖拽落点**必须用同一份**，否则字母条按下标跳转、拖拽按下标换位都会落到别的地方去。
     val visibleCells = remember(model.cells, model.pinsExpanded, model.recommendExpanded) { model.visibleCells }
+    // 拖拽落点要在**按下那一刻**现取，所以这里存的是"最新那一份"而不是值本身：`remember(model)`
+    // 只跑一次，直接捕获 `visibleCells` 会把**首次组合**时的那一份冻在 lambda 里 —— 而模型的应用
+    // 列表是异步装进来的（`cells` 初值 emptyList），首次组合时它往往还是空的，于是每次拖拽都是
+    // `pins=0`：长按只放大、怎么拖都不动（用户 2026-10-16 的反馈）。
+    val currentVisibleCells = rememberUpdatedState(visibleCells)
     val drag = remember(model) {
-        PinDragState(model) { visibleCells.filterIsInstance<Cell.Pin>() }
+        PinDragState(model) { currentVisibleCells.value.filterIsInstance<Cell.Pin>() }
     }
     val title = stringResource(R.string.slide_launch_app_settings_title)
     // 顶部共用收藏区在功能页上装的是「已选功能」，提示语跟着换 —— 否则功能页写着「暂无收藏应用」。
@@ -1162,6 +1168,9 @@ private class PinDragState(
      *
      * 传 lambda 而不是列表：状态本身按 `remember(model)` 复用（`movePin` 会改 `cells`，把它当 key
      * 会让每次换位都重建状态、拖到一半断掉），所以列表要在**按下那一刻**现取。
+     *
+     * **这个 lambda 必须读得到当下的值**（调用方用 `rememberUpdatedState` 喂进来）：`remember(model)`
+     * 只在首次组合跑一次，直接捕获一个局部变量会把那一份**永远冻住**。
      */
     private val visiblePins: () -> List<Cell.Pin>,
 ) {
@@ -1204,6 +1213,15 @@ private class PinDragState(
         totalDrag = Offset.Zero
         translationX = 0f
         translationY = 0f
+        // 「长按只放大、怎么拖都不动」这类反馈唯一能事后核对的东西：`slots` 必须等于 `pins`
+        // （`slots=0` 就是落点表是空的 —— 拖拽只能在原地放大，一个格子都换不了）。用户 2026-10-16。
+        val line = "PIN_DRAG_START key=$key pins=${pins.size} slots=${initialSlots.size} " +
+            "centers=${centers.size} myPos=$myPos"
+        if (myPos >= 0 && initialSlots.size == pins.size) {
+            android.util.Log.i("BubbleDrawer", line)
+        } else {
+            android.util.Log.w("BubbleDrawer", "$line SLOTS_MISMATCH")
+        }
     }
 
     fun onDrag(amount: Offset) {
@@ -1242,11 +1260,16 @@ private class PinDragState(
 
     fun onDragEnd() {
         if (draggingKey == null) return
+        val key = draggingKey
         draggingKey = null
         translationX = 0f
         translationY = 0f
         initialSlots = emptyList()
         model.persistOrder()
+        android.util.Log.i(
+            "BubbleDrawer",
+            "PIN_DRAG_END key=$key index=${model.cells.indexOfFirst { it is Cell.Pin && cellKey(it) == key }}",
+        )
     }
 }
 

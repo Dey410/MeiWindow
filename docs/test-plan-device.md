@@ -65,7 +65,10 @@ E:\Android\Sdk\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app
       （56dp 仿 ActionBar：标题 + 管理/完成 + ✕；4 列网格、★区、A–Z、字母条都在）
 - [ ] 面板**屏幕居中**；设置页"更多面板"四个滑杆（长/宽 = 占屏幕 %、图标 dp、文字 sp）改完下次开面板生效
 - [ ] 点面板外部 → 关闭；轻遮罩 `#33000000` 随面板一起收
-- [ ] 管理/完成可用：编辑态点击加/减固定、★区长按拖动排序，退出面板后顺序仍在
+- [ ] 管理/完成可用：编辑态点击加/减固定、★区长按拖动排序，退出面板后顺序仍在；
+      日志 `PIN_DRAG_START key=… pins=N slots=N centers=N myPos=K`（`slots` 必须等于 `pins`；
+      `slots=0` 就是"长按只放大、怎么拖都不动"，不齐时同一行会标 `SLOTS_MISMATCH`）、
+      松手 `PIN_DRAG_END key=… index=…`
 - [ ] 面板里点应用 → 面板收起，应用以**面板的位置/大小**开小窗（日志 `MORE_LAUNCH … rect=`）
 - [ ] `adb shell am broadcast -a com.repl.bubbledrawer.action.DEBUG_MORE` 可开关面板；
       `adb logcat -s BubbleDrawer` 有 `MORE_PANEL_SHOW [l,t][r,b] screen=… pct=… page=texts=[…]`
@@ -76,7 +79,20 @@ E:\Android\Sdk\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app
 - [ ] 超过 6 个 → toast"最多固定 6 个"
 - [ ] A–Z 分组：微信在 W、支付宝在 Z、QQ 在 Q、数字开头在 0 桶、符号在 #（最底）
 - [ ] 右侧字母条：点字母滚动到组；滚动时当前字母同步
-- [ ] ★ 区长按拖动排序；"管理/完成"切换后顺序持久化
+- [ ] ★ 区长按拖动排序；"管理/完成"切换后顺序持久化。
+      **冷启动就拖**：`PIN_DRAG_START` 的 `pins` 不能是 0（2026-10-16 的回归正是首次组合时把空列表冻进了拖拽状态）
+
+### 长按拖动排序失效（用户 2026-10-16：「编辑收藏时无法排序，长按只能放大无法移动」）
+
+成因是 **Compose 的 `remember` 把首次组合的那一份列表冻住了**：`PinDragState` 的落点表由
+`remember(model) { PinDragState(model) { visibleCells.filterIsInstance<Cell.Pin>() } }` 喂进去，而
+`PinManageModel.cells` 的初值是 `emptyList()`、应用列表由 `reload()` **异步**装（`scope.launch`）——
+首次组合时它必然是空的，于是每次长按拿到的 `pins` 恒为 0、`initialSlots` 也是空的，
+`onDrag` 第一行就 return：外观上只剩 `draggingKey` 打开的那一下 1.12 倍放大，怎么拖都不动。
+
+修法：`rememberUpdatedState(visibleCells)`，lambda 在**按下那一刻**读最新值（这也是它当初写成 lambda
+的理由 —— `remember(model)` 只跑一次，直接捕获局部变量就会把它冻结）。`PIN_DRAG_START` 那行日志就是
+为这个失败模式留的证据：`slots` 与 `pins` 不齐时它标 `SLOTS_MISMATCH`。
 - [ ] 固定后回主界面 → 角落滑动气泡条即时更新
 
 ## A7 持久与保活
