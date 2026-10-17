@@ -293,6 +293,28 @@ object RemotePrefs {
     const val KEY_FLYME_FREEFORM_SWIPE_DOWN_FULL = "flyme_freeform_swipe_down_full"
     const val KEY_FLYME_FREEFORM_DIM_BG = "flyme_freeform_dim_bg"
 
+    /**
+     * 「回桌面不收迷你」：全面屏手势上滑回桌面时，ROM 会把**所有**小窗一次性收成迷你小窗。
+     *
+     * 用户 2026-10-17：「目前上滑时会把所有小窗变为迷你小窗……在实验性功能里加一个“回桌面不收迷你”
+     * 的开关。」这不是模块的行为，也不是「上滑小白条」那条单窗口路径 —— 它走的是框架广播
+     * `com.miui.fullscreen_state_change`（`state=toHome` / `toRecents`）→ WMShell
+     * `MiuiFreeformModeSettingsObserver.FreeFormBroadcastReceiver` →
+     * `MiuiFreeformModeController.allFreeformFromFreeformToMini()`，遍历 Z 序上每一个小窗调
+     * `fromFreeformToMini(taskId)`（缩小 + 贴到上方左/右角 + 迷你看转场）。
+     *
+     * 打开后模块在系统界面进程里把「批量」那两处入口拦掉（见
+     * `FlymeFreeformController.hookHomeKeepFreeform`）：小窗保持原样，`toHome` 与 `toRecents` 都拦
+     * （用户说的"上滑"落在这两个状态上都意味着"系统自动收迷你"，只拦一半的话同一开关会时灵时不灵）。
+     * 模块自己的「小白条上滑 → 迷你小窗」是 `fromFreeformToMini(int)` 一层，**不受影响**；
+     * ROM 从最近任务以小窗打开（`startEnterMiniShellTransition(..., "fromRecent")`）也不受影响。
+     *
+     * 与「Flyme 样式轻量小窗」总开关**无关**：像 [DEFAULT_FLYME_FREEFORM_NO_OFFSET] 一样，这是对
+     * HyperOS 自身行为的开关，原生小窗模式下同样生效，所以不做 `flymeFreeformEnabled` 门控。
+     */
+    const val KEY_HOME_KEEP_FREEFORM = "home_keep_freeform"
+    const val DEFAULT_HOME_KEEP_FREEFORM = false
+
     const val DEFAULT_FLYME_FREEFORM_ENABLED = false
     const val DEFAULT_FLYME_FREEFORM_CENTER = true
 
@@ -449,6 +471,8 @@ object RemotePrefs {
         val flymeFreeformSwipeUpHoldFree: Boolean = DEFAULT_FLYME_FREEFORM_SWIPE_UP_HOLD_FREE,
         val flymeFreeformSwipeDownFull: Boolean = DEFAULT_FLYME_FREEFORM_SWIPE_DOWN_FULL,
         val flymeFreeformDimBg: Boolean = DEFAULT_FLYME_FREEFORM_DIM_BG,
+        /** 回桌面不收迷你（见 [KEY_HOME_KEEP_FREEFORM]，与 Flyme 样式总开关无关） */
+        val homeKeepFreeform: Boolean = DEFAULT_HOME_KEEP_FREEFORM,
         /** 小窗底部联系人条（Flyme「联系人头像」） */
         val contactBar: Boolean = DEFAULT_CONTACT_BAR,
         /** 联系人条尺寸阈值：小窗宽度低于屏幕宽度的 N% 时隐藏（0 = 关闭该限制） */
@@ -579,6 +603,7 @@ object RemotePrefs {
             flymeFreeformSwipeUpHoldFree = sp.getBoolean(KEY_FLYME_FREEFORM_SWIPE_UP_HOLD_FREE, DEFAULT_FLYME_FREEFORM_SWIPE_UP_HOLD_FREE),
             flymeFreeformSwipeDownFull = sp.getBoolean(KEY_FLYME_FREEFORM_SWIPE_DOWN_FULL, DEFAULT_FLYME_FREEFORM_SWIPE_DOWN_FULL),
             flymeFreeformDimBg = sp.getBoolean(KEY_FLYME_FREEFORM_DIM_BG, DEFAULT_FLYME_FREEFORM_DIM_BG),
+            homeKeepFreeform = sp.getBoolean(KEY_HOME_KEEP_FREEFORM, DEFAULT_HOME_KEEP_FREEFORM),
             contactBar = sp.getBoolean(KEY_CONTACT_BAR, DEFAULT_CONTACT_BAR),
             contactBarMinWidthPct = sp.getInt(KEY_CONTACT_BAR_MIN_WIDTH_PCT, DEFAULT_CONTACT_BAR_MIN_WIDTH_PCT)
                 .coerceIn(CONTACT_BAR_MIN_WIDTH_MIN, CONTACT_BAR_MIN_WIDTH_MAX),

@@ -916,6 +916,26 @@ fun ExperimentalSettingsScreen(
                 },
             )
 
+            // --- 回到桌面 ---
+            // 这一项压的是 ROM 自己的行为（回桌面时把所有小窗收成迷你），和「禁止小窗偏移」同性质：
+            // 不开 Flyme 样式小窗也该生效，所以**不**跟总开关联动。
+            item(key = "exp-home-title") {
+                SmallTitle(text = stringResource(R.string.exp_section_home))
+            }
+            groupedCardItems(
+                keyPrefix = "exp-home",
+                items = listOf(
+                    CardItem("home-keep-freeform") {
+                        SwitchRow(
+                            title = stringResource(R.string.exp_home_keep_freeform),
+                            summary = stringResource(R.string.exp_home_keep_freeform_summary),
+                            checked = snap.homeKeepFreeform,
+                            onCheckedChange = actions::setHomeKeepFreeform,
+                        )
+                    },
+                ),
+            )
+
             // --- 说明 ---
             item(key = "exp-info-title") {
                 SmallTitle(text = stringResource(R.string.exp_section_info))

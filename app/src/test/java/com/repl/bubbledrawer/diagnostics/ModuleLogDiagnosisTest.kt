@@ -32,6 +32,7 @@ class ModuleLogDiagnosisTest {
             "${LOGCAT_PREFIX}HOOK_INSTALLED_RestoreAvoid",
             "${LOGCAT_PREFIX}HOOK_INSTALLED_onBottomCaptionHandleMotionEvents",
             "${LOGCAT_PREFIX}HOOK_INSTALLED_MiuiFreeformModeAnimation.startGestureAnimation",
+            "${LOGCAT_PREFIX}HOOK_INSTALLED_MiuiFreeformModeController.allFreeformFromFreeformToMini hooks=2",
             "${LOGCAT_PREFIX}PROBE prefs[enabled=true center=true scale=80 mini=true dim=true outside=true noOffset=false]",
             // 真机原样的一行：976x1561 的窗口在 1220x2656 的屏幕上，落点 (122, 547) 就是正中。
             LSPD_PREFIX + "CENTERED_BOUNDS rect=Rect(122, 547 - 1342, 2499) scale=0.8 src=rom " +
@@ -71,6 +72,28 @@ class ModuleLogDiagnosisTest {
         assertEquals("全部正常", diagnosis.headline)
         assertTrue(diagnosis.checks.any { it.id == "placement.last" && it.status == CheckStatus.PASS })
         assertTrue(diagnosis.checks.any { it.id == "settings.effective" && it.status == CheckStatus.PASS })
+    }
+
+    @Test
+    fun aRomWithoutTheBatchMiniEntryIsInfoNotAWarning() {
+        // 老 ROM：类在、那两个入口不在 —— 它本来就不做批量迷你化，这不该算故障。
+        val lines = HEALTHY.filterNot {
+            it.contains("HOOK_INSTALLED_MiuiFreeformModeController")
+        } + "${LOGCAT_PREFIX}HOME_KEEP_HOOK_UNAVAILABLE reason=method"
+        val check = checksOf(lines).first { it.id == "hooks.home_keep_freeform" }
+
+        assertEquals(CheckStatus.INFO, check.status)
+        assertTrue("detail should name the reason: ${check.detail}", check.detail.contains("method"))
+    }
+
+    @Test
+    fun anOldBuildWithoutTheRecordIsWarned() {
+        // 上一版模块的日志里根本没有这一行：不能当作"装上了"，也不能当作"这 ROM 没有入口"。
+        val lines = HEALTHY.filterNot { it.contains("HOOK_INSTALLED_MiuiFreeformModeController") }
+        val check = checksOf(lines).first { it.id == "hooks.home_keep_freeform" }
+
+        assertEquals(CheckStatus.WARN, check.status)
+        assertTrue("detail should suggest upgrading: ${check.detail}", check.detail.contains("旧版本"))
     }
 
     @Test

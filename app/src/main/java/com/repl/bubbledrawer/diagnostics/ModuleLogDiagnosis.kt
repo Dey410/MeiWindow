@@ -352,6 +352,42 @@ object ModuleLogDiagnosis {
             ),
         )
 
+        // 「回桌面不收迷你」：这里只回答"拦得住吗" —— 那两处入口是否装上了。装不上（旧 ROM 没有这两个
+        // 方法）时开关打开也不会生效，上滑回桌面照样把所有小窗收成迷你小窗。
+        val homeKeepHook = lines.lastOrNull {
+            it.contains("HOOK_INSTALLED_MiuiFreeformModeController.allFreeformFromFreeformToMini")
+        }
+        val homeKeepSkipped = lines.lastOrNull { it.contains("FREEFORM_HOME_KEEP_SKIPPED") }
+        // 装不上有两种性质完全不同的原因：方法不存在（这台 ROM 本来就没有批量迷你化 → INFO）与安装抛异常
+        // （该拦却没拦住 → FAIL）。日志里分得开就别混成一句"开关可能没用"。
+        val homeKeepUnavailable = lines.lastOrNull { it.contains("HOME_KEEP_HOOK_UNAVAILABLE") }
+        val homeKeepFailed = lines.lastOrNull { it.contains("HOME_KEEP_HOOK_FAILED_") }
+        add(
+            DiagnosisCheck(
+                id = "hooks.home_keep_freeform",
+                group = CheckGroup.HOOKS,
+                title = "回桌面不收迷你 hook",
+                status = when {
+                    homeKeepHook != null -> CheckStatus.PASS
+                    homeKeepFailed != null -> CheckStatus.FAIL
+                    homeKeepUnavailable != null -> CheckStatus.INFO
+                    else -> CheckStatus.WARN
+                },
+                detail = when {
+                    homeKeepHook != null && homeKeepSkipped != null ->
+                        "已安装，并且已经拦下过（${homeKeepSkipped.substringAfter("via=").trim()}）"
+                    homeKeepHook != null -> "已安装：开关打开后回桌面 / 进最近任务都不会再把小窗收成迷你小窗"
+                    homeKeepFailed != null -> "安装抛异常了：开关打开也拦不住，回桌面仍会把所有小窗收成迷你小窗"
+                    homeKeepUnavailable != null ->
+                        "这台 ROM 里没有批量迷你化的入口（" +
+                            homeKeepUnavailable.substringAfter("reason=").trim() + "），开关不会生效，也不需要生效"
+                    else -> "日志里没有这一项（旧版本）：升级到带这个开关的版本后才会出现"
+                },
+                evidence = (homeKeepSkipped ?: homeKeepFailed ?: homeKeepUnavailable ?: homeKeepHook)
+                    ?.let(::trimPrefix),
+            ),
+        )
+
         val installed = lines.filter { it.contains("HOOK_INSTALLED_") }.distinctBy { it.substringAfter("HOOK_INSTALLED_").take(40) }
         if (installed.isNotEmpty()) {
             add(

@@ -197,6 +197,7 @@ object RemoteBridge {
             .putBoolean(RemotePrefs.KEY_FLYME_FREEFORM_SWIPE_UP_HOLD_FREE, snap.flymeFreeformSwipeUpHoldFree)
             .putBoolean(RemotePrefs.KEY_FLYME_FREEFORM_SWIPE_DOWN_FULL, snap.flymeFreeformSwipeDownFull)
             .putBoolean(RemotePrefs.KEY_FLYME_FREEFORM_DIM_BG, snap.flymeFreeformDimBg)
+            .putBoolean(RemotePrefs.KEY_HOME_KEEP_FREEFORM, snap.homeKeepFreeform)
             .putBoolean(RemotePrefs.KEY_CONTACT_BAR, snap.contactBar)
             .putInt(RemotePrefs.KEY_CONTACT_BAR_MIN_WIDTH_PCT, snap.contactBarMinWidthPct)
         if (localPins != null) {

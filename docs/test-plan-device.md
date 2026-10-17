@@ -946,3 +946,37 @@ ROM 自己用 `MiuiMultiWindowUtils.getActivityOptions(ctx, 目标包, true)` �
 - [ ] 长按拖动排序仍然正常（拖动时不会变成滚页）：长按某一格 → 放大 → 拖动换位 →
       让位动画照旧（回归 A6 的那三条）
 
+## A30 实验性功能：「回桌面不收迷你」（2026-10-17 新增）
+
+**用户要的**：「目前上滑时会把所有小窗变为迷你小窗……在实验性功能里加一个“回桌面不收迷你”的开关」
+（"上滑" = 全面屏手势上滑回桌面）。
+
+**这是 ROM 的行为，不是模块的**：framework 发广播 `com.miui.fullscreen_state_change`
+（`state=toHome` / `toRecents`）→ WMShell `MiuiFreeformModeSettingsObserver.FreeFormBroadcastReceiver:90-103`
+→ `MiuiFreeformModeController.allFreeformFromFreeformToMini()` →（可能先等 100ms 给旋转让路）
+`allFreeformFromFreeformToMiniInternal()`：**遍历 Z 序上每一个小窗**，跳过正在拖拽缩放/连续动画/
+转场中/正在退出或进入/elude 动画的，其余逐个 `fromFreeformToMini(taskId)` —— mode 1 + 迷你缩放 +
+贴到上方左/右角 + `startGestureAnimation(11, …)`。这就是"所有小窗一起变迷你"的来源。
+（模块自己的「小白条上滑 → 迷你小窗」只作用于那一个窗口，走的是同一层的 `fromFreeformToMini(int)`。）
+
+**改法**：模块在系统界面进程钩住那两个**无参**入口（`FlymeFreeformController.hookHomeKeepFreeform`），
+开关打开时不 proceed，并记 `FREEFORM_HOME_KEEP_SKIPPED via=…`。只拦"批量"这一层 ——
+模块的单窗口路径、「从最近任务以小窗打开」（`startEnterMiniShellTransition(…, "fromRecent")`）都不受影响。
+与 Flyme 样式轻量小窗总开关**无关**（和「禁止小窗偏移」同性质：压的是 ROM 自身行为，原生小窗也应生效）。
+
+取证（模块日志或 `adb logcat -s BubbleDrawer`）：
+`HOOK_INSTALLED_MiuiFreeformModeController.allFreeformFromFreeformToMini hooks=2`
+（两个入口都装上），开关打开后再上滑回桌面应出现 `FREEFORM_HOME_KEEP_SKIPPED via=…`。
+
+- [ ] 开关**关**（默认）：开两个小窗 → 上滑回桌面 → 两个都变迷你小窗（现状，作对照）
+- [ ] 开关**开**：同样操作 → 小窗**保持原样**（大小与位置都不动，桌面正常回去），
+      日志出现 `FREEFORM_HOME_KEEP_SKIPPED`；不再出现 `allFreeformFromFreeformToMini`
+- [ ] 开着开关上滑**悬停**进最近任务 → 同样不再收迷你（`toHome` 与 `toRecents` 共用一个入口，一起拦）
+- [ ] 开着开关、且「小白条上滑转为迷你小窗」开着：在某个小窗的小白条上滑 → **该窗口**仍然变迷你小窗
+      （单窗口路径没被误伤）
+- [ ] 开着开关，从最近任务把某个应用**以小窗打开** → 仍正常进入小窗（`fromRecent` 那条路径不受影响）
+- [ ] 关掉开关立刻生效（不用重启系统界面）：值走共享组，钩子里每次读取
+- [ ] 体检页「回桌面不收迷你 hook」= PASS；若为 WARN，说明这台 ROM 里没有那两个入口，
+      开关不会生效（那台 ROM 本来也不做批量迷你化）
+- [ ] 开/关 Flyme 样式轻量小窗总开关，本项行为不变
+

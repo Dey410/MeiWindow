@@ -57,6 +57,7 @@ interface SettingsActions {
     fun setFlymeFreeformSwipeUpHoldFree(enabled: Boolean)
     fun setFlymeFreeformSwipeDownFull(enabled: Boolean)
     fun setFlymeFreeformDimBg(enabled: Boolean)
+    fun setHomeKeepFreeform(enabled: Boolean)
     fun setContactBar(enabled: Boolean)
     fun setContactBarMinWidthPct(pct: Int)
 
@@ -120,6 +121,7 @@ class StoreSettingsActions(private val context: Context) : SettingsActions {
     override fun setFlymeFreeformSwipeUpHoldFree(enabled: Boolean) = SettingsStore.setFlymeFreeformSwipeUpHoldFree(context, enabled)
     override fun setFlymeFreeformSwipeDownFull(enabled: Boolean) = SettingsStore.setFlymeFreeformSwipeDownFull(context, enabled)
     override fun setFlymeFreeformDimBg(enabled: Boolean) = SettingsStore.setFlymeFreeformDimBg(context, enabled)
+    override fun setHomeKeepFreeform(enabled: Boolean) = SettingsStore.setHomeKeepFreeform(context, enabled)
     override fun setContactBar(enabled: Boolean) = SettingsStore.setContactBar(context, enabled)
     override fun setContactBarMinWidthPct(pct: Int) = SettingsStore.setContactBarMinWidthPct(context, pct)
     override fun setLightOpenEnabled(enabled: Boolean) = SettingsStore.setLightOpenEnabled(context, enabled)

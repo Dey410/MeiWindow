@@ -1571,6 +1571,7 @@ class FlymeFreeformController(
             hookTaskToFront(module, classLoader)
             hookImeState(module, classLoader)
             hookGestureAnimation(module, classLoader)
+            hookHomeKeepFreeform(module, prefs, classLoader)
         }
 
         /**
@@ -3017,6 +3018,73 @@ class FlymeFreeformController(
                 }
             }
             log("HOOK_INSTALLED_MiuiFreeformModeAnimation.startGestureAnimation")
+        }
+
+        /**
+         * 「回桌面不收迷你」— 拦掉 ROM 的**批量**小窗 → 迷你小窗。
+         *
+         * 触发链（源码 `out/WMShell_src/…/multitasking/miuifreeform/`）：framework 发
+         * `com.miui.fullscreen_state_change`（`state=toHome` / `toRecents`）→
+         * `MiuiFreeformModeSettingsObserver.FreeFormBroadcastReceiver:90-103` →
+         * `MiuiFreeformModeController.allFreeformFromFreeformToMini()` →（可能先等 100ms 给旋转让路）
+         * `allFreeformFromFreeformToMiniInternal()`：遍历 Z 序上**每一个**小窗，跳过正在拖拽缩放/
+         * 连续动画/转场中/正在退出或进入/elude 动画的那些，其余逐个 `fromFreeformToMini(taskId)`
+         * （mode 1 + 迷你缩放 + 贴到上方左/右角 + `startGestureAnimation(11, …)`）。所以"上滑回桌面
+         * 时所有小窗一起变迷你"只可能来自这里；用户 2026-10-17 要的就是把这个关掉。
+         *
+         * 为什么钩这两个方法而不是那个广播接收器：`Internal()` 还会被"旋转让路"的延迟 runnable 和
+         * shell 命令直接调用，只拦外层在那两条路上会漏；而这两个方法都无参、只做这一件事，拦掉没有
+         * 副作用 —— `mPendingFreeformToMiniForRecents` / `mPendingMiniTaskIds` 这些记账只由
+         * `Internal()` 写，跳过就不会留下"半个批量迷你化"的残留。
+         *
+         * **只拦"批量"**：`fromFreeformToMini(int)` 本身不动 —— 模块自己的「小白条上滑 → 迷你小窗」
+         * 调的正是它（[fromFreeformToMini]），ROM 从最近任务以小窗打开走的也是另一条
+         * `startEnterMiniShellTransition(..., "fromRecent")`，两者都照旧。
+         *
+         * 开关只受 `RemotePrefs.KEY_HOME_KEEP_FREEFORM` 控制，**不看** Flyme 样式小窗总开关
+         * （同 [hookFreeformAvoidOffset]：这是对 ROM 自身行为的开关，原生小窗模式下同样要生效）。
+         */
+        private fun hookHomeKeepFreeform(
+            module: XposedModule,
+            prefs: SharedPreferences,
+            classLoader: ClassLoader,
+        ) {
+            val cls = runCatching {
+                classLoader.loadClass("com.android.wm.shell.multitasking.miuifreeform.MiuiFreeformModeController")
+            }.getOrNull()
+            if (cls == null) {
+                log("HOME_KEEP_HOOK_UNAVAILABLE reason=class")
+                return
+            }
+
+            var installed = 0
+            cls.declaredMethods
+                .filter { it.parameterCount == 0 && it.returnType == Void.TYPE }
+                .filter {
+                    it.name == "allFreeformFromFreeformToMini" || it.name == "allFreeformFromFreeformToMiniInternal"
+                }
+                .forEach { method ->
+                    runCatching {
+                        module.hook(method)
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("bubbledrawer.freeform.home_keep.${method.name}")
+                            .intercept { chain ->
+                                if (!RemotePrefs.read(prefs).homeKeepFreeform) return@intercept chain.proceed()
+                                log("FREEFORM_HOME_KEEP_SKIPPED via=${method.name}")
+                                null
+                            }
+                        installed++
+                    }.onFailure {
+                        module.log(Log.WARN, TAG, "HOME_KEEP_HOOK_FAILED_${method.name}", it)
+                    }
+                }
+            if (installed > 0) {
+                log("HOOK_INSTALLED_MiuiFreeformModeController.allFreeformFromFreeformToMini hooks=$installed")
+            } else {
+                // 类在、方法不在：这台 ROM 的批量迷你化没走那两个入口（老 ROM 常见），开关无事可做 ——
+                // 体检页据此报 INFO 而不是 WARN，免得把"这台本来就不收迷你"说成故障。
+                log("HOME_KEEP_HOOK_UNAVAILABLE reason=method")
+            }
         }
     }
 }
