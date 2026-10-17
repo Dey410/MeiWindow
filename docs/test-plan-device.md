@@ -235,6 +235,8 @@ E:\Android\Sdk\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app
       （日志 `FAN_RETRACT_AUTO_TIMEOUT`）；手指还在滑动时不会中途消失（每个事件重新计时）；
       拖到最左「不自动收起」→ 一直停留，只有点选应用 / 点按面板外部 / 熄屏才收
 - [ ] 点按外部、选中应用、熄屏三条既有收起路径不受影响（`FAN_RETRACT_VOID` / 选中即收 / `FAN_RETRACT_SCREEN_OFF`）
+- [ ] **双击外部关闭**（默认**关**，2026-10-17 新增）：关 = 点扇形外面一下即收；开 = 要连点两下
+      （第一下只记时间，日志 `FAN_VOID_TAP_FIRST`；第二下 `FAN_VOID_TAP_CLOSE mode=double`）。详见 A27
 - [ ] **图标大小**（默认 44 dp，范围 32–64 dp）：拖动后扇形图标与选中光环一起变大变小，
       扇形半径不变、图标间不重叠；扇开着改动即时生效（`FAN_REBIND` 路径 = `rebindFanIfBusy`）
 - [ ] **图标形状**：圆形（默认，Flyme 原样）↔ 系统样式圆角矩形；后者图标与选中光环都变成圆角方形
@@ -874,3 +876,73 @@ adb logcat -s BubbleDrawer | findstr PRESSURE_CALIBRATION
 - [ ] **不可小窗的应用**：把某个 `resizeableActivity=false` 的应用放进白名单 → 仍全屏，
       日志有 `MiuiMultiWindowUtils: pkg name: X unsupported freeform mode`（这是预期，不是 bug）
 - [ ] 开关即时生效：不重启、不重装，在设置页改开关/名单 → 下一次跳转立刻按新配置判定
+
+## A27 扇形：双击外部关闭（2026-10-17）
+
+入口：设置 → 扇形面板外观 → 「双击外部关闭」（默认**关**）。
+
+- [ ] 开关关（默认）：扇形开着 → 点空白处**一下** → 收起；日志 `FAN_VOID_TAP_CLOSE mode=single`
+- [ ] 开关开：点一下 → **不收起**（日志 `FAN_VOID_TAP_FIRST mode=double`）；系统双击时限内再点一下
+      → 收起（`FAN_VOID_TAP_CLOSE mode=double`）
+- [ ] 两下间隔超过双击时限 → 只记第一下，不会误收
+- [ ] 热生效：改完直接划出扇形即可，不用重启系统界面（值走共享组，扇子每次读取）
+- [ ] 与「更多面板」那一项无关：面板仍按它自己的「单击/双击收起」设置走
+
+## A28 收藏应用管理里点应用 → 目标以小窗打开（2026-10-17 修复）
+
+**用户报告的 bug**：主页 → 收藏应用管理 → 点应用 → 目标**没有**小窗，反而**魅窗自己**变成了小窗；
+当时安全中心还弹了「魅窗想要打开 xx，是否继续」。
+
+**成因**：App 进程直接带 MIUI 的 freeform `ActivityOptions` 是走不通的 ——
+`MiuiMultiWindowUtils.getActivityOptions` 先过 `checkAuthority()`，第三方调用者拿到 null，
+手里只剩一个裸的 `setLaunchWindowingMode(5)`；这次启动还要再过系统的「应用间跳转」判定与安全中心
+拦截框，结果那次 freeform 请求落到了**调用者自己**的任务上（魅窗变小窗），目标反而没进小窗。
+
+**现在的链路**（与「应用间跳转」完全相同）：`GateLaunchStrategy` 只给 Intent 加一个标记
+`com.repl.bubbledrawer.extra.FREEFORM_REQUEST`，不带任何 options → system_server 的闸门
+（`LightOpenGate`，钩 `MiuiFreeformServiceImpl.startActivityByFreeForm`）看到标记返回 true →
+ROM 自己用 `MiuiMultiWindowUtils.getActivityOptions(ctx, 目标包, true)` 落窗。与扇形面板
+（SystemUI 身份）走的是同一条道。
+
+- [ ] 「小窗启动」开：主页 → 收藏应用管理 → 点应用 → **目标应用**以小窗打开，
+      **魅窗保持原样**（它自己绝不该变成小窗）
+- [ ] 日志：App 侧 `LAUNCH_GATE_REQUEST pkg=…`；模块日志（system_server 侧）
+      `LIGHT_OPEN_FREEFORM_REQUEST target=… top=…`
+- [ ] 安全中心弹「魅窗想要打开 xx」→ 点「允许」之后那一次启动**仍然是小窗**
+      （标记跟着 Intent 走）；拦截框本身**绝不**变小窗
+- [ ] 目标不支持小窗（`resizeableActivity=false`，例如「设置」）→ 仍然全屏（ROM 的判定，不是 bug）
+- [ ] 「小窗启动」关：点应用 = 普通全屏打开，日志里连 `LAUNCH_GATE_REQUEST` 都不出现
+- [ ] 功能页里点一个**已选功能**（快捷方式）→ 同样小窗（`launchShortcut(…, viaGate = true)`）
+- [ ] 扇形「更多」面板里点应用 → 行为不变（那里是 SystemUI 身份，走 `FreeformLaunchStrategy`）
+- [ ] 该启动不会把魅窗自己弄成小窗、也不会留下"半截"任务：`adb shell dumpsys activity activities`
+      里只应有目标应用那一个小窗任务
+
+## A29 收藏应用管理 / 扇形「更多」页：收藏那一块要能上下滑（2026-10-17 修复）
+
+**用户报告的 bug**：「收藏的应用那一块不响应上下滑动手势」，另外「把上滑淡出删掉」。
+
+**成因**：顶部收藏区（应用 + 已选功能）是**盖在 Pager 上面**的一层（视觉上是可折叠的表头），
+它自己不是滚动容器 —— 手指落在上面时，下面那个 `LazyVerticalGrid` 根本收不到手势。
+收藏一多，这一层就把可视区盖满：先盖掉 TabRow，再盖掉 A-Z 列表，于是整页滑不动。
+面板里最早暴露（窗口只有屏高的 62%，几行收藏就盖满了）；主页的收藏应用管理页同一个问题，
+只是要再多几行才盖满。
+
+**改法**：把落在收藏区上的竖直拖动接回**同一条**滚动链 —— 收藏区那个 `Box` 自己挂一个
+`scrollable`（状态 = 当前页那个网格）+ 顶栏的 `scrollBehavior`，于是外层 `nestedScroll` 照常先
+折叠收藏区、剩下的再滚网格，fling 也一并接上；长按排序进行中把 `scrollable` 关掉
+（`enabled = !drag.isDragging`），拖动排序优先。
+
+**上滑淡出**：`pinsAlpha`（`alpha = 1 + headerOffset/height`）整个删掉，收藏区只平移、全程不透明；
+完全折叠那一刻它正好落在顶栏下沿（顶栏开模糊时是透明的），所以那里做**硬切**不再画，
+避免"顶栏后面透出残影"。
+
+- [ ] 主页 → 收藏应用管理：收藏**超过一屏**（例如 20 个）→ 在**收藏区上**上下滑 → 整页跟着滚
+      （先折叠收藏区，再滚 A-Z 列表）；松手有惯性
+- [ ] 扇形「更多」面板（62% 窗口）里同样操作 → 一样能滑（这是最早暴露的地方）
+- [ ] 从收藏区往下滑（回滚）→ 列表先回到顶，再继续下滑 → 收藏区平滑展开、重新出现
+- [ ] 收藏区**不再淡出**：上滑时它是整体平移出去的，图标不会半透明
+- [ ] 折叠到位后顶栏后面**没有**收藏区残影（它已经不在绘制列表里）
+- [ ] 滚动条/顶栏：从收藏区滑动时顶栏的模糊与收起照常跟随（不是只在网格区域滑才动）
+- [ ] 长按拖动排序仍然正常（拖动时不会变成滚页）：长按某一格 → 放大 → 拖动换位 →
+      让位动画照旧（回归 A6 的那三条）
+

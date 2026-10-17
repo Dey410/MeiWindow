@@ -9,7 +9,10 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.ScrollableDefaults
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.scrollable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -256,10 +259,28 @@ fun PinManageScreen(
     val tabRowY = (topContentPaddingPx + sharedPinsContentHeightPx + headerOffsetPx)
         .coerceAtLeast(topContentPaddingPx)
     val pinsY = topContentPaddingPx + headerOffsetPx
-    val pinsAlpha = if (sharedPinsContentHeightPx > 0f) {
-        (1f + headerOffsetPx / sharedPinsContentHeightPx).coerceIn(0f, 1f)
-    } else 1f
     val pagerY = (sharedPinsContentHeightPx + headerOffsetPx).coerceAtLeast(0f)
+
+    // 收藏区是**盖在 Pager 上面**的一层（视觉上是"可折叠的表头"），所以手指落在它上面时，下面那个
+    // LazyVerticalGrid 根本收不到手势 —— 收藏一多、这块把可视区盖满，整页就滑不动了。
+    // 用户 2026-10-17：「收藏的应用那一块不响应上下滑动手势」（面板里尤其明显：62% 的窗口高度，
+    // 几行收藏就把 TabRow 与 A-Z 列表全挡住）。
+    //
+    // 这里把落在这块上的竖直拖动接回**同一条**滚动链：它自己就是一个 `scrollable`（状态 = 当前页
+    // 那个网格），于是外层 nestedScroll 照常先折叠收藏区、剩下的再滚网格；顶栏的 scrollBehavior 也
+    // 挂上，免得"从收藏区滑动时顶栏不动"。长按排序进行中把它关掉，让拖动排序先拿到手势
+    // （收藏区里的 pointerInput 在更内层，Main 阶段本来就先收到事件，这里只是双保险）。
+    val activeGridState: LazyGridState = if (model.selectedTab == 0) appsGridState else fnsGridState
+    val pinsScrollModifier = Modifier
+        .then(
+            if (scrollBehavior != null) Modifier.nestedScroll(scrollBehavior.nestedScrollConnection) else Modifier,
+        )
+        .scrollable(
+            state = activeGridState,
+            orientation = Orientation.Vertical,
+            enabled = !drag.isDragging,
+            flingBehavior = ScrollableDefaults.flingBehavior(),
+        )
 
     // 需求 10：切换页面时回顶，但回的是不含收藏的顶，应用/功能在平移的时候自己平移到上面（不含收藏的顶），收藏不跟着平移！
     val switchTab: (Int) -> Unit = { targetPage ->
@@ -540,11 +561,18 @@ fun PinManageScreen(
                 }
 
                 // 2. 顶部共用收藏区域 (应用 + 功能)：独立于 Pager 外部，平移动画时收藏绝不跟着平移！
+                // 以前它还会随上滑淡出，现在只平移、全程不透明（用户 2026-10-17：「把上滑淡出删掉」）。
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .offset { IntOffset(0, pinsY.toInt()) }
-                        .graphicsLayer { alpha = pinsAlpha },
+                        .then(pinsScrollModifier)
+                        // 完全折叠后它的下沿正好落在顶栏下沿：顶栏开模糊时是透明的，再画就只是
+                        // "顶栏后面透出来的残影"。所以到那一刻直接不画 —— 硬切（不是渐变）；
+                        // 读快照状态，不会因此每帧重组。
+                        .graphicsLayer {
+                            alpha = if (headerOffsetPx <= -sharedPinsContentHeightPx + 1f) 0f else 1f
+                        },
                 ) {
                     MeasuredHeader(
                         onMeasuredHeight = { h ->

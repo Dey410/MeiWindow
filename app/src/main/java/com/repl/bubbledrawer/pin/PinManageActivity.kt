@@ -208,7 +208,14 @@ class PinManageActivity : ComponentActivity() {
                         textSp = 0,
                         onLaunch = { app ->
                             // ORIGINAL: view-mode tap launches the app (AbstractC2806s.m9105e
-                            // carries start_windowmode=true)
+                            // carries start_windowmode=true).
+                            //
+                            // user 2026-10-17: 这里原先把 MIUI 的 freeform ActivityOptions 直接塞进
+                            // startActivity，第三方进程过不了 checkAuthority，加上安全中心的
+                            // 「xx 想要打开 xx」拦截框，那次小窗落到了**魅窗自己**身上（点应用 →
+                            // 魅窗变成小窗，目标反而没小窗）。现在改走系统闸门：
+                            // ConfigurableLaunchStrategy → GateLaunchStrategy（Intent 带标记，
+                            // 由 system_server 用 ROM 自己的小窗参数落窗）。
                             ConfigurableLaunchStrategy(this@PinManageActivity).launch(this@PinManageActivity, app)
                             LaunchCountStore.increment(this@PinManageActivity, app.packageName, app.userId)
                             com.repl.bubbledrawer.data.predict.AppPredictor.recordLaunch(this@PinManageActivity, app.packageName, app.userId)
@@ -220,7 +227,9 @@ class PinManageActivity : ComponentActivity() {
                         backdrop = backdrop,
                         scrollBehavior = scrollBehavior,
                         onLaunchShortcut = { item ->
-                            ShortcutRepository.launchShortcut(this@PinManageActivity, item)
+                            // 与小窗启动同一条规则：App 进程走「系统闸门」（见上面 onLaunch 的注释），
+                            // 不再自己拼 freeform ActivityOptions。
+                            ShortcutRepository.launchShortcut(this@PinManageActivity, item, viaGate = true)
                         },
                     )
                 }

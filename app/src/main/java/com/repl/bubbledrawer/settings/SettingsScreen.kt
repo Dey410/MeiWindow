@@ -448,6 +448,14 @@ fun FanSettingsScreen(
                             onCommit = actions::setFanAutoRetractSec,
                         )
                     })
+                    add(CardItem("double_tap_dismiss") {
+                        SwitchRow(
+                            title = stringResource(R.string.fan_double_tap_dismiss),
+                            summary = stringResource(R.string.fan_double_tap_dismiss_summary),
+                            checked = snap.fanDoubleTapDismiss,
+                            onCheckedChange = actions::setFanDoubleTapDismiss,
+                        )
+                    })
                     add(CardItem("icon_size") {
                         DefaultableIntSliderRow(
                             title = stringResource(R.string.fan_icon_size),

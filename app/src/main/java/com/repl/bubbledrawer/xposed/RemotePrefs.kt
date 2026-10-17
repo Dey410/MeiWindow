@@ -140,6 +140,49 @@ object RemotePrefs {
     const val FAN_AUTO_RETRACT_MIN = 0
     const val FAN_AUTO_RETRACT_MAX = 30
 
+    /**
+     * 扇形面板「双击外部关闭」（默认**关** = 点一下扇形外面就收起）。
+     *
+     * 用户 2026-10-17：「在扇形面板设置里加一个双击外部关闭的开关，默认关。」
+     *
+     * 与「更多面板」的 [KEY_PANEL_DISMISS_OUTSIDE] 是两件事，互不影响：那个是面板自己的
+     * 单击/双击选择，这一项只管**扇形**的 canvas。它也不影响「上下滑翻页」——
+     * 竖直滑永远是翻页，只有"点一下"才走这里的收起判定（见 `FanHost` 的 canvas 手势）。
+     */
+    const val KEY_FAN_DOUBLE_TAP_DISMISS = "fan_double_tap_dismiss"
+    const val DEFAULT_FAN_DOUBLE_TAP_DISMISS = false
+
+    /**
+     * 「下一次某某应用的启动请给小窗」的**一次性口令**（"包名|截止 elapsedRealtime"）。
+     *
+     * 与 [com.repl.bubbledrawer.lightopen.LightOpen.EXTRA_FREEFORM_REQUEST] 配套：Intent 上那个
+     * 标记是**首选**通道（同一次 binder 调用、零延迟），但安全中心的「xx 想要打开 xx」拦截框
+     * 有可能重造 Intent 而丢掉 extras —— 用户点「允许」之后的那次启动就只剩这个口令能认出来。
+     *
+     * 为什么是"包名 + 截止时间"而不是布尔：它必须**只对那一次启动**生效。3 秒之后自动作废，
+     * 免得用户点了一下没成功、几秒后再从别处打开同一个应用也被塞进小窗。
+     */
+    const val KEY_LAUNCH_PRIME = "launch_prime"
+
+    /** 小窗启动口令的有效期（毫秒，从写入那一刻算）。要盖得住"看弹窗 + 点允许"的思考时间。 */
+    const val LAUNCH_PRIME_TTL_MS = 8_000L
+
+    fun encodeLaunchPrime(packageName: String, deadlineElapsedMs: Long): String =
+        "$packageName|$deadlineElapsedMs"
+
+    /**
+     * @return 口令里的包名与截止时间；格式不对/为空返回 null（老版本写的值、半截写入都不认）。
+     */
+    fun decodeLaunchPrime(raw: String?): Pair<String, Long>? {
+        if (raw.isNullOrEmpty()) return null
+        val sep = raw.lastIndexOf('|')
+        if (sep <= 0 || sep == raw.length - 1) return null
+        val pkg = raw.substring(0, sep)
+        val deadline = raw.substring(sep + 1).toLongOrNull() ?: return null
+        if (pkg.isEmpty() || deadline <= 0L) return null
+        return pkg to deadline
+    }
+
     /** 扇形图标大小（dp，默认 = launcher_app_item_icon_width 44dp）。 */
     const val KEY_FAN_ICON_DP = "fan_icon_dp"
     const val DEFAULT_FAN_ICON_DP = 44
@@ -367,6 +410,8 @@ object RemotePrefs {
         val fanShowVibrate: Boolean = DEFAULT_FAN_SHOW_VIBRATE,
         /** 扇形滑出后不点选自动收回的秒数（0 = 不自动收回） */
         val fanAutoRetractSec: Int = DEFAULT_FAN_AUTO_RETRACT_SEC,
+        /** 扇形「双击外部关闭」（默认关 = 单击即收起，见 [KEY_FAN_DOUBLE_TAP_DISMISS]） */
+        val fanDoubleTapDismiss: Boolean = DEFAULT_FAN_DOUBLE_TAP_DISMISS,
         /** 扇形图标大小（dp） */
         val fanIconDp: Int = DEFAULT_FAN_ICON_DP,
         /** 扇形图标形状：0 = 圆形，1 = 系统样式圆角矩形 */
@@ -493,6 +538,7 @@ object RemotePrefs {
             fanShowVibrate = sp.getBoolean(KEY_FAN_SHOW_VIBRATE, DEFAULT_FAN_SHOW_VIBRATE),
             fanAutoRetractSec = sp.getInt(KEY_FAN_AUTO_RETRACT_SEC, DEFAULT_FAN_AUTO_RETRACT_SEC)
                 .coerceIn(FAN_AUTO_RETRACT_MIN, FAN_AUTO_RETRACT_MAX),
+            fanDoubleTapDismiss = sp.getBoolean(KEY_FAN_DOUBLE_TAP_DISMISS, DEFAULT_FAN_DOUBLE_TAP_DISMISS),
             fanIconDp = sp.getInt(KEY_FAN_ICON_DP, DEFAULT_FAN_ICON_DP).let { if (it <= 0) DEFAULT_FAN_ICON_DP else it.coerceIn(FAN_ICON_MIN, FAN_ICON_MAX) },
             fanIconShape = sp.getInt(KEY_FAN_ICON_SHAPE, DEFAULT_FAN_ICON_SHAPE).coerceIn(0, 1),
             cloneBadge = sp.getBoolean(KEY_CLONE_BADGE, DEFAULT_CLONE_BADGE),

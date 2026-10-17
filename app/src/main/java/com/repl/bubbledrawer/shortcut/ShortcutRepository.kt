@@ -18,6 +18,7 @@ import android.os.SystemClock
 import android.os.UserManager
 import android.util.Log
 import com.repl.bubbledrawer.launch.MiuiFreeform
+import com.repl.bubbledrawer.lightopen.LightOpen
 import com.repl.bubbledrawer.xposed.SettingsStore
 import org.xmlpull.v1.XmlPullParser
 
@@ -891,13 +892,22 @@ object ShortcutRepository {
      * 能读到真设置（hook 进程的 `RemoteBridge.remote` 是空的，会退到 SystemUI 自己的 cfg 文件 →
      * 全是默认值，用户开着的小窗会被无视）。所以 SystemUI 侧（扇形面板）传
      * `RemotePrefs.read(prefs).freeform`，App 侧（管理页）用默认值即可。
+     *
+     * [viaGate]：**App 进程**（管理页）必须为 true —— 从第三方进程直接塞 MIUI 的 freeform
+     * `ActivityOptions` 会把"小窗"落到调用者自己身上（详见
+     * [com.repl.bubbledrawer.launch.GateLaunchStrategy] 的类注释）。走闸门时 Intent 只带
+     * [LightOpen.EXTRA_FREEFORM_REQUEST]，由 system_server 用 ROM 自己的参数落窗。
      */
     fun launchShortcut(
         context: Context,
         item: ShortcutItem,
         useFreeform: Boolean = SettingsStore.snapshot(context).freeform,
+        viaGate: Boolean = false,
     ): Boolean {
-        val bundle = if (useFreeform && item.packageName.isNotEmpty()) {
+        val requestFreeform = useFreeform && item.packageName.isNotEmpty()
+        // 走闸门时不带 options：留给 system_server 的闸门（ROM 自己那条路）生成。
+        val gate = requestFreeform && viaGate
+        val bundle = if (requestFreeform && !gate) {
             (MiuiFreeform.makeActivityOptions(context, item.packageName)
                 ?: ActivityOptions.makeBasic().also {
                     runCatching {
@@ -926,6 +936,7 @@ object ShortcutRepository {
             val ok = runCatching {
                 val intent = Intent.parseUri(item.intentUri, 0).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    if (gate) putExtra(LightOpen.EXTRA_FREEFORM_REQUEST, true)
                 }
                 context.startActivity(intent, bundle)
                 true

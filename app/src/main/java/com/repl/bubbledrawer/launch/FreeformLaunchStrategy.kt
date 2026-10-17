@@ -262,11 +262,81 @@ data class FreeformTrigger(val anchorX: Int, val display: Rect)
  *  The toggle lives in the module's shared prefs (SettingsStore writes through
  *  to the LSPosed remote group; the local mirror keeps it usable offline). */
 class ConfigurableLaunchStrategy(private val context: Context) : ILaunchStrategy {
-    private val freeform = FreeformLaunchStrategy()
+    private val gate = GateLaunchStrategy()
     private val fullscreen = FullscreenLaunchStrategy()
 
     override fun launch(context: Context, app: BubbleApp): Boolean {
         val useFreeform = com.repl.bubbledrawer.xposed.SettingsStore.snapshot(this.context).freeform
-        return (if (useFreeform) freeform else fullscreen).launch(context, app)
+        return (if (useFreeform) gate else fullscreen).launch(context, app)
+    }
+}
+
+/**
+ * 小窗启动（**模块自己的 App 进程**）：不自己塞 ActivityOptions，只把"我要小窗"写在 Intent 上，
+ * 由 system_server 的闸门用 ROM 自己的参数完成落窗。
+ *
+ * ## 为什么要换掉 [FreeformLaunchStrategy]（用户 2026-10-17 报的 bug）
+ *
+ * 现象：「在 app 主页的收藏应用管理里，点击 app 不会小窗打开，而会把魅窗自身变为小窗」。
+ *
+ * 从 App 进程带 MIUI 的 freeform `ActivityOptions` 直接 `startActivity` 是走不通的一条路：
+ * `MiuiMultiWindowUtils.getActivityOptions` 先过 `checkAuthority()`，第三方调用者拿到 null
+ * （见 [MiuiFreeform.makeActivityOptions] 的注释），我们手里只剩一个裸的
+ * `setLaunchWindowingMode(5)`；这次启动还要再过系统的「应用间跳转」判定与安全中心的
+ * 「xx 想要打开 xx」拦截框。结果那次 freeform 请求落到了**调用者自己**（魅窗）的那个任务上，
+ * 目标应用反而没进小窗 —— 这正是用户看到的样子。
+ *
+ * 扇形面板不受影响：它跑在 SystemUI 进程里（system uid），`checkAuthority` 直接放行，所以
+ * [FreeformLaunchStrategy] 那条路对它是正确的，此处不动。
+ *
+ * ## 换成了什么
+ *
+ * 与「应用间跳转」**完全相同**的那条系统路径：Intent 只带
+ * [com.repl.bubbledrawer.lightopen.LightOpen.EXTRA_FREEFORM_REQUEST]，不带任何 options；
+ * system_server 的闸门（`LightOpenGate`，钩的是 ROM 自己的
+ * `MiuiFreeformServiceImpl.startActivityByFreeForm`）看到标记返回 true，ROM 便用
+ * `MiuiMultiWindowUtils.getActivityOptions(ctx, 目标包, true)` 生成正式的小窗参数。
+ * 这条路与调用者的身份无关，也不依赖 SystemUI 是否活着；顺带绕开了"第三方调用者"这一整类坑。
+ *
+ * 目标应用不支持小窗（`supportFreeformByDeveloper=false`）时 ROM 会保持全屏 —— 与 ROM 自己
+ * 的侧边栏行为一致，不再出现"魅窗变小窗、目标却没小窗"。
+ */
+class GateLaunchStrategy : ILaunchStrategy {
+
+    override fun launch(context: Context, app: BubbleApp): Boolean {
+        val intent = appLaunchIntent(context, app, resetTaskIfNeeded = false) ?: return false
+        // 首选通道：标记放在 intent 上 —— 这次启动与标记是同一次 binder 调用，闸门不会读到
+        // "2 秒前的快照"；拦截框确认之后启动的就是这个 Intent，标记也照样在。
+        intent.putExtra(com.repl.bubbledrawer.lightopen.LightOpen.EXTRA_FREEFORM_REQUEST, true)
+
+        android.util.Log.i(
+            "BubbleDrawer",
+            "LAUNCH_GATE_REQUEST pkg=${app.packageName} userId=${app.userId} " +
+                "comp=${intent.component?.flattenToShortString() ?: "-"}",
+        )
+        // 第二通道：一次性口令（8 秒、只认这个包）。拦截框若重造 Intent 丢了 extras，
+        // 用户点「允许」之后的第二次启动还能靠它对上（见 RemotePrefs.KEY_LAUNCH_PRIME）。
+        com.repl.bubbledrawer.xposed.SettingsStore.primeFreeformLaunch(context, app.packageName)
+
+        val userHandle = MultiUserHelper.getUserHandle(app.userId)
+        if (app.userId != 0 && userHandle != null) {
+            val asUserOk = runCatching {
+                Context::class.java.getMethod(
+                    "startActivityAsUser",
+                    Intent::class.java,
+                    android.os.Bundle::class.java,
+                    UserHandle::class.java,
+                ).invoke(context, intent, null, userHandle)
+                true
+            }.getOrElse { false }
+            if (asUserOk) return true
+        }
+
+        return try {
+            context.startActivity(intent)
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 }

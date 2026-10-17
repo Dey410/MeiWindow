@@ -155,6 +155,26 @@ object SettingsStore {
     fun setFanAutoRetractSec(context: Context, sec: Int) =
         putInt(context, RemotePrefs.KEY_FAN_AUTO_RETRACT_SEC, sec.coerceIn(RemotePrefs.FAN_AUTO_RETRACT_MIN, RemotePrefs.FAN_AUTO_RETRACT_MAX))
 
+    /** 扇形「双击外部关闭」开关（默认关 = 单击即收起）。 */
+    fun setFanDoubleTapDismiss(context: Context, enabled: Boolean) =
+        putBoolean(context, RemotePrefs.KEY_FAN_DOUBLE_TAP_DISMISS, enabled)
+
+    /**
+     * 「下一次打开这个应用请给小窗」的一次性口令（见 [RemotePrefs.KEY_LAUNCH_PRIME]）。
+     *
+     * 由 App 进程在启动前写、system_server 的闸门读。它是 `GateLaunchStrategy` 的**第二通道**：
+     * Intent 上的标记若被安全中心的拦截框重造时丢掉，用户点「允许」之后的那一次启动还能靠它对上。
+     */
+    fun primeFreeformLaunch(context: Context, packageName: String) {
+        if (packageName.isEmpty()) return
+        val value = RemotePrefs.encodeLaunchPrime(
+            packageName,
+            android.os.SystemClock.elapsedRealtime() + RemotePrefs.LAUNCH_PRIME_TTL_MS,
+        )
+        RemoteBridge.local(context).edit().putString(RemotePrefs.KEY_LAUNCH_PRIME, value).apply()
+        RemoteBridge.remote?.edit()?.putString(RemotePrefs.KEY_LAUNCH_PRIME, value)?.apply()
+    }
+
     /** 扇形图标大小（dp）。 */
     fun setFanIconDp(context: Context, dp: Int) =
         putInt(context, RemotePrefs.KEY_FAN_ICON_DP, dp.coerceIn(RemotePrefs.FAN_ICON_MIN, RemotePrefs.FAN_ICON_MAX))

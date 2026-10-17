@@ -62,6 +62,25 @@ object LightOpen {
      */
     const val SECURITY_CENTER = "com.miui.securitycenter"
 
+    /**
+     * 「这次启动请给我小窗」——**模块自己的 App 进程**放在启动 Intent 上的标记。
+     *
+     * 为什么需要它（用户 2026-10-17：「在 app 主页的收藏应用管理里，点击 app 不会小窗打开，而会
+     * 把魅窗自身变为小窗。可能是因为安全中心此时弹出了'xx 想要打开 xx，是否继续'的弹窗。小窗打开里
+     * 的应用间跳转修过这个。」）：
+     *
+     * 从 App 进程直接带 MIUI 的 freeform `ActivityOptions` 发给 `startActivity` 是走不通的 ——
+     * `MiuiMultiWindowUtils.getActivityOptions` 先过 `checkAuthority`，第三方调用者拿到 null，我们只
+     * 剩一个裸的 `setLaunchWindowingMode(5)`；而系统还要再经一次「应用间跳转」判定与安全中心拦截框，
+     * 结果那次"小窗"落到了调用者（魅窗）自己身上，目标应用反而没有小窗。
+     *
+     * 所以改用**与「应用间跳转」完全相同的那条系统路径**：Intent 只带这个标记、不带任何 options，
+     * system_server 里的闸门（[com.repl.bubbledrawer.xposed.LightOpenGate]）看到标记就返回 true，
+     * ROM 自己用 `MiuiMultiWindowUtils.getActivityOptions(ctx, 目标包, true)` 生成正式的小窗参数 ——
+     * 与扇形面板（SystemUI 身份）打开的完全是同一条链。
+     */
+    const val EXTRA_FREEFORM_REQUEST = "com.repl.bubbledrawer.extra.FREEFORM_REQUEST"
+
     // 动作常量自己写：纯逻辑层不 import android.content.Intent（单测里那是 stub）。
     const val ACTION_SEND = "android.intent.action.SEND"
     const val ACTION_SEND_MULTIPLE = "android.intent.action.SEND_MULTIPLE"
@@ -133,6 +152,21 @@ object LightOpen {
         jumpMode = if (jumpMode == MODE_BLACK) MODE_BLACK else MODE_WHITE,
         jumpTargets = decodeTargets(jumpListRaw),
     )
+
+    /**
+     * 「模块自己的 App 进程点名要小窗」（Intent 带 [EXTRA_FREEFORM_REQUEST]）该不该被闸门接管。
+     *
+     * 只有两种情况不接管：目标解析不出来、目标就是安全中心的拦截框本身 —— 拦截框绝不能变成小窗
+     * （真机反馈 2026-10-14），真实目标在它后面那一次启动里，那一次会自己带着同一个标记。
+     *
+     * 这条判定与「轻量打开」的六个开关无关（它跟的是设置页的「小窗启动」），所以不接收
+     * [LightOpenSettings]，纯函数、有单测。
+     */
+    fun requestedFreeformDecision(targetPackage: String?): LightOpenDecision = when {
+        targetPackage.isNullOrBlank() -> LightOpenDecision.LEAVE
+        targetPackage == SECURITY_CENTER -> LightOpenDecision.LEAVE
+        else -> LightOpenDecision.FORCE_FREEFORM
+    }
 
     // ---------------------------------------------------------------- 开关判定
 

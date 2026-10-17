@@ -55,7 +55,7 @@ import io.github.libxposed.api.XposedModule
  */
 class LightOpenGate(
     private val module: XposedModule,
-    prefs: SharedPreferences,
+    private val prefs: SharedPreferences,
 ) {
     private val watcher = LightOpenWatcher(prefs)
 
@@ -118,11 +118,45 @@ class LightOpenGate(
 
     /** 返回 null = 不干预（走原生判定）。 */
     private fun decide(info: ActivityInfo?, intent: Intent?, topPackage: String?): Any? {
+        // 「模块自己的 App 进程点名要小窗」——两条通道，先后各有理由（见 LightOpen.
+        // EXTRA_FREEFORM_REQUEST 与 RemotePrefs.KEY_LAUNCH_PRIME 的注释）：
+        //   1. Intent 自带标记：同一次 binder 调用、零延迟，正常情况走它；
+        //   2. 一次性口令：安全中心的「xx 想要打开 xx」拦截框若重造 Intent 会丢 extras，
+        //      而用户点「允许」之后的**第二次**启动才是真正要落窗的那一次 —— 只剩它能认出来。
+        //
+        // 这两条判定故意放在**所有开关之前**：跟的是设置页的「小窗启动」，与「轻量打开」那六个
+        // 开关无关。也故意不看 `topPackage`：拦截框确认之后前台是 `com.miui.securitycenter`。
+        val target = rawTargetPackage(info, intent)
+        val marker = intent?.getBooleanExtra(LightOpen.EXTRA_FREEFORM_REQUEST, false) == true
+        if (marker && target != null) {
+            if (LightOpen.requestedFreeformDecision(target) == LightOpenDecision.FORCE_FREEFORM) {
+                module.log(
+                    Log.INFO,
+                    TAG,
+                    "LIGHT_OPEN_FREEFORM_REQUEST via=intent target=$target top=$topPackage",
+                )
+                return true
+            }
+            // 拦截框自己：不接管（它绝不能变成小窗）。
+            return null
+        }
+        val primed = primeTarget()
+        if (primed != null && target != null && primed == target &&
+            LightOpen.requestedFreeformDecision(target) == LightOpenDecision.FORCE_FREEFORM
+        ) {
+            module.log(
+                Log.INFO,
+                TAG,
+                "LIGHT_OPEN_FREEFORM_REQUEST via=prime target=$target top=$topPackage",
+            )
+            return true
+        }
+        if (marker) return null // 带了标记却解析不出目标：不接管
+
         val settings = watcher.current()
         if (!settings.enabled) return null
         if (!settings.appJump && !settings.shareToApp && !settings.textAction) return null
 
-        val target = rawTargetPackage(info, intent)
         val top = topPackage?.takeIf { it.isNotEmpty() }
         // 「文本操作」判定：
         // 1. 系统 TextClassifier 标记（选中文本后弹出的编辑条/浮动菜单条目，带 EXTRA_FROM_TEXT_CLASSIFIER）
@@ -197,6 +231,20 @@ class LightOpenGate(
         return action == Intent.ACTION_PROCESS_TEXT || action == Intent.ACTION_WEB_SEARCH ||
             action == Intent.ACTION_VIEW || intent.hasExtra(LightOpen.EXTRA_FROM_TEXT_CLASSIFIER)
     }
+
+    /**
+     * 一次性口令里的目标包名（没过期才有值，见 [RemotePrefs.KEY_LAUNCH_PRIME]）。
+     *
+     * 直接读 prefs 而不是 [LightOpenWatcher] 的快照：口令只活 8 秒，而快照最长可能旧 2 秒 ——
+     * 那正好是这条通道最需要新鲜的窗口。
+     */
+    private fun primeTarget(): String? = runCatching {
+        val (pkg, deadline) = RemotePrefs.decodeLaunchPrime(
+            prefs.getString(RemotePrefs.KEY_LAUNCH_PRIME, null),
+        ) ?: return null
+        if (android.os.SystemClock.elapsedRealtime() > deadline) return null
+        pkg
+    }.getOrNull()
 
     /**
      * ROM 的 `getRawPackageName`：应用锁场景下 Intent 指向的是应用锁 Activity，真实目标在

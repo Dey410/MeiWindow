@@ -67,6 +67,8 @@
     <string name="fan_auto_retract_never">不自动收起</string>
     <string name="sec_value">%1$d 秒</string>
     <string name="fan_auto_retract_summary">滑出后没点选就自动收回；拖到最左则一直停留</string>
+    <string name="fan_double_tap_dismiss">双击外部关闭</string>
+    <string name="fan_double_tap_dismiss_summary">点扇形外面要连点两下才收起（默认单击即收起）；上下滑翻页不受影响</string>
     <string name="fan_icon_size">图标大小</string>
     <string name="fan_icon_size_summary">扇形里每个应用图标的大小</string>
     <string name="fan_icon_shape">图标形状</string>

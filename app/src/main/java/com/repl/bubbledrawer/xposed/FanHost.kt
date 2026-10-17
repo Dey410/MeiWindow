@@ -66,7 +66,8 @@ import kotlinx.coroutines.launch
  *    → cancelExternal
  *  • release decisions — forwarded UP runs GestureAppLauncher m9729p (launch over
  *    an icon / cancelFlag collapse after pull-back / stay open over plain void)
- *  • void DOWN on the canvas closes — verbatim C2822g.onTouchEvent :381-393
+ *  • canvas 上的新触摸 — 竖直滑翻页、点一下收起（见 [FanCanvas]；只有一页时仍是原版
+ *    C2822g.onTouchEvent :381-393 的"落下即收起"）
  *  • 不操作自动收起 — 用户在设置里给的秒数（默认 10s，0 = 不收起）。参考实现在
  *    beginGesture/updateGesture 上以固定 5s 重新计时（:186-187 / :194-195），这里同规则、
  *    时长可调：每个事件（含 UP）重新计时，所以滑出后不点选才会收回。
@@ -1296,16 +1297,10 @@ class FanHost(
         scrim = s
 
         // canvas ABOVE, TOUCHABLE — AppLauncherWindow.m9248S :640-650 flags 16777984
-        // has NO 0x10 NOT_TOUCHABLE; fresh void DOWN closes the panel verbatim
-        // C2822g.onTouchEvent :381-393; icon children carry the click listener
+        // has NO 0x10 NOT_TOUCHABLE; icon children carry the click listener
         // (C2937F$a.onClick :56-69, wired in buildTile). The drag stroke itself
-        // comes from the SPY, not from this window.
-        val c = object : FrameLayout(context) {
-            override fun onTouchEvent(event: MotionEvent): Boolean {
-                if (event.actionMasked == MotionEvent.ACTION_DOWN) dock.onVoidTouchDown()
-                return true
-            }
-        }.apply {
+        // comes from the SPY, not from this window. 收起 / 翻页的判据见 [FanCanvas]。
+        val c = FanCanvas(context).apply {
             addView(
                 dock.launcher,
                 FrameLayout.LayoutParams(
@@ -1340,6 +1335,44 @@ class FanHost(
         // 提示随 canvas 一起被移除了，只留引用没有意义（下次划出时 ensureCalibrationHint 会重建）。
         calibrationHint = null
         fanWindowsUp = false
+    }
+
+    /**
+     * 扇形打开之后落在 canvas 上的**新触摸**（划出扇形的那一笔不走这里，它由 SPY 直接喂给 [dock]）。
+     *
+     * 原版 `C2822g.onTouchEvent` :381-393 是「落下即收起」；这里只多一个设置项：「双击外部关闭」
+     * 打开时第一下先攒着、双击时限内的第二下才收起（用户 2026-10-17 要的开关，默认关）。
+     */
+    private inner class FanCanvas(context: Context) : FrameLayout(context) {
+
+        private val doubleTapMs = ViewConfiguration.getDoubleTapTimeout().toLong()
+
+        /** 双击模式下上一次「点在外面」的时间（0 = 没有待配对的第一下）。 */
+        private var lastTapAt = 0L
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                // 手指刚落下：顺手重新计时「不操作自动收起」（双击模式下这一下并不收）。
+                armTimeout()
+                if (!doubleTapMode()) {
+                    logger(Log.INFO, "FAN_VOID_TAP_CLOSE mode=single", null)
+                    dock.onVoidTouchDown()
+                } else {
+                    val now = SystemClock.uptimeMillis()
+                    if (lastTapAt != 0L && now - lastTapAt <= doubleTapMs) {
+                        lastTapAt = 0L
+                        logger(Log.INFO, "FAN_VOID_TAP_CLOSE mode=double", null)
+                        dock.onVoidTouchDown()
+                    } else {
+                        lastTapAt = now
+                        logger(Log.INFO, "FAN_VOID_TAP_FIRST mode=double waitMs=$doubleTapMs", null)
+                    }
+                }
+            }
+            return true
+        }
+
+        private fun doubleTapMode(): Boolean = RemotePrefs.read(prefs).fanDoubleTapDismiss
     }
 
     // ---------------- 更多应用 panel (方案 B: pinned on the current 小窗) ----------------
