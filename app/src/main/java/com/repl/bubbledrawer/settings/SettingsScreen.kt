@@ -47,6 +47,7 @@ fun MainSettingsScreen(
     onNavigateToExperimental: () -> Unit,
     onNavigateToLightOpen: () -> Unit,
     onNavigateToDiagnostics: () -> Unit,
+    onNavigateToGestureBlacklist: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -110,8 +111,29 @@ fun MainSettingsScreen(
                             onCheckedChange = actions::setEnabled,
                         )
                     })
-                    add(CardItem("freeform") {
+                    // 用户 2026-10-18：「在启用角落手势下面加一个手势黑名单和横屏时需滑动两次才打开的开关」。
+                    add(CardItem("gesture_blacklist") {
+                        ArrowRow(
+                            title = stringResource(R.string.gesture_blacklist),
+                            summary = if (snap.fanBlacklist.isEmpty()) {
+                                stringResource(R.string.gesture_blacklist_empty)
+                            } else {
+                                stringResource(R.string.gesture_blacklist_count, snap.fanBlacklist.size)
+                            },
+                            enabled = snap.enabled,
+                            onClick = onNavigateToGestureBlacklist,
+                        )
+                    })
+                    add(CardItem("landscape_two_swipes") {
                         SwitchRow(
+                            title = stringResource(R.string.fan_landscape_two_swipes),
+                            summary = stringResource(R.string.fan_landscape_two_swipes_summary),
+                            checked = snap.fanLandscapeTwoSwipes,
+                            enabled = snap.enabled,
+                            onCheckedChange = actions::setFanLandscapeTwoSwipes,
+                        )
+                    })
+                    add(CardItem("freeform") {                        SwitchRow(
                             title = stringResource(R.string.freeform_toggle),
                             summary = stringResource(R.string.freeform_hint),
                             checked = snap.freeform,
@@ -439,8 +461,9 @@ fun FanSettingsScreen(
                             min = RemotePrefsFanAutoRetractMin,
                             max = RemotePrefsFanAutoRetractMax,
                             valueText = {
+                                // 用户 2026-10-18：滑到最左（0 秒）= **松手直接收起**，不再表示"永不收起"。
                                 if (it <= 0) {
-                                    stringResource(R.string.fan_auto_retract_never)
+                                    stringResource(R.string.fan_auto_retract_release)
                                 } else {
                                     stringResource(R.string.sec_value, it)
                                 }

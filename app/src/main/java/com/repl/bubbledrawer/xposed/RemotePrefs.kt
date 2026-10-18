@@ -141,6 +141,29 @@ object RemotePrefs {
     const val FAN_AUTO_RETRACT_MAX = 30
 
     /**
+     * 角落手势的黑名单（应用包名，换行分隔）。
+     *
+     * 用户 2026-10-18：「在启用角落手势下面加一个手势黑名单和横屏时需滑动两次才打开的开关」。
+     * 黑名单里的应用在前台时，角落手势**什么都不做**（不弹扇形、也不吞那一笔）：看视频、玩游戏时
+     * 手指贴边很容易误触。存字符串而不是 StringSet：远程组是按 key 逐个镜像的，StringSet 在那边
+     * 没有对应类型（见 `RemoteBridge.syncLocal`）。
+     */
+    const val KEY_FAN_BLACKLIST = "fan_blacklist"
+    const val DEFAULT_FAN_BLACKLIST = ""
+    const val FAN_BLACKLIST_SEPARATOR = "\n"
+
+    /**
+     * 横屏时角落手势要**滑两次**才打开扇形（默认关）。
+     *
+     * 同一个要求的另一半：横屏第一次上滑只提示一句「再次上滑」，[FAN_SECOND_SWIPE_MS] 内同一侧
+     * 再滑一次才真的弹出 —— 横屏时边角是游戏/视频最常用的触控区域。
+     */
+    const val KEY_FAN_LANDSCAPE_TWO_SWIPES = "fan_landscape_two_swipes"
+    const val DEFAULT_FAN_LANDSCAPE_TWO_SWIPES = false
+
+    /** 第一次上滑之后多久内再滑一次算"第二次"（毫秒）。 */
+    const val FAN_SECOND_SWIPE_MS = 1600L
+    /**
      * 扇形面板「双击外部关闭」（默认**关** = 点一下扇形外面就收起）。
      *
      * 用户 2026-10-17：「在扇形面板设置里加一个双击外部关闭的开关，默认关。」
@@ -449,6 +472,10 @@ object RemotePrefs {
         val fanAutoRetractSec: Int = DEFAULT_FAN_AUTO_RETRACT_SEC,
         /** 扇形「双击外部关闭」（默认关 = 单击即收起，见 [KEY_FAN_DOUBLE_TAP_DISMISS]） */
         val fanDoubleTapDismiss: Boolean = DEFAULT_FAN_DOUBLE_TAP_DISMISS,
+        /** 角落手势黑名单（应用包名集合，见 [KEY_FAN_BLACKLIST]） */
+        val fanBlacklist: Set<String> = emptySet(),
+        /** 横屏时需滑动两次才打开扇形（见 [KEY_FAN_LANDSCAPE_TWO_SWIPES]） */
+        val fanLandscapeTwoSwipes: Boolean = DEFAULT_FAN_LANDSCAPE_TWO_SWIPES,
         /** 扇形图标大小（dp） */
         val fanIconDp: Int = DEFAULT_FAN_ICON_DP,
         /** 扇形图标形状：0 = 圆形，1 = 系统样式圆角矩形 */
@@ -581,6 +608,11 @@ object RemotePrefs {
             fanAutoRetractSec = sp.getInt(KEY_FAN_AUTO_RETRACT_SEC, DEFAULT_FAN_AUTO_RETRACT_SEC)
                 .coerceIn(FAN_AUTO_RETRACT_MIN, FAN_AUTO_RETRACT_MAX),
             fanDoubleTapDismiss = sp.getBoolean(KEY_FAN_DOUBLE_TAP_DISMISS, DEFAULT_FAN_DOUBLE_TAP_DISMISS),
+            fanBlacklist = decodeFanBlacklist(sp.getString(KEY_FAN_BLACKLIST, DEFAULT_FAN_BLACKLIST)),
+            fanLandscapeTwoSwipes = sp.getBoolean(
+                KEY_FAN_LANDSCAPE_TWO_SWIPES,
+                DEFAULT_FAN_LANDSCAPE_TWO_SWIPES,
+            ),
             fanIconDp = sp.getInt(KEY_FAN_ICON_DP, DEFAULT_FAN_ICON_DP).let { if (it <= 0) DEFAULT_FAN_ICON_DP else it.coerceIn(FAN_ICON_MIN, FAN_ICON_MAX) },
             fanIconShape = sp.getInt(KEY_FAN_ICON_SHAPE, DEFAULT_FAN_ICON_SHAPE).coerceIn(0, 1),
             cloneBadge = sp.getBoolean(KEY_CLONE_BADGE, DEFAULT_CLONE_BADGE),
@@ -645,3 +677,30 @@ object RemotePrefs {
     const val MIN_DP = 24
     const val MAX_DP = 160
 }
+
+// ---------------------------------------------------------------------------------------------
+// 手势黑名单的编解码（纯算术，见 `FanBlacklistCodecTest`）
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * 黑名单落盘格式：包名按行分隔。
+ *
+ * 为什么不是 `StringSet`：远程组是按 key 逐个镜像的（`RemoteBridge.syncLocal` 里那些
+ * putInt/putBoolean），StringSet 在那套协议里没有对应类型。行分隔还顺手带来了可读性 ——
+ * 一份坏掉的名单用 `cat` 就能看出来。
+ */
+fun encodeFanBlacklist(packages: Set<String>): String = packages
+    .asSequence()
+    .map { it.trim() }
+    .filter { it.isNotEmpty() }
+    .distinct()
+    .sorted()
+    .joinToString(RemotePrefs.FAN_BLACKLIST_SEPARATOR)
+
+/** 反过来：空串 / 只有分隔符 → 空集合（默认= 不拦任何应用）。 */
+fun decodeFanBlacklist(raw: String?): Set<String> = raw
+    .orEmpty()
+    .split(RemotePrefs.FAN_BLACKLIST_SEPARATOR)
+    .map { it.trim() }
+    .filter { it.isNotEmpty() }
+    .toSet()

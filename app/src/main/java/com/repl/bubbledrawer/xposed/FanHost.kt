@@ -770,6 +770,15 @@ class FanHost(
     private var lastTouchX = 0f
     private var lastTouchY = 0f
 
+    /**
+     * 这一笔被拦掉了（黑名单 / 横屏两次滑动）：`forward` 必须把后续事件整体丢掉，
+     * 否则扇形没画出来、dock 却还在收事件（会点中"看不见的格子"）。
+     */
+    private var fanSuppressed = false
+
+    /** 横屏两次滑动：第一次上滑的时刻与哪一侧（0 = 没有待确认的第一次）。 */
+    private var pendingSwipeAt = 0L
+    private var pendingSwipeSide: SpySide? = null
     /** Corner claim: raise windows, bind fresh pins, seed the launcher with the
      *  synthetic DOWN at the press point (the real DOWN stayed with the app under
      *  the corner — the spy was only observing until pilfer), then arm the timeout. */
@@ -783,10 +792,19 @@ class FanHost(
         // The fan renders tiles from the cached list; if that list is the boot's locked-user
         // subset, refresh in the background so the NEXT stroke (and the 更多 panel) is whole.
         if (repo.cacheNeedsRefresh()) reloadApps("FAN_SHOW")
+        val snap = RemotePrefs.read(prefs)
+        // 用户 2026-10-18 的两个开关：黑名单里的应用、横屏的第一次上滑 —— 都不弹扇形。
+        // 拦掉之后必须让 forward() 把这一笔的后续事件也丢掉（见 fanSuppressed）。
+        val blocked = suppressionReason(side, screenW, screenH, snap)
+        if (blocked != null) {
+            fanSuppressed = true
+            logger(Log.INFO, "FAN_SUPPRESSED reason=$blocked side=$side pkg=${foregroundPackage()}", null)
+            return
+        }
+        fanSuppressed = false
         activeCorner = if (side == SpySide.LEFT) Corner.BOTTOM_LEFT else Corner.BOTTOM_RIGHT
         raiseFanWindows()
         dock.previewMode = false
-        val snap = RemotePrefs.read(prefs)
         dock.show(
             activeCorner, screenW, screenH,
             snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
@@ -802,9 +820,58 @@ class FanHost(
         armTimeout() // reference :186-187 (beginGesture → postDelayed(timeout, …))
     }
 
+    /**
+     * 这一笔该不该被拦掉，返回原因（null = 正常弹扇形）。顺序：黑名单优先于"横屏两次"。
+     *
+     * 用户 2026-10-18：「在启用角落手势下面加一个手势黑名单和横屏时需滑动两次才打开的开关」。
+     * 黑名单看的是**前台应用的包名**（角落里滑出来的时候，用户眼睛盯着的是那个应用）；
+     * 横屏两次则记下第一次的侧别与时刻，[RemotePrefs.FAN_SECOND_SWIPE_MS] 内同一侧再来一次才算数。
+     */
+    private fun suppressionReason(
+        side: SpySide,
+        screenW: Int,
+        screenH: Int,
+        snap: RemotePrefs.Snapshot,
+    ): String? {
+        val pkg = foregroundPackage()
+        if (pkg != null && snap.fanBlacklist.contains(pkg)) return "BLACKLIST"
+        if (!snap.fanLandscapeTwoSwipes) return null
+        if (!com.repl.bubbledrawer.launch.isWideScreen(screenW, screenH)) return null
+        val now = SystemClock.uptimeMillis()
+        val pending = pendingSwipeAt
+        if (pending != 0L && pendingSwipeSide == side && now - pending <= RemotePrefs.FAN_SECOND_SWIPE_MS) {
+            pendingSwipeAt = 0L
+            pendingSwipeSide = null
+            logger(Log.INFO, "FAN_TWO_SWIPE_CONFIRMED side=$side gapMs=${now - pending}", null)
+            return null
+        }
+        pendingSwipeAt = now
+        pendingSwipeSide = side
+        logger(Log.INFO, "FAN_TWO_SWIPE_FIRST side=$side", null)
+        runCatching {
+            android.widget.Toast.makeText(context, R.string.fan_second_swipe_hint, android.widget.Toast.LENGTH_SHORT).show()
+        }.onFailure { logger(Log.WARN, "FAN_TOAST_FAILED", it) }
+        return "TWO_SWIPES"
+    }
+
+    /** 前台应用包名（黑名单用）。取不到就返回 null = 不拦（宁可多弹一次，也不要永久失效）。 */
+    private fun foregroundPackage(): String? = runCatching {
+        val am = host.getSystemService(android.app.ActivityManager::class.java) ?: return null
+        @Suppress("DEPRECATION")
+        am.getRunningTasks(1).firstOrNull()?.topActivity?.packageName
+    }.getOrNull()
+
     /** A pilfered MOVE/UP in SCREEN coords — one continuous stream, so the
      *  release always arrives (this is what the old two-window handoff lost). */
     fun forward(ev: MotionEvent) {
+        // 这一笔在 show() 里被拦掉了（黑名单 / 横屏第一次上滑）：扇形没有画出来，dock 也不能收事件，
+        // 否则会点中"看不见的格子"（甚至启动应用）。
+        if (fanSuppressed) {
+            if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                fanSuppressed = false
+            }
+            return
+        }
         dock.forward(ev, 0)
         when (ev.actionMasked) {
             MotionEvent.ACTION_MOVE -> {
@@ -818,6 +885,15 @@ class FanHost(
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 pressureDetector.stopListening()
+                // 0 秒 = **松手直接收起**（用户 2026-10-18：「在…不操作自动收起时间里滑块添加一个 0 秒，
+                // 即松手直接收起」）。以前 0 表示"永不收起"，所以这里要单独接一下：
+                // 放到队列尾部，让这一笔 UP 先把"点没点中某个格子"处理完（点中时它自己会收）。
+                if (RemotePrefs.read(prefs).fanAutoRetractSec <= 0) {
+                    mainHandler.post {
+                        // retract() 自己会打 `FAN_RETRACT_ON_RELEASE`，这里不再重复一行。
+                        if (dock.isBusy) retract("ON_RELEASE")
+                    }
+                }
             }
             MotionEvent.ACTION_DOWN -> {
                 lastTouchX = ev.x
@@ -1214,9 +1290,9 @@ class FanHost(
     }
 
     private fun armTimeout() {
-        // 扇形滑出后不点选就自动收回：每次事件（含 UP/CANCEL）重新计时，时长来自设置
-        // （0 = 不自动收起）。参考实现同样在 beginGesture/updateGesture 上重新计时
-        // （CornerRadialOverlayView :186-187 / :194-195，固定 5s），这里换成用户可调。
+        // 扇形滑出后不点选就自动收回：每次事件（含 UP/CANCEL）重新计时，时长来自设置。
+        // **0 = 松手即收**（不再表示"永不收起"，用户 2026-10-18）：那一下由 [forward] 的
+        // ACTION_UP/CANCEL 分支处理，这里只负责"滑出后一直不动"的那种计时。
         mainHandler.removeCallbacks(timeout)
         if (!dock.isBusy) return
         val sec = RemotePrefs.read(prefs).fanAutoRetractSec

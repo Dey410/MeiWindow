@@ -159,6 +159,14 @@ object SettingsStore {
     fun setFanDoubleTapDismiss(context: Context, enabled: Boolean) =
         putBoolean(context, RemotePrefs.KEY_FAN_DOUBLE_TAP_DISMISS, enabled)
 
+    /** 角落手势黑名单（用户 2026-10-18）。存换行分隔的包名，见 [encodeFanBlacklist]。 */
+    fun setFanBlacklist(context: Context, packages: Set<String>) =
+        putString(context, RemotePrefs.KEY_FAN_BLACKLIST, encodeFanBlacklist(packages))
+
+    /** 横屏时需滑动两次才打开扇形（用户 2026-10-18）。 */
+    fun setFanLandscapeTwoSwipes(context: Context, enabled: Boolean) =
+        putBoolean(context, RemotePrefs.KEY_FAN_LANDSCAPE_TWO_SWIPES, enabled)
+
     /**
      * 「下一次打开这个应用请给小窗」的一次性口令（见 [RemotePrefs.KEY_LAUNCH_PRIME]）。
      *

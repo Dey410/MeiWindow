@@ -64,9 +64,15 @@
     <string name="fan_show_vibrate">滑出时振动</string>
     <string name="fan_show_vibrate_summary">扇形开始展开的那一帧轻振一下（Flyme 手感）</string>
     <string name="fan_auto_retract">不操作自动收起</string>
-    <string name="fan_auto_retract_never">不自动收起</string>
-    <string name="sec_value">%1$d 秒</string>
-    <string name="fan_auto_retract_summary">滑出后没点选就自动收回；拖到最左则一直停留</string>
+    <string name="fan_auto_retract_release">松手即收</string>
+    <string name="gesture_blacklist">手势黑名单</string>
+    <string name="gesture_blacklist_empty">未选择应用（角落手势对所有应用生效）</string>
+    <string name="gesture_blacklist_count">%1$d 个应用（这些应用里角落手势不响应）</string>
+    <string name="gesture_blacklist_count_selected">已选 %1$d 个应用</string>
+    <string name="fan_landscape_two_swipes">横屏时需滑动两次</string>
+    <string name="fan_landscape_two_swipes_summary">横屏下第一次上滑只提示「再次上滑」，第二次才打开扇形（避免游戏/视频时误触）</string>
+    <string name="fan_second_swipe_hint">再次上滑</string>    <string name="sec_value">%1$d 秒</string>
+    <string name="fan_auto_retract_summary">滑出后没点选就自动收回；拖到最左（0 秒）则松手立刻收回</string>
     <string name="fan_double_tap_dismiss">双击外部关闭</string>
     <string name="fan_double_tap_dismiss_summary">点扇形外面要连点两下才收起（默认单击即收起）；上下滑翻页不受影响</string>
     <string name="fan_icon_size">图标大小</string>

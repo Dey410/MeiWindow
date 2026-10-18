@@ -14,4 +14,7 @@ sealed interface BubbleScreen : NavKey {
     data object LightOpen : BubbleScreen
     data object LightOpenApps : BubbleScreen
     data object Diagnostics : BubbleScreen
+
+    /** 角落手势黑名单（用户 2026-10-18）。 */
+    data object GestureBlacklist : BubbleScreen
 }

@@ -226,6 +226,9 @@ fun PinManageScreen(
     // 列表滑到顶端后再下拉时平滑展开收藏区域
     val nestedScrollConnection = remember(sharedPinsContentHeightPx) {
         object : NestedScrollConnection {
+            /** 被"列表不在顶部"挡掉的展开，仅用于取证（一秒一行）。 */
+            private var lastBlockedLogAt = 0L
+
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
                 val delta = available.y
                 val minOffset = -sharedPinsContentHeightPx
@@ -242,14 +245,31 @@ fun PinManageScreen(
             override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
                 val delta = available.y
                 val minOffset = -sharedPinsContentHeightPx
-                return if (delta > 0 && headerOffsetPx < 0f) {
-                    val newOffset = (headerOffsetPx + delta).coerceIn(minOffset, 0f)
-                    val consumed = newOffset - headerOffsetPx
-                    headerOffsetPx = newOffset
-                    Offset(0f, consumed)
-                } else {
-                    Offset.Zero
+                if (delta <= 0f || headerOffsetPx >= 0f) return Offset.Zero
+                // 只有**列表真的回到顶**时才把收藏区拉回来。
+                //
+                // 用户 2026-10-18：「在收藏上滑，当应用/功能 tabrow 到顶后继续上滑，整个页面会下滑」。
+                // 收藏区展开会同时把 Pager 往下推（`pagerY = 收藏高度 + headerOffset`），所以只要
+                // 在列表还滚着的时候展开一次，整页就跟着往下一沉；那种残余位移属于上一笔手势的尾巴，
+                // 不该改变页面结构。这也正是 A29 里写的顺序：先回到顶，再展开。
+                val grid = if (model.selectedTab == 0) appsGridState else fnsGridState
+                val atTop = grid.firstVisibleItemIndex == 0 && grid.firstVisibleItemScrollOffset == 0
+                if (!atTop) {
+                    val now = android.os.SystemClock.uptimeMillis()
+                    if (now - lastBlockedLogAt >= 1000L) {
+                        lastBlockedLogAt = now
+                        android.util.Log.i(
+                            "BubbleDrawer",
+                            "PINS_EXPAND_BLOCKED first=${grid.firstVisibleItemIndex}" +
+                                " off=${grid.firstVisibleItemScrollOffset} delta=$delta",
+                        )
+                    }
+                    return Offset.Zero
                 }
+                val newOffset = (headerOffsetPx + delta).coerceIn(minOffset, 0f)
+                val consumed = newOffset - headerOffsetPx
+                headerOffsetPx = newOffset
+                return Offset(0f, consumed)
             }
         }
     }

@@ -76,6 +76,16 @@ class MainActivity : ComponentActivity() {
                                 onNavigateToExperimental = { backStack.add(BubbleScreen.Experimental) },
                                 onNavigateToLightOpen = { backStack.add(BubbleScreen.LightOpen) },
                                 onNavigateToDiagnostics = { backStack.add(BubbleScreen.Diagnostics) },
+                                onNavigateToGestureBlacklist = { backStack.add(BubbleScreen.GestureBlacklist) },
+                            )
+                        }
+                        entry<BubbleScreen.GestureBlacklist>(swipeDismiss = swipeBack) {
+                            GestureBlacklistScreen(
+                                state = state,
+                                actions = actions,
+                                onBack = {
+                                    if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
+                                },
                             )
                         }
                         entry<BubbleScreen.Trigger>(swipeDismiss = swipeBack) {

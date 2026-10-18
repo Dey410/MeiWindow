@@ -2669,20 +2669,31 @@ class FlymeFreeformController(
         @Volatile private var lastCenterSkip: String? = null
 
         /**
-         * Center the launch rect on the screen (设置项「小窗居中」), for **both** orientations.
+         * 横屏不居中 —— 一行证据（去重）。用户 2026-10-18 的规则「居中小窗仅对竖屏生效」之后，
+         * 横屏看不到 `CENTERED_BOUNDS` 是**正确**的，这行就是用来区分"按规则没居中"和"钩子没跑"。
+         */
+        private fun logCenterLandscape(rect: Rect, screenW: Int, screenH: Int) {
+            val message = "CENTERED_BOUNDS_SKIPPED_LANDSCAPE rect=$rect screen=($screenW x $screenH)"
+            if (message == lastCenterSkip) return
+            lastCenterSkip = message
+            log(message)
+        }
+
+        /**
+         * Center the launch rect on the screen (设置项「小窗居中」) —— **只在竖屏**。
          *
-         * The rect is in *unscaled* task space, so the visible size is `rect * scale` — and that scale
-         * is not the setting: the ROM clamps it to whatever fits the freeform accessible area, which
-         * for a landscape window is ~1/aspect smaller than the setting (see [hookFreeformScale]).
-         * Centering with the setting verbatim would compute a negative left/top and hang the window
-         * off both screen edges. This is also the only place a directly-opened 横屏小窗 gets centered
-         * at all: the ROM centers such a window horizontally (`getLeftMargin`) but pins it to the top
-         * of the screen (`getTopMargin` returns 0 whenever the display itself is portrait).
+         * 用户 2026-10-18：「在横屏时打开其他 app 的小窗，上滑使其转变为迷你小窗，随后点击迷你小窗
+         * 恢复为小窗时，位置会出现在横屏的最中间，希望能做到从哪里来到哪里去。即居中小窗修改为
+         * 仅对竖屏生效」。所以横屏直接返回、一个像素都不改：rect 保持 ROM 算出来的那一份，
+         * 迷你 → 普通小窗的还原就待在它原来的位置。
+         *
+         * 其余历史原因仍然成立：rect 是**未缩放**的任务空间坐标，可见尺寸是 `rect * scale`，
+         * 而这个 scale 不是设置值 —— ROM 会把它夹到能放下为止；按设置值居中会在两条边都算出负数、
+         * 把小窗挂到屏幕外。竖屏下这个换算仍然是 [centerScale] 的事。
          *
          * [keepLeft] is for the one caller that already knows where the window belongs horizontally:
          * a扇形 launch states the side it was triggered from ([requestedLeft] sees it in the ROM's own
          * arguments, `MiuiFreeform.triggerSideRect` computed it), and centering would silently undo it.
-         * The vertical placement is still ours — that is the part the ROM gets wrong in landscape.
          *
          * 两个轴现在各管各的（用户 2026-10-11）：
          *  - **横向**：`小窗居中` 开着才居中，关掉就不动它；扇形触发侧永远优先（[keepLeft]）；
@@ -2728,6 +2739,13 @@ class FlymeFreeformController(
             }
             val scale = centerScale(applied, assumed, targetScale)
             val (screenW, screenH) = screenSizeForCentering()
+            // 用户 2026-10-18：**居中只在竖屏生效**。横屏时一个像素都不改 —— 尤其是迷你小窗点回
+            // 普通小窗那一下（[hookBoundsCentering] 里的 `getRestoredBounds`）：ROM 给的 rect 就是
+            // 它"原来待的地方"，居中会让它跳到屏幕正中（"从哪里来到哪里去"）。
+            if (isWideScreen(screenW, screenH)) {
+                logCenterLandscape(rect, screenW, screenH)
+                return
+            }
             val visualW = rect.width() * scale
             val visualH = rect.height() * scale
             if (visualW > screenW + 0.5f || visualH > screenH + 0.5f) {
@@ -2743,14 +2761,10 @@ class FlymeFreeformController(
             // 触发侧 —— 否则居中会在 ROM 按触发侧算完之后再把它搬回屏幕中间。
             val left = if (keepLeft || !snap.flymeFreeformCenter) rect.left else targetLeft
             // 纵向：居中开关管到哪一步就停在哪一步（开着 = 正中，关着 = ROM 给的位置），然后叠加
-            // 「小窗上下位置」的滑杆 —— 滑杆只在竖屏生效（横屏窗口几乎占满高度，挪一下就出屏）。
+            // 「小窗上下位置」的滑杆。走到这里的只可能是竖屏（横屏在上面已经返回）。
             val centered = snap.flymeFreeformCenter
             val verticalBase = if (centered) targetTop else rect.top
-            val offset = if (isWideScreen(screenW, screenH)) {
-                0
-            } else {
-                verticalOffsetPx(snap.flymeFreeformVerticalPct, screenH, visualH)
-            }
+            val offset = verticalOffsetPx(snap.flymeFreeformVerticalPct, screenH, visualH)
             rect.offsetTo(left, verticalBase + offset)
             // 禁止小窗偏移 = 关: 把已经居中好的窗口再交给 ROM 的避让逻辑一次，第二个小窗因此落在
             // 「第一个的位置 + 右 78dp / 下 44dp」（方向选择与屏幕内夹取都由 ROM 自己决定）。

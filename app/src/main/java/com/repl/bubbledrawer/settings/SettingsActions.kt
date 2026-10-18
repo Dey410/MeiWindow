@@ -30,6 +30,12 @@ interface SettingsActions {
     fun setFanAutoRetractSec(sec: Int)
     /** 扇形「双击外部关闭」（默认关 = 单击即收起；竖直滑永远是翻页，走不到这里）。 */
     fun setFanDoubleTapDismiss(enabled: Boolean)
+
+    /** 角落手势黑名单：这些应用在前台时角落手势不响应（用户 2026-10-18）。 */
+    fun setFanBlacklist(packages: Set<String>)
+
+    /** 横屏时角落手势要滑两次才打开扇形（用户 2026-10-18）。 */
+    fun setFanLandscapeTwoSwipes(enabled: Boolean)
     fun setFanIconDp(dp: Int)
     fun setFanIconShape(shape: Int)
     /** 外圈半径单独控制：开关 + 滑条（滑条值低于内圈时自动回到内圈半径）。 */
@@ -99,6 +105,9 @@ class StoreSettingsActions(private val context: Context) : SettingsActions {
     override fun setFanShowVibrate(enabled: Boolean) = SettingsStore.setFanShowVibrate(context, enabled)
     override fun setFanAutoRetractSec(sec: Int) = SettingsStore.setFanAutoRetractSec(context, sec)
     override fun setFanDoubleTapDismiss(enabled: Boolean) = SettingsStore.setFanDoubleTapDismiss(context, enabled)
+    override fun setFanBlacklist(packages: Set<String>) = SettingsStore.setFanBlacklist(context, packages)
+    override fun setFanLandscapeTwoSwipes(enabled: Boolean) =
+        SettingsStore.setFanLandscapeTwoSwipes(context, enabled)
     override fun setFanIconDp(dp: Int) = SettingsStore.setFanIconDp(context, dp)
     override fun setFanIconShape(shape: Int) = SettingsStore.setFanIconShape(context, shape)
     override fun setFanOuterRadiusEnabled(enabled: Boolean) = SettingsStore.setFanOuterRadiusEnabled(context, enabled)

@@ -1222,3 +1222,84 @@ adb shell dumpsys input | findstr "bubble contact bar"          # 输入窗口�
 - [ ] 热重载（`adb install -r`）：`CONTACT_BAR_DISPOSED` 之后新进程里条照常出现，没有两层的条
 - [ ] 标题是应用名的通知（QQ/微信/TIM）：`CONTACT_BAR_CONV_NEW` 里的 label 是人名才有意义；
       系统话术（登录提醒/版本更新）不应该冒出一个联系人
+## A33 五个交互问题（用户 2026-10-18 一次报的一批）
+
+### 1. 更多应用面板：tabrow 到顶后继续上滑，整页跟着往下走
+
+**成因（按布局推出来的，不是猜的）**：收藏区展开会同时把 `HorizontalPager` 往下推
+（`pagerY = 收藏区高度 + headerOffset`）。`onPostScroll` 以前只要"收藏区还有折叠量"就展开，不管列表
+滚到了哪里；列表已经滚下去时那点残余位移属于上一笔手势的尾巴，展开一下整页就跟着沉一下。
+
+**改法**：`onPostScroll` 只在该页网格**真的在顶部**（`firstVisibleItemIndex == 0 &&
+firstVisibleItemScrollOffset == 0`）时展开收藏区，否则原样吞掉并打一行
+`PINS_EXPAND_BLOCKED first=… off=… delta=…`（一秒最多一行）。A29 写的顺序本来就是"先回到顶，再展开"。
+
+- [ ] 面板里在收藏区上滑：先把收藏区折叠、TabRow 吸顶，再继续上滑 → **只有列表在滚**，TabRow 不动
+- [ ] 列表滚到中间时下拉 → 列表先回顶，到顶后继续下拉 → 收藏区才展开（`PINS_EXPAND_BLOCKED` 不出现在这一路）
+- [ ] 主页的收藏应用管理页同样两条
+
+### 2. 横屏：居中小窗改成只在竖屏生效
+
+用户原话：「在横屏时打开其他 app 的小窗，上滑使其转变为迷你小窗，随后点击迷你小窗恢复为小窗时，
+位置会出现在横屏的最中间，希望能做到从哪里来到哪里去。即居中小窗修改为仅对竖屏生效」。
+
+`centerRectOnScreen` 现在一进函数就按屏幕方向判断：横屏直接返回、一个像素都不改
+（日志 `CENTERED_BOUNDS_SKIPPED_LANDSCAPE rect=… screen=(W x H)`，去重一行），竖屏照旧。
+
+**注意（设备实测证据）**：这台机器的实验性「Flyme 样式轻量小窗」总开关当前是**关**的，日志里每次都是
+`CENTER_SKIPPED src=mini.getRestoredBounds enabled=false …` —— 也就是说**模块根本没参与摆放**，
+横屏落在正中间是 ROM 自己的行为。这条改的是"模块居中"的规则；要让它生效得先打开那个总开关。
+若打开后横屏仍然居中，那就是 ROM 的 `getRestoredBounds` 自己算的，需要另一套钩子（把还原矩形改回
+窗口去迷你之前的 `taskBounds`），到时候按设备日志再定。
+
+- [ ] 竖屏：迷你 → 点回普通小窗，仍然居中（`CENTERED_BOUNDS` 照旧出现）
+- [ ] 横屏：同样的操作，窗口回到它迷你之前的位置，不乱跳（模块日志里出现 `..._SKIPPED_LANDSCAPE`）
+
+### 3. 角落手势：手势黑名单 + 横屏两次上滑（用户 2026-10-18 新要求）
+
+**手势黑名单**（设置主页 → 全局开关 → 「手势黑名单」）：选中的应用在前台时，角落手势什么都不做。
+判定在 `FanHost.show` 的最前面（`suppressionReason`）：`FAN_SUPPRESSED reason=BLACKLIST side=… pkg=…`，
+并且 `forward()` 把这一笔后续事件整体丢掉（`fanSuppressed`），否则扇形没画出来、dock 却在收事件。
+前台包名来自 `ActivityManager.getRunningTasks(1)`；**取不到时不拦**（宁可多弹一次，也不要永久失效）。
+落盘格式是换行分隔的包名（`encodeFanBlacklist`/`decodeFanBlacklist`，纯函数，`FanBlacklistCodecTest`）。
+
+**横屏两次上滑**（同一个位置，「横屏时需滑动两次」）：横屏下第一次上滑不弹扇形，只提示一句
+「再次上滑」（`FAN_TWO_SWIPE_FIRST side=…`），`FAN_SECOND_SWIPE_MS = 1600ms` 内同一侧再滑一次才打开
+（`FAN_TWO_SWIPE_CONFIRMED side=… gapMs=…`）。竖屏不受影响；瞬时横竖判断用 `isWideScreen(screenW, screenH)`。
+
+- [ ] 黑名单里勾一个应用 → 在那个应用里角落上滑：扇形不出现（`FAN_SUPPRESSED reason=BLACKLIST`），
+      也不会有"看不见的点击"（不会启动应用）
+- [ ] 取消勾选 → 立刻恢复（设置实时同步，不用重启系统界面）
+- [ ] 横屏开「横屏时需滑动两次」→ 第一次上滑只出 toast「再次上滑」；1.6 秒内同一侧再滑 → 扇形打开
+- [ ] 两次之间超时（等 2 秒以上）→ 又要从"第一次"开始
+- [ ] 关掉这个开关 → 横屏一次就打开（和以前一样）
+
+### 4. 自动收起时间滑块加 0 秒 = 松手即收
+
+用户原话：「在扇形面板外观的不操作自动收起时间里滑块添加一个0秒，即松手直接收起」。
+以前 0 表示"**永不**自动收起"（滑块最左显示「不自动收起」），现在改成**松手立刻收**：
+`armTimeout()` 在 0 时不再挂计时器，改由 `FanHost.forward` 收到 `ACTION_UP/CANCEL` 时收
+（日志 `FAN_RETRACT_ON_RELEASE` / `FAN_RETRACT_ON_RELEASE`），滑块文字改成「松手即收」。
+
+- [ ] 扇形外观 → 不操作自动收起 → 拖到最左：显示「松手即收」
+- [ ] 滑出扇形后松手（不点任何格子）→ 立刻收回（`FAN_RETRACT_ON_RELEASE`）
+- [ ] 滑出后**按住不放** → 不收回；点中某个应用 → 照常启动并收回
+- [ ] 拖到 5 秒：5 秒后自动收回（老行为不变）
+
+### 5. 管理 + 搜索时点搜索结果收藏/取消收藏没反应
+
+用户原话：「在扇形面板打开的更多应用页或主页的收藏应用管理，当点击管理再搜索应用时，搜索到的应用
+无法正常点击收藏或取消收藏」。
+
+**成因**：搜索结果的格子**永远是 `Cell.App`**（只有 `+`/`−` 徽标不同），点一下收藏时变的是
+`cells`（★ 区，搜索时看不见）和 `pinnedKeys` —— 而 `pinnedKeys` 以前是**普通字段**，不是 Compose
+状态：徽标读的是 `model.isPinned(...)`，非状态的写入不会让它重组，于是界面上一点变化都没有。
+非搜索时看不出来，因为那时格子在 `Cell.Pin`/`Cell.App` 之间**换类型**，列表本身重建了。
+
+**改法**：`pinnedKeys` 改成 `mutableStateOf`（`PinManageModel`），徽标当场翻。模型那半边另有
+`PinManageModelSearchManageTest` 两条钉住（搜索+管理下 `togglePin` 必须当场生效）。
+
+- [ ] 面板「更多」→ 点「管理」→ 搜索任意应用 → 点一下：徽标立刻变（`+` ↔ `−`），再点一下变回去
+- [ ] 主页 → 收藏应用管理 → 同样操作（两处共用同一个模型/页面）
+- [ ] 搜到**已收藏**的应用：徽标是 `−`，点一下取消收藏（徽标变 `+`）
+- [ ] 退出搜索回到列表：★ 区与徽标一致（不会出现"点了但没进 ★ 区"）

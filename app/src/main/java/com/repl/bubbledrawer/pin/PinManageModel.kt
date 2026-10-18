@@ -235,9 +235,14 @@ class PinManageModel(
      * 落后的一方写回共享组），把刚写下的编辑用旧值顶掉的机会也被放大几百倍（2026-10-12
      * 「收藏自动反复添加/移除」）。收藏列表在一次构建里本来就是同一份，这里在 [rebuild] 时取一次。
      *
+     * **它必须是 Compose 状态**（2026-10-18）：搜索结果里的格子一直是 `Cell.App`（只有 `+`/`−`
+     * 徽标不同），点一下收藏时 `cells` 变了但那些格子不会重建；读普通字段的话界面上什么都不会变，
+     * 看起来就是"点了没用"。用户 2026-10-18：「当点击管理再搜索应用时，搜索到的应用无法正常点击
+     * 收藏或取消收藏」—— 位置在 ★ 区（搜索时看不见），徽标又不动，就是完全没反应。
+     *
      * 还没构建过时（快照为 null）退回现读：那种状态下页面是空的，不会有人来问。
      */
-    private var pinnedKeys: Set<String>? = null
+    private var pinnedKeys by mutableStateOf<Set<String>?>(null)
 
     fun isPinned(app: BubbleApp): Boolean =
         (pinnedKeys ?: pinsOf().map { "${it.packageName}#${it.userId}" }.toSet())

@@ -168,6 +168,8 @@ object RemoteBridge {
             .putBoolean(RemotePrefs.KEY_FAN_SHOW_VIBRATE, snap.fanShowVibrate)
             .putInt(RemotePrefs.KEY_FAN_AUTO_RETRACT_SEC, snap.fanAutoRetractSec)
             .putBoolean(RemotePrefs.KEY_FAN_DOUBLE_TAP_DISMISS, snap.fanDoubleTapDismiss)
+            .putString(RemotePrefs.KEY_FAN_BLACKLIST, encodeFanBlacklist(snap.fanBlacklist))
+            .putBoolean(RemotePrefs.KEY_FAN_LANDSCAPE_TWO_SWIPES, snap.fanLandscapeTwoSwipes)
             .putInt(RemotePrefs.KEY_FAN_ICON_DP, snap.fanIconDp)
             .putInt(RemotePrefs.KEY_FAN_ICON_SHAPE, snap.fanIconShape)
             .putBoolean(RemotePrefs.KEY_FAN_AUTO_FILL_RECOMMEND, snap.fanAutoFillRecommend)
