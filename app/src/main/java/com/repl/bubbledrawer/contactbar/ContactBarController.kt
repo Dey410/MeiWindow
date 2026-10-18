@@ -602,33 +602,53 @@ class ContactBarController(
     private fun createWindowlessWindowManager(config: Configuration, rootSurface: SurfaceControl): Any {
         val cls = Class.forName("android.view.WindowlessWindowManager")
         val ctor = wwmConstructor ?: run {
-            val found = cls.declaredConstructors.firstOrNull { candidate ->
-                val types = candidate.parameterTypes
-                (types.size == 3 || types.size == 2) &&
-                    types[0] == Configuration::class.java &&
-                    types[1] == SurfaceControl::class.java
+            val found = cls.declaredConstructors
+                .filter { candidate ->
+                    val types = candidate.parameterTypes
+                    types.size >= 2 &&
+                        types[0].isAssignableFrom(config.javaClass) &&
+                        types[1].isAssignableFrom(rootSurface.javaClass) &&
+                        types.drop(2).all { !it.isPrimitive }
+                }
+                .minByOrNull { it.parameterCount }
+            if (found == null) {
+                error("No WindowlessWindowManager(Configuration, SurfaceControl, …) in ${cls.declaredConstructors.toList()}")
             }
-            if (found == null) error("No WindowlessWindowManager(Configuration, SurfaceControl[, IBinder]) in ${cls.declaredConstructors.toList()}")
             runCatching { found.isAccessible = true }
             found.also { wwmConstructor = it }
         }
-        val args = if (ctor.parameterCount == 3) arrayOf(config, rootSurface, null) else arrayOf(config, rootSurface)
+        val args = arrayOfNulls<Any>(ctor.parameterCount)
+        args[0] = config
+        args[1] = rootSurface
         return ctor.newInstance(*args)
     }
 
+    /**
+     * 视图宿主。构造签名各版本不一样（这台 ROM 上是
+     * `SurfaceControlViewHost(Context, Display, WindowlessWindowManager, String)`，和迷你小窗长按菜单
+     * 用的同一个），所以按"前三个参数对得上"来挑，剩下的参数按类型给默认值 —— 但**不能**只认
+     * `boolean`：那会把唯一存在的那个四参构造器筛掉，条就永远建不起来（2026-10-18 用户实测：
+     * 日志里只有 `CONTACT_BAR_VIEW_HOST_FAILED`，条不显示）。
+     */
     private fun createSurfaceControlViewHost(context: Context, display: Display, wwm: Any): SurfaceControlViewHost {
-        val wwmCls = Class.forName("android.view.WindowlessWindowManager")
         val ctor = scvhConstructor ?: run {
             val found = SurfaceControlViewHost::class.java.declaredConstructors
-                .filter { it.parameterCount >= 3 }
-                .firstOrNull { candidate ->
+                .filter { candidate ->
                     val types = candidate.parameterTypes
-                    types[0] == Context::class.java &&
-                        types[1] == Display::class.java &&
-                        wwmCls.isAssignableFrom(types[2]) &&
-                        types.drop(3).all { it == Boolean::class.javaPrimitiveType }
+                    types.size >= 3 &&
+                        types[0].isAssignableFrom(context.javaClass) &&
+                        types[1].isAssignableFrom(display.javaClass) &&
+                        types[2].isAssignableFrom(wwm.javaClass) &&
+                        types.drop(3).all { !it.isPrimitive || it == java.lang.Boolean.TYPE }
                 }
-            if (found == null) error("No SurfaceControlViewHost(Context, Display, WindowlessWindowManager[, boolean])")
+                // 参数最少的最"正统"：三参 > 四参（多出来的那个是名字/调试开关）。
+                .minByOrNull { it.parameterCount }
+            if (found == null) {
+                error(
+                    "No SurfaceControlViewHost(Context, Display, WindowlessWindowManager, …) in " +
+                        SurfaceControlViewHost::class.java.declaredConstructors.toList(),
+                )
+            }
             runCatching { found.isAccessible = true }
             found.also { scvhConstructor = it }
         }
@@ -636,7 +656,14 @@ class ContactBarController(
         args[0] = context
         args[1] = display
         args[2] = wwm
-        for (index in 3 until ctor.parameterCount) args[index] = false
+        for (index in 3 until ctor.parameterCount) {
+            args[index] = when {
+                ctor.parameterTypes[index] == java.lang.Boolean.TYPE -> false
+                ctor.parameterTypes[index] == java.lang.Integer.TYPE -> 0
+                ctor.parameterTypes[index] == String::class.java -> "ContactBar"
+                else -> null
+            }
+        }
         return ctor.newInstance(*args) as SurfaceControlViewHost
     }
 
@@ -668,16 +695,38 @@ class ContactBarController(
         }
     }
 
-    /** 把视图交给 host（首次）。失败返回 false，调用方负责拆掉半成品。 */
+    /**
+     * 把视图交给 host（首次）。三步台阶，和迷你小窗长按菜单同一套（那套在这台 ROM 上验证过）：
+     * `setView(View, WindowManager.LayoutParams)` → 自定义 `LayoutParams` 包装 → `setView(View, int, int)`。
+     * 全失败返回 false，调用方负责拆掉半成品。
+     */
     private fun bindViewToHost(vh: SurfaceControlViewHost, v: View, width: Int, height: Int): Boolean {
         val lp = viewLayoutParams(width, height)
-        val byParams = runCatching {
+        val byPublicParams = runCatching {
             SurfaceControlViewHost::class.java
                 .getMethod("setView", View::class.java, WindowManager.LayoutParams::class.java)
                 .invoke(vh, v, lp)
             true
         }.getOrDefault(false)
-        if (byParams) return true
+        if (byPublicParams) return true
+
+        val twoParams = vh.javaClass.methods.firstOrNull {
+            it.name == "setView" && it.parameterCount == 2 && it.parameterTypes[0].isAssignableFrom(v.javaClass)
+        }
+        if (twoParams != null) {
+            val paramType = twoParams.parameterTypes[1]
+            val converted = runCatching {
+                paramType.getConstructor(WindowManager.LayoutParams::class.java).newInstance(lp)
+            }.getOrNull() ?: runCatching {
+                paramType.getConstructor(Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                    .newInstance(width, height)
+            }.getOrNull()
+            if (converted != null) {
+                val ok = runCatching { twoParams.invoke(vh, v, converted); true }.getOrDefault(false)
+                if (ok) return true
+            }
+        }
+
         return runCatching { vh.setView(v, width, height); true }.getOrDefault(false)
     }
 
