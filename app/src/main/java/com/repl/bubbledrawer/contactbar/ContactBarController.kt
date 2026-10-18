@@ -3,6 +3,7 @@ package com.repl.bubbledrawer.contactbar
 import android.app.ActivityOptions
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.os.Handler
@@ -10,38 +11,44 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.Choreographer
+import android.view.Display
 import android.view.Gravity
+import android.view.SurfaceControl
+import android.view.SurfaceControlViewHost
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
 import com.repl.bubbledrawer.launch.FlymeFreeformController
 import com.repl.bubbledrawer.launch.MiuiFreeform
-import com.repl.bubbledrawer.xposed.CornerInputMonitor
 import com.repl.bubbledrawer.xposed.RemotePrefs
 
 /**
  * The floating contact bar under the small window: Flyme's
  * `com.flyme.systemuitools.windowmode.views.C2831I` ("WMNotificationView"), ported to HyperOS.
  *
- * What Flyme does and what we do instead:
+ * 架构（2026-10-18 改）：
  *
- * | Flyme | here |
+ * | Flyme | 这里的实现 |
  * |---|---|
- * | overlay window type 2056 + `meizuFlags`, anchored from `WindowManagerExt.getWindowModeBound(0,0,windowingMode)` | overlay window type 2024 (the module's proven spy/panel identity), anchored from the live `MiuiFreeformModeTaskInfo` |
- * | geometry scaled by `dMin = live/origin bound` recomputed on every bound change | rect read verbatim from `getActiveTaskScaleBounds()` on every frame |
- * | shown for `windowingMode == 11 \|\| 1035`, hidden when no conversations | shown for `mMode == 0`, hidden for mini/pinned |
+ * | 悬浮窗类型 2056 + `meizuFlags`，位置来自 `WindowManagerExt.getWindowModeBound(0,0,windowingMode)` | 挂在 `TaskDisplayArea` 下的**一块 SurfaceControl**（`RootTaskDisplayAreaOrganizer.attachToDisplayArea`），视图用 `SurfaceControlViewHost` 托管；Z 序 `setRelativeLayer(sc, 窗口 leash, +1)` |
+ * | 每帧按 `dMin = live/origin bound` 重算几何 | 每帧用 `SurfaceControl.Transaction.setPosition()` 直接改硬件位置（不过 `system_server`） |
+ * | `windowingMode == 11 \|\| 1035` 显示，没有会话就隐藏 | 普通小窗 (`mMode == 0`) 显示，迷你/贴边隐藏 |
  *
- * Two user requirements drive the frame loop:
+ * 为什么不再是 `WindowManager` 的窗口（用户 2026-10-18 让重构，原话「现在它作为一个视图插进小窗」）：
+ * 以前每次 `addView` / `updateViewLayout` 都是一次同步 binder 到 `system_server` 的 WMS 重新摆窗口，
+ * 比 WMShell 自己（同一个进程里的 Folme 动画）晚 1~2 帧 —— 拖动时条"甩"在窗口后面。现在位置和 Z 序
+ * 都在本进程内改，与窗口同一帧生效。
  *
- *  1. **宽度始终 = 小窗宽度.** HyperOS lets the user drag-resize the window, and WMShell exposes no
- *     per-frame callback at all (verified: `MiuiFreeformModeTaskRepository` only fires appeared /
- *     vanished / mode-changed, and `MiuiFreeformModeResizeHandler.handleResize` pushes geometry
- *     straight into the gesture animation). So the bar polls the task object once per frame —
- *     `getActiveTaskScaleBounds()` returns the destination rect while a gesture/animation is in
- *     flight, which keeps the bar's edge glued to the window's edge.
- *  2. **迷你小窗不显示.** `mMode` 1 (迷你) / 3 (迷你贴边) / 2 (普通贴边) all mean "no room for a bar"
- *     — the window is a thumbnail pinned at a screen edge — so the bar is removed from the window
- *     manager (not merely hidden: an added-but-invisible overlay would still eat touches).
+ * 两条用户要求仍然是这个循环存在的理由：
+ *
+ *  1. **跟手，且宽度始终 = 小窗宽度.** 所以几何每帧从 `MiuiFreeformModeTaskInfo` 现读现摆，
+ *     不缓存、不插值。
+ *  2. **迷你小窗不显示.** `mMode` 1（迷你）/3（迷你贴边）/2（普通贴边）都没有摆条的地方 ——
+ *     整块 surface `hide()`，SurfaceFlinger 层面既不绘制也不收触摸。
+ *
+ * Z 序要特别注意（A19 那条用户反馈「下拉通知栏之后联系人条叠在通知上面」）：条跟着**窗口的 leash**
+ * 排 Z（`setRelativeLayer`），而通知中心/控制中心是整个图层层级之上的窗口，所以条照旧"该被盖住时
+ * 被盖住"，又永远在小窗之上（不会被窗口本身压住）。
  */
 class ContactBarController(
     private val host: Context,
@@ -73,6 +80,48 @@ class ContactBarController(
 
     private var view: ContactBarView? = null
     private var added = false
+    private var rootSurface: SurfaceControl? = null
+    private var viewHost: SurfaceControlViewHost? = null
+    private var currentLeash: SurfaceControl? = null
+
+    /**
+     * 上一次建立 surface/视图失败的时刻。失败后**不能每帧重试**：拖一个小窗就是 60 次/秒的
+     * 反射建 surface + 60 行日志，而失败原因（ROM 改动、显示区没准备好）不会在 16ms 内变。
+     */
+    private var attachFailedAt = 0L
+
+    private val tx = SurfaceControl.Transaction()
+
+    /** `SurfaceControl.Transaction` 里还没进公开 SDK 的那几个，走反射并只解析一次。 */
+    private val txSetTrustedOverlay by lazy { txMethod("setTrustedOverlay", SurfaceControl::class.java, java.lang.Boolean.TYPE) }
+    private val txSetRelativeLayer by lazy { txMethod("setRelativeLayer", SurfaceControl::class.java, SurfaceControl::class.java, java.lang.Integer.TYPE) }
+    private val txRemove by lazy { txMethod("remove", SurfaceControl::class.java) }
+
+    private fun txMethod(name: String, vararg params: Class<*>): java.lang.reflect.Method? =
+        runCatching { SurfaceControl.Transaction::class.java.getMethod(name, *params) }.getOrNull()
+
+    /** 反射调一次；void 方法的 `invoke` 返回 null，所以不能用返回值判断成功。 */
+    private fun txCall(method: java.lang.reflect.Method?, vararg args: Any?): Boolean {
+        method ?: return false
+        return runCatching { method.invoke(tx, *args); true }.getOrDefault(false)
+    }
+
+    /**
+     * `RootTaskDisplayAreaOrganizer.attachToDisplayArea(int, SurfaceControl.Builder)`。
+     * 故意**不做缓存**：`getRootTaskDisplayAreaOrganizer()` 在控制器 hook 装好之前会返回 null，
+     * 缓存成 lazy 的话那次 null 就是永久的（条再也不出现）。
+     */
+    private fun attachMethodFor(organizer: Any): java.lang.reflect.Method? = runCatching {
+        organizer.javaClass.getMethod(
+            "attachToDisplayArea",
+            Int::class.javaPrimitiveType,
+            SurfaceControl.Builder::class.java,
+        ).apply { isAccessible = true }
+    }.getOrNull()
+
+    /** 视图宿主的两个隐藏构造器 —— 探测一次就记住（失败路径每 [ATTACH_RETRY_MS] 会再走一遍）。 */
+    private var wwmConstructor: java.lang.reflect.Constructor<*>? = null
+    private var scvhConstructor: java.lang.reflect.Constructor<*>? = null
 
     @Volatile
     private var frameScheduled = false
@@ -235,6 +284,7 @@ class ContactBarController(
             )
         }
         fastUntil = SystemClock.uptimeMillis() + FAST_WINDOW_MS
+        onFrame()
         scheduleFrame()
     }
 
@@ -246,6 +296,7 @@ class ContactBarController(
             task = null
             unfocused = false
             detach("TASK_VANISHED")
+            destroySurface()
         }
     }
 
@@ -333,6 +384,7 @@ class ContactBarController(
             log(Log.INFO, "CONTACT_BAR_LOOP per-frame (window moving)")
         }
         fastUntil = SystemClock.uptimeMillis() + FAST_WINDOW_MS
+        onFrame()
         scheduleFrame()
     }
 
@@ -421,9 +473,12 @@ class ContactBarController(
             return
         }
         if (!added) {
-            attach(info, rect)
+            // 失败退避（见 [attachFailedAt]）：拖动中每帧重试 = 60 次/秒的反射建 surface。
+            if (SystemClock.uptimeMillis() - attachFailedAt >= ATTACH_RETRY_MS) attach(info, rect)
         } else if (rect != lastRect) {
             update(info, rect)
+        } else {
+            checkLeash(info)
         }
         lastRect = rect
         logGeometry(info, bounds, rect)
@@ -484,45 +539,282 @@ class ContactBarController(
         view = it
     }
 
-    // ---------------------------------------------------------------- window plumbing
+    // ---------------------------------------------------------------- surface plumbing
+    //
+    // 联系人条**不是**窗口：一块挂在 TaskDisplayArea 下的 SurfaceControl + 一个
+    // SurfaceControlViewHost 托管的视图（见类注释）。这里每一条路径都必须自己扛住异常 ——
+    // 它们全在主线程的 Choreographer 回调和输入回调里，抛出去就是系统界面进程崩掉。
 
+    /** 显示区/显示取不到时返回 null（绝不 `error()`：那是主线程崩溃）。 */
+    private fun displayOrNull(): Display? {
+        val dm = runCatching {
+            host.getSystemService(android.hardware.display.DisplayManager::class.java)
+        }.getOrNull()
+        return runCatching { dm?.getDisplay(Display.DEFAULT_DISPLAY) }.getOrNull()
+            ?: runCatching { host.display }.getOrNull()
+            ?: runCatching { dm?.displays?.firstOrNull() }.getOrNull()
+    }
+
+    /**
+     * 建立（或复用）条的那块 surface：`RootTaskDisplayAreaOrganizer.attachToDisplayArea(displayId,
+     * builder)` 把它挂到显示区下 —— 和黑色遮罩（`FreeformBackgroundDecoration`）同一套机制，
+     * 所以在 HyperOS 上是验证过的路径。
+     */
+    private fun ensureSurface(taskId: Int): SurfaceControl? {
+        rootSurface?.let {
+            if (it.isValid) return it
+            // 失效了（SurfaceFlinger 重启、显示区重建、旋转…）—— 后面所有 transaction 都会抛
+            // IllegalArgumentException，所以必须整块换新的，不能"先用着试试"。
+            log(Log.WARN, "CONTACT_BAR_SURFACE_STALE taskId=$taskId")
+            destroySurface()
+        }
+        val organizer = FlymeFreeformController.getRootTaskDisplayAreaOrganizer()
+        if (organizer == null) {
+            log(Log.WARN, "CONTACT_BAR_ORGANIZER_NULL")
+            return null
+        }
+        val attachMethod = attachMethodFor(organizer) ?: run {
+            log(Log.WARN, "CONTACT_BAR_ATTACH_METHOD_NULL")
+            return null
+        }
+        val displayId = displayOrNull()?.displayId ?: Display.DEFAULT_DISPLAY
+        val created = runCatching {
+            val builder = SurfaceControl.Builder().setName("ContactBarSurface-$taskId")
+            runCatching {
+                SurfaceControl.Builder::class.java.getMethod("setContainerLayer").invoke(builder)
+            }
+            attachMethod.invoke(organizer, displayId, builder)
+            builder.build()
+        }.onFailure {
+            logger(Log.WARN, "CONTACT_BAR_SURFACE_FAILED displayId=$displayId", it)
+        }.getOrNull() ?: return null
+        rootSurface = created
+        log(Log.INFO, "CONTACT_BAR_SURFACE taskId=$taskId displayId=$displayId name=$created")
+        return created
+    }
+
+    /**
+     * `WindowlessWindowManager(Configuration, SurfaceControl, IBinder)` —— 视图的"窗口管理器"，
+     * 它把 `setView` 进来的视图子 surface 挂到我们那块 surface 下（**不经过 system_server**）。
+     * 构造签名按版本探测，结果缓存：这条路径失败时是每 [ATTACH_RETRY_MS] 试一次，
+     * 不缓存的话每次都要遍历一遍构造器。
+     */
+    private fun createWindowlessWindowManager(config: Configuration, rootSurface: SurfaceControl): Any {
+        val cls = Class.forName("android.view.WindowlessWindowManager")
+        val ctor = wwmConstructor ?: run {
+            val found = cls.declaredConstructors.firstOrNull { candidate ->
+                val types = candidate.parameterTypes
+                (types.size == 3 || types.size == 2) &&
+                    types[0] == Configuration::class.java &&
+                    types[1] == SurfaceControl::class.java
+            }
+            if (found == null) error("No WindowlessWindowManager(Configuration, SurfaceControl[, IBinder]) in ${cls.declaredConstructors.toList()}")
+            runCatching { found.isAccessible = true }
+            found.also { wwmConstructor = it }
+        }
+        val args = if (ctor.parameterCount == 3) arrayOf(config, rootSurface, null) else arrayOf(config, rootSurface)
+        return ctor.newInstance(*args)
+    }
+
+    private fun createSurfaceControlViewHost(context: Context, display: Display, wwm: Any): SurfaceControlViewHost {
+        val wwmCls = Class.forName("android.view.WindowlessWindowManager")
+        val ctor = scvhConstructor ?: run {
+            val found = SurfaceControlViewHost::class.java.declaredConstructors
+                .filter { it.parameterCount >= 3 }
+                .firstOrNull { candidate ->
+                    val types = candidate.parameterTypes
+                    types[0] == Context::class.java &&
+                        types[1] == Display::class.java &&
+                        wwmCls.isAssignableFrom(types[2]) &&
+                        types.drop(3).all { it == Boolean::class.javaPrimitiveType }
+                }
+            if (found == null) error("No SurfaceControlViewHost(Context, Display, WindowlessWindowManager[, boolean])")
+            runCatching { found.isAccessible = true }
+            found.also { scvhConstructor = it }
+        }
+        val args = arrayOfNulls<Any>(ctor.parameterCount)
+        args[0] = context
+        args[1] = display
+        args[2] = wwm
+        for (index in 3 until ctor.parameterCount) args[index] = false
+        return ctor.newInstance(*args) as SurfaceControlViewHost
+    }
+
+    /** 视图的"窗口参数"。`token` 必须留空：WWM 不是 `system_server`，随机 token 只会让每个尺寸变化都变成一个新窗口。 */
+    private fun viewLayoutParams(width: Int, height: Int) = WindowManager.LayoutParams(
+        width,
+        height,
+        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+        PixelFormat.TRANSLUCENT,
+    ).apply {
+        gravity = Gravity.TOP or Gravity.START
+        x = 0
+        y = 0
+        title = "bubble contact bar"
+        windowAnimations = 0
+        layoutInDisplayCutoutMode =
+            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        @Suppress("DEPRECATION")
+        systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+        runCatching { setFitInsetsTypes(0) }
+        // 条在窗口 Z 序之外（挂在显示区下），HyperOS 的模糊/合成用它判断"可以盖在别人上面"。
+        runCatching {
+            WindowManager.LayoutParams::class.java.getMethod("setTrustedOverlay").invoke(this)
+        }
+    }
+
+    /** 把视图交给 host（首次）。失败返回 false，调用方负责拆掉半成品。 */
+    private fun bindViewToHost(vh: SurfaceControlViewHost, v: View, width: Int, height: Int): Boolean {
+        val lp = viewLayoutParams(width, height)
+        val byParams = runCatching {
+            SurfaceControlViewHost::class.java
+                .getMethod("setView", View::class.java, WindowManager.LayoutParams::class.java)
+                .invoke(vh, v, lp)
+            true
+        }.getOrDefault(false)
+        if (byParams) return true
+        return runCatching { vh.setView(v, width, height); true }.getOrDefault(false)
+    }
+
+    /**
+     * 改视图尺寸（小窗被拖动缩放时每帧可能都变）。先试 `relayout(int, int)`；有的版本没有它，
+     * 就重新 `setView` 一次 —— 两条路都失败就让调用方整块重建，而不是留一个尺寸不对的条。
+     */
+    private fun resizeViewHost(vh: SurfaceControlViewHost?, v: View, width: Int, height: Int): Boolean {
+        if (vh == null) return false
+        if (runCatching { vh.relayout(width, height); true }.getOrDefault(false)) return true
+        return bindViewToHost(vh, v, width, height)
+    }
+
+    /** `SurfaceControl.Transaction` 没有公开的 show/hide（旧实现里 `invoke` 返回 null，两条路都会跑）。 */
+    private fun showSurface(sc: SurfaceControl) {
+        tx.setVisibility(sc, true)
+    }
+
+    private fun hideSurface(sc: SurfaceControl) {
+        tx.setVisibility(sc, false)
+    }
+
+    /**
+     * 窗口的 leash —— Z 序的参照物。`getLeash()` 读不到时退到控制器那套（运行中的 task / `mLeash`）。
+     * 每帧最多一次，访问器在 [FreeformTask] 里按类缓存。
+     */
+    private fun resolveLeash(info: Any): SurfaceControl? =
+        FreeformTask.leash(info) ?: FlymeFreeformController.instance?.getTaskLeash(info)
+
+    /**
+     * 把条摆到 [rect] 并让它可见。失败时**拆掉整块 surface** 并记下 [attachFailedAt]
+     * （下一轮 [ATTACH_RETRY_MS] 后再试），绝不留下"看起来加了、其实什么都没显示"的状态 ——
+     * 那会让条永远不再出现（以前 `added` 就是这么被置上的）。
+     */
     private fun attach(info: Any, rect: Rect) {
+        val taskId = FreeformTask.taskId(info)
+        val sc = ensureSurface(taskId) ?: return failed("SURFACE_UNAVAILABLE")
+        val display = displayOrNull() ?: return failed("NO_DISPLAY")
         val v = ensureView()
         applyCorner(v, info)
         v.bind(items, fallbackIcon(), ::openConversation, ::onRemoveConversation)
-        val shownType = runCatching {
-            wm.addView(v, params(rect, barWindowType))
-            barWindowType
-        }.recoverCatching { refusal ->
-            // ROM 不认 APPLICATION_OVERLAY（需要 SYSTEM_ALERT_WINDOW 的 app-op；SystemUI 的 uid 上没被
-            // 显式 allow 过的话就会被拒）—— 那就退回原来的类型 + trusted：图层回到老样子，但条还在。
-            // 宁可"又压住通知"，也不能让联系人条整个消失。
-            logger(Log.WARN, "CONTACT_BAR_ADD_RETRY type=$barWindowType", refusal)
-            val fallback = CornerInputMonitor.CORNER_WINDOW_TYPE
-            wm.addView(v, params(rect, fallback, trusted = true))
-            fallback
+
+        if (viewHost == null) {
+            val created = runCatching {
+                val wwm = createWindowlessWindowManager(host.resources.configuration, sc)
+                val vh = createSurfaceControlViewHost(host, display, wwm)
+                if (!bindViewToHost(vh, v, rect.width(), rect.height())) {
+                    runCatching { vh.release() }
+                    error("setView failed")
+                }
+                vh
+            }.onFailure {
+                logger(Log.WARN, "CONTACT_BAR_VIEW_HOST_FAILED taskId=$taskId", it)
+            }.getOrNull() ?: return failed("VIEW_HOST_UNAVAILABLE")
+            viewHost = created
+        } else if (!resizeViewHost(viewHost, v, rect.width(), rect.height())) {
+            return failed("RELAYOUT_FAILED")
+        }
+
+        val leash = resolveLeash(info)
+        val applied = runCatching {
+            currentLeash = leash
+            runCatching { txCall(txSetTrustedOverlay, sc, true) }
+            if (leash != null && leash.isValid && txCall(txSetRelativeLayer, sc, leash, 1)) {
+                // 相对窗口 leash 排 Z：通知中心/控制中心在更上层，照旧盖得住它（A19）。
+            } else {
+                currentLeash = null
+                tx.setLayer(sc, LAYER_WITHOUT_LEASH)
+            }
+            tx.setPosition(sc, rect.left.toFloat(), rect.top.toFloat())
+            tx.setCrop(sc, Rect(0, 0, rect.width(), rect.height()))
+            showSurface(sc)
+            tx.apply()
+            true
         }.onFailure {
-            logger(Log.WARN, "CONTACT_BAR_ADD_FAILED rect=$rect", it)
-        }.getOrNull() ?: return
+            logger(Log.WARN, "CONTACT_BAR_SHOW_FAILED rect=$rect", it)
+        }.getOrDefault(false)
+        if (!applied) return failed("TRANSACTION_FAILED")
+
         added = true
+        attachFailedAt = 0L
         hideReason = null
         v.fadeIn()
-        attachedType = shownType
-        attachedTrusted = shownType != barWindowType
         log(
             Log.INFO,
-            "CONTACT_BAR_SHOW rect=$rect items=${items.size} pkg=$currentPkg type=$shownType",
+            "CONTACT_BAR_SHOW rect=$rect items=${items.size} pkg=$currentPkg taskId=$taskId " +
+                "leash=${leash != null} relative=${currentLeash != null}",
         )
     }
 
+    /** 失败收尾：拆掉半成品（下一次从零开始），并让下一帧不要立刻重试。 */
+    private fun failed(reason: String) {
+        attachFailedAt = SystemClock.uptimeMillis()
+        if (rootSurface != null || viewHost != null) destroySurface()
+        if (hideReason != reason) log(Log.WARN, "CONTACT_BAR_HIDE reason=$reason")
+        added = false
+        hideReason = reason
+    }
+
     private fun update(info: Any, rect: Rect) {
+        val sc = rootSurface
+        if (sc == null || !sc.isValid) {
+            // surface 没了：这不是"位置不对"，只能是整块重建（见 [ensureSurface]）。
+            log(Log.WARN, "CONTACT_BAR_SURFACE_LOST")
+            destroySurface()
+            return
+        }
         val v = view ?: return
-        // 用**当前真正生效的**类型更新（可能是退回后的 2024 + trusted）：换类型会让 updateViewLayout 抛异常。
-        runCatching { wm.updateViewLayout(v, params(rect, attachedType, attachedTrusted)) }
-            .onFailure { logger(Log.WARN, "CONTACT_BAR_UPDATE_FAILED", it) }
+        val old = lastRect
+        val sizeChanged = old == null || old.width() != rect.width() || old.height() != rect.height()
+        if (sizeChanged && !resizeViewHost(viewHost, v, rect.width(), rect.height())) {
+            logger(Log.WARN, "CONTACT_BAR_RELAYOUT_FAILED rect=$rect", null)
+            destroySurface()
+            return
+        }
+
+        val leash = resolveLeash(info)
+        val applied = runCatching {
+            if (leash != null && leash.isValid && leash !== currentLeash &&
+                txCall(txSetRelativeLayer, sc, leash, 1)
+            ) {
+                currentLeash = leash
+            }
+            if (sizeChanged) tx.setCrop(sc, Rect(0, 0, rect.width(), rect.height()))
+            tx.setPosition(sc, rect.left.toFloat(), rect.top.toFloat())
+            showSurface(sc)
+            tx.apply()
+            true
+        }.onFailure {
+            logger(Log.WARN, "CONTACT_BAR_UPDATE_FAILED rect=$rect", it)
+        }.getOrDefault(false)
+        if (!applied) {
+            // 这一帧没摆对就别硬撑：拆掉，下一帧整块重建（拖一次也就多一次重建）。
+            destroySurface()
+            return
+        }
         applyCorner(v, info)
-        // 以前这里还要"宽度变了就按新容量重绑一次"（宽了多显示几个）。条改成可左右滑动之后，
-        // 哪些头像可见由手势决定，窗口变化只影响窗口本身 —— [attach] 时绑的那份列表继续用。
     }
 
     /**
@@ -536,15 +828,35 @@ class ContactBarController(
         view.setCornerRadius(radius)
     }
 
+    /** 位置没变也要看一眼：换窗口（两个小窗）时 Z 序的参照物跟着换。 */
+    private fun checkLeash(info: Any) {
+        val sc = rootSurface ?: return
+        if (!sc.isValid) {
+            destroySurface()
+            return
+        }
+        val leash = resolveLeash(info) ?: return
+        if (!leash.isValid || leash === currentLeash) return
+        val applied = runCatching {
+            if (!txCall(txSetRelativeLayer, sc, leash, 1)) return@runCatching false
+            tx.apply()
+            true
+        }.getOrDefault(false)
+        if (applied) currentLeash = leash
+    }
+
     /**
-     * Remove the overlay from the window manager. Deliberately keeps [items] and [currentPkg]: a
+     * Hide the contact bar surface. Deliberately keeps [items] and [currentPkg]: a
      * mini window that is restored to a normal one, or a bar hidden by a transient state, must come
      * back instantly instead of waiting for the next notification refresh.
      */
     private fun detach(reason: String) {
-        view?.let { v ->
-            view = null
-            runCatching { wm.removeViewImmediate(v) }
+        val sc = rootSurface
+        if (sc != null && sc.isValid) {
+            runCatching {
+                hideSurface(sc)
+                tx.apply()
+            }.onFailure { logger(Log.WARN, "CONTACT_BAR_HIDE_FAILED reason=$reason", it) }
         }
         if (added || hideReason != reason) {
             log(Log.INFO, "CONTACT_BAR_HIDE reason=$reason")
@@ -554,65 +866,25 @@ class ContactBarController(
         hideReason = reason
     }
 
-    /**
-     * 联系人条的窗口类型 —— **故意不是** `CornerInputMonitor.CORNER_WINDOW_TYPE`（2024 / trusted）。
-     *
-     * 用户 2026-10-12：「还是想办法调低图层吧，通知中心不显示了，控制中心还是显示」。
-     * 设备实测（`dumpsys window windows` 的 `mBaseLayer`，控制中心打开时）：
-     *
-     * ```
-     * 281000 NAVIGATION_BAR_PANEL  bubble contact bar      ← 原来的条（2024 + setTrustedOverlay）
-     * 251000 NAVIGATION_BAR_PANEL  bubble slide ime probe  ← 同一个类型，没有 trusted
-     * 241000 SYSTEM_OVERLAY        AntiMistakeTouchView
-     * 231000 STATUS_BAR_SUB_PANEL  NotificationModalWindowManager
-     * 181000 NOTIFICATION_SHADE    NotificationShade      ← 通知中心
-     * 171000 STATUS_BAR            StatusBar
-     * 151000 APPLICATION_OVERLAY   ShellDropTarget        ← 同一个进程里的 APPLICATION_OVERLAY
-     * 131000 BASE_APPLICATION      QQ（小窗）
-     * ```
-     *
-     * 也就是说：`setTrustedOverlay` 会把窗口提到窗帘**之上**（281000 vs 同类型的 251000），而
-     * `TYPE_APPLICATION_OVERLAY` 落在 **151000** —— 正好在通知中心（181000）、控制中心那几个面板
-     * （231000/241000）和导航栏之下，又在小窗（131000）与输入法（111000）之上：**该盖住它的都盖得住，
-     * 该被它盖住的还盖得住**。所以条改成这个类型，并且不再设 trusted（Panel 那套留着手势探针与扇面用）。
-     */
-    private val barWindowType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+    /** 彻底拆掉 surface 与视图宿主（任务消失、热重载、重建失败时）。 */
+    private fun destroySurface() {
+        val vh = viewHost
+        viewHost = null
+        runCatching { vh?.release() }
+            .onFailure { logger(Log.WARN, "CONTACT_BAR_HOST_RELEASE_FAILED", it) }
 
-    /** 实际生效的类型（`APPLICATION_OVERLAY` 被拒时退回 2024 + trusted，见 [attach]）。 */
-    private var attachedType = barWindowType
-
-    private var attachedTrusted = false
-
-    private fun params(
-        rect: Rect,
-        type: Int,
-        trusted: Boolean = false,
-    ) = WindowManager.LayoutParams(
-        rect.width(),
-        rect.height(),
-        type,
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-        PixelFormat.TRANSLUCENT,
-    ).apply {
-        gravity = Gravity.TOP or Gravity.START
-        x = rect.left
-        y = rect.top
-        title = "bubble contact bar"
-        windowAnimations = 0
-        layoutInDisplayCutoutMode =
-            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-        @Suppress("DEPRECATION")
-        systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
-            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-        runCatching { setFitInsetsTypes(0) }
-        if (trusted) {
+        val sc = rootSurface
+        rootSurface = null
+        if (sc != null && sc.isValid) {
             runCatching {
-                WindowManager.LayoutParams::class.java.getMethod("setTrustedOverlay").invoke(this)
-            }
+                if (!txCall(txRemove, sc)) tx.reparent(sc, null)
+                tx.apply()
+            }.onFailure { logger(Log.WARN, "CONTACT_BAR_SURFACE_REMOVE_FAILED", it) }
         }
+        view = null
+        added = false
+        lastRect = null
+        currentLeash = null
     }
 
     // ---------------------------------------------------------------- data
@@ -631,13 +903,16 @@ class ContactBarController(
         if (list == items) return@onMain
         lastDataReason = null
         items = list
-        val v = view ?: return@onMain
-        v.bind(items, fallbackIcon(), ::openConversation, ::onRemoveConversation)
         log(
             Log.INFO,
             "CONTACT_BAR_DATA pkg=$pkg items=${items.size} live=${recent.lastLiveCount} " +
                 "remembered=${(items.size - recent.lastLiveCount).coerceAtLeast(0)}",
         )
+        val v = view
+        if (v != null) {
+            v.bind(items, fallbackIcon(), ::openConversation, ::onRemoveConversation)
+        }
+        scheduleFrame()
     }
 
     /**
@@ -825,6 +1100,7 @@ class ContactBarController(
         idleScheduled = false
         onFreeformWindowMotion = null
         detach("DISPOSE")
+        destroySurface()
         task = null
         // Also unregister our notification listener: a hot reload replaces our classes but not the
         // objects the previous generation registered inside SystemUI.
@@ -838,6 +1114,15 @@ class ContactBarController(
     private companion object {
         /** Gap between the window's bottom edge and the bar (Flyme: 10dp margin, 63dp bar). */
         const val GAP_DP = 6
+
+        /** 建立 surface/视图宿主失败后的重试间隔 —— 别每帧重试（见 [attachFailedAt]）。 */
+        const val ATTACH_RETRY_MS = 500L
+
+        /**
+         * 拿不到窗口 leash 时的绝对 Z。显示区这一层的子图层里它排在所有任务之上，
+         * 而通知中心/控制中心仍在整个图层层级之上 —— 退化路径也不会压住面板。
+         */
+        const val LAYER_WITHOUT_LEASH = 25000
 
         /**
          * How long the bar stays hidden after the close gesture commits. The task only vanishes when

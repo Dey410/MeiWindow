@@ -58,7 +58,6 @@ object FreeformTask {
         val isInPinMode = find(cls, "isInPinMode")
         val enterState = find(cls, "getEnterState")
         val cornerRadius = find(cls, "getCornerRadius")
-        val leash = find(cls, "getLeash")
         val windowingMode = find(cls, "getWindowingMode")
 
         private fun find(cls: Class<*>, name: String) =
@@ -138,16 +137,44 @@ object FreeformTask {
     }
 
     /**
-     * The task's surface leash — the anchor for "just below this window" z-ordering. Null when the
+     * The task's surface leash — the anchor for "just above this window" z-ordering. Null when the
      * object cannot supply one.
+     *
+     * 访问器**按类缓存**：联系人条每帧都要用它排 Z 序（`ContactBarController.update`），而
+     * `getField`/`getDeclaredField` 每次都要重新复制一遍字段表 —— 60 次/秒的拖动里那是白花的开销。
      */
+    private class LeashAccess(
+        private val getter: java.lang.reflect.Method?,
+        private val field: java.lang.reflect.Field?,
+    ) {
+        fun read(target: Any): SurfaceControl? {
+            getter?.let { return runCatching { it.invoke(target) as? SurfaceControl }.getOrNull() }
+            field?.let { return runCatching { it.get(target) as? SurfaceControl }.getOrNull() }
+            return null
+        }
+    }
+
+    private val leashAccessCache = HashMap<Class<*>, LeashAccess>()
+
+    private fun leashAccess(cls: Class<*>): LeashAccess = synchronized(leashAccessCache) {
+        leashAccessCache[cls]?.let { return it }
+        val getter = runCatching { cls.getMethod("getLeash") }.getOrNull()
+        val field = if (getter != null) {
+            null
+        } else {
+            runCatching { cls.getField("leash") }.getOrNull()
+                ?: runCatching { cls.getDeclaredField("mLeash").apply { isAccessible = true } }.getOrNull()
+        }
+        LeashAccess(getter, field).also { leashAccessCache[cls] = it }
+    }
+
     fun leash(info: Any?): SurfaceControl? {
         if (info == null) return null
-        (read(info) { it.leash } as? SurfaceControl)?.let { if (it.isValid) return it }
+        leashAccess(info.javaClass).read(info)?.takeIf { it.isValid }?.let { return it }
+        // `MiuiFreeformModeTaskInfo` 自己不一定有 leash，真正的 task（`RunningTaskInfo` /
+        // `TaskInfo`）挂在 `taskInfo` 字段上 —— 那条路径的字段名各版本不同（`leash` / `mLeash`）。
         val taskInfo = read(info) { it.taskInfo } ?: return null
-        return runCatching { taskInfo.javaClass.getField("leash").get(taskInfo) as? SurfaceControl }
-            .getOrNull()
-            ?.takeIf { it.isValid }
+        return leashAccess(taskInfo.javaClass).read(taskInfo)?.takeIf { it.isValid }
     }
 
     /** `windowingMode` of the task ([WINDOWING_MODE_FREEFORM] = 小窗); -1 when it cannot be read. */

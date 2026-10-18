@@ -1658,6 +1658,9 @@ class FlymeFreeformController(
         @Volatile var savedOrganizer: Any? = null
         @Volatile var savedContext: Context? = null
 
+        fun getRootTaskDisplayAreaOrganizer(): Any? =
+            instance?.getRootTaskDisplayAreaOrganizer() ?: savedOrganizer
+
         /** `MiuiFreeformModeController.mMultiTaskingTaskRepository` — task id → window object. */
         @Volatile var savedRepository: Any? = null
         @Volatile var sForceMiniTransition = false

@@ -276,8 +276,17 @@ class RecentConversations(
     private fun remember(conv: Conversation, now: Long) {
         if (isForgotten(conv)) return
         val id = conversationId(conv.pkg, conv.displayLabel)
-        val record = remembered.getOrPut(id) {
-            Remembered(id, conv.pkg, conv.title, null, null, null, null, conv.userId, 0L, now, conv.displayLabel)
+        val known = remembered[id]
+        val record = known ?: Remembered(
+            id, conv.pkg, conv.title, null, null, null, null, conv.userId, 0L, now, conv.displayLabel,
+        ).also {
+            remembered[id] = it
+            // 一个会话只在这一行出现一次（以前每收到一条通知、每重建一次列表都打一行，主线程 I/O）。
+            log(
+                Log.INFO,
+                "CONTACT_BAR_CONV_NEW pkg=${conv.pkg} label=${conv.displayLabel} title=${conv.title}",
+                null,
+            )
         }
         if (conv.icon != null) record.icon = conv.icon
         if (conv.pendingIntent != null) record.pendingIntent = conv.pendingIntent
@@ -376,12 +385,19 @@ class RecentConversations(
         // Group summaries ("微信 · 3 条新消息") carry the app name, not a person — they would add a
         // bogus avatar and are exactly what the title gate below is meant to reject.
         if (runCatching { n.flags and Notification.FLAG_GROUP_SUMMARY != 0 }.getOrDefault(false)) return null
-        val title = runCatching {
+        var title = runCatching {
             n.extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim()
         }.getOrNull().orEmpty()
-        // Same gate as Flyme's `m8903m()`: a chat notification always carries the sender as the
-        // title and the sender's avatar as the large icon. System chatter («下线通知» …) fails it.
-        if (title.isEmpty() || title in IGNORED_TITLES) return null
+
+        // 标题是应用名（`QQ` / `微信` / `TIM`）或空时，发送者只在正文的 `发送者：消息` 里；
+        // 取不到就**丢弃**这条通知 —— 判定与理由见 [resolveConversationTitle]（纯算术，有单测）。
+        title = resolveConversationTitle(
+            rawTitle = title,
+            text = runCatching {
+                n.extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString()
+            }.getOrNull().orEmpty(),
+            ignored = IGNORED_TITLES,
+        ) ?: return null
         val pi = n.contentIntent ?: return null
 
         // **谁发的**（只为了头像）：MessagingStyle 是权威答案（Telegram 就用它）—— 人 = 最后一条
@@ -418,7 +434,7 @@ class RecentConversations(
             // 但要留一行证据 —— 否则"这个人怎么没头像"永远查不出原因。
             if (raw != null && cachedIcons[key] == null) logIconCopyFailed(pkg, key)
         }
-        return Conversation(
+        val conv = Conversation(
             pkg = pkg,
             key = key,
             title = title,
@@ -434,6 +450,7 @@ class RecentConversations(
             userId = notificationUserId(sbn),
             label = label,
         )
+        return conv
     }
 
     /** The avatar we keep — see [ownIconCopy] for why it is a copy and never the source. */
@@ -539,8 +556,11 @@ class RecentConversations(
             "org.telegram.messenger",
         )
 
-        /** Flyme drops QQ's 「下线通知」 explicitly (`C2831I.java:533-539`). */
-        private val IGNORED_TITLES = setOf("下线通知", "微信", "QQ", "微信支付", "服务通知")
+        /**
+         * Flyme drops QQ's 「下线通知」 explicitly (`C2831I.java:533-539`)；应用名标题（`微信` / `QQ` /
+         * `TIM`）在 [resolveConversationTitle] 里单独处理 —— 只有正文能给出"发送者：…"时才算一条会话。
+         */
+        private val IGNORED_TITLES = setOf("下线通知", "微信支付", "服务通知")
 
         @Volatile
         private var pipelineRef: Any? = null

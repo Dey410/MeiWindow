@@ -184,6 +184,10 @@ E:\Android\Sdk\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app
 - [ ] 真机自测小窗命令（比手势快）：`adb shell am start --windowingMode 5 -n <pkg>/<activity>`
       —— 注意这样拉起的是**较小**的 freeform 窗口（本机约屏幕宽 33%），默认 60% 阈值下会被
       `TOO_SMALL` 隐藏，属预期；要看条可用手势开正常小窗或把阈值调低
+- [ ] **触摸**（2026-10-18 换成 `SurfaceControl` 之后唯一换了投递方的东西，见 A32）：点头像打开会话、
+      横滑滚动、上滑移除都照旧；`adb shell dumpsys input | findstr "bubble contact bar"` 能查到输入窗口
+- [ ] 条的取证（A32）：`dumpsys SurfaceFlinger --list` 里有 `ContactBarSurface-<taskId>`；
+      它不再是窗口，`dumpsys window` 里**查不到** `bubble contact bar` 了
 - [ ] 快捷判据：`adb logcat -s BubbleDrawer | findstr CONTACT_BAR`
       （启动时应有 `CONTACT_BAR_HOOKS_INSTALLED pipeline=true` 与 `CONTACT_BAR_NOTIF_LISTENER_ATTACHED`）
 
@@ -579,6 +583,12 @@ reason=NO_CONTACTS` 一直重复，看起来像"功能没做"）。
 - [ ] 随后条上仍能出新消息（不是只有重启系统界面之后才行）
 
 ### 联系人条与通知栏/控制中心：把图层真的调低（用户 2026-10-12）
+
+> **2026-10-18 更新**：条已经不是窗口了（改成挂在显示区下的 `SurfaceControl`，见 **A32**）。
+> 这一节的窗口类型、`mBaseLayer` 与 `dumpsys window` 取证**全部作废**；
+> 「通知中心/控制中心要盖住条」这条用户要求没变 —— 现在由 `setRelativeLayer(sc, 窗口 leash, +1)`
+> 实现（条跟随窗口的 Z，而面板在整个图层层级之上）。下面这段留作历史：它解释了**当初为什么**要换类型。
+
 现象：下拉通知栏之后联系人条叠在通知上面；再试「躲开」的方案，通知中心不显示了，**控制中心还是显示** ——
 HyperOS 的这两个面板不是同一个窗口，靠"识别面板再躲"永远追不完。
 
@@ -605,8 +615,9 @@ HyperOS 的这两个面板不是同一个窗口，靠"识别面板再躲"永远�
 - [ ] 开着聊天小窗 → 下拉通知中心：条**在下面**（不是消失，也不压住通知）
 - [ ] 右侧下拉出控制中心：条同样在下面
 - [ ] 收起任一面板：条照旧贴在小窗下沿（位置、点击、划掉都不受影响）
-- [ ] 条仍然盖在普通应用/桌面上（`APPLICATION_OVERLAY` 在应用窗口之上），输入法弹出时照旧让位
-- [ ] `dumpsys window windows`：`bubble contact bar` 的 `mBaseLayer=151000`、`ty=APPLICATION_OVERLAY`
+- [ ] 条仍然盖在普通应用/桌面上（它挂在小窗的 leash 之上、又在面板之下），输入法弹出时照旧让位
+- [ ] ~~`dumpsys window windows`：`mBaseLayer=151000`、`ty=APPLICATION_OVERLAY`~~ —— 条不再是窗口，
+      这一条已作废，改看 `dumpsys SurfaceFlinger --list` 里的 `ContactBarSurface-<taskId>`（A32）
 
 ## A20 小窗落点：横方向居中/触发侧，竖方向正中 + 上下滑杆
 用户 2026-10-11 的决定（原话）：「**竖屏时始终居中，横屏依旧按你的在那边打开就在哪边显示的逻辑**」、
@@ -1079,3 +1090,117 @@ release pkg=… restore=1.0 volume=true appOps=true
 - [ ] 关掉「迷你小窗长按菜单」开关：长按无菜单，迷你小窗的拖动/单击与 1.3.3 一致
       （倍率滑块此时是灰的）
 - [ ] 体检页原有各项仍 PASS（本项未新增体检判据，参考日志 `HOOK_INSTALLED_hookMiniTouchForMenu_complete`）
+
+## A32 联系人条改成 SurfaceControl（用户 2026-10-18 的重构复查）
+
+用户原话：「另一个 ai 重构了联系人条，现在它作为一个视图插进小窗，你检查一下有没有破坏原功能，顺便改进」。
+
+### 改了什么
+
+以前条是一个 **`WindowManager` 窗口**（`TYPE_APPLICATION_OVERLAY`，A19 里为了把图层调低才选它），
+每帧 `updateViewLayout` → 同步 binder 到 `system_server` 的 WMS 重新摆窗口 —— 比 WMShell 自己
+（同一个进程里的 Folme 动画）晚 1~2 帧，拖动时条会"甩"在窗口后面。
+
+现在是一块挂在 **`TaskDisplayArea`** 下的 `SurfaceControl`（`RootTaskDisplayAreaOrganizer.attachToDisplayArea`，
+和黑色遮罩同一套机制）+ `SurfaceControlViewHost` 托管的视图，位置/Z 序每帧在本进程里改完就生效。
+
+| 项 | 以前 | 现在 |
+|---|---|---|
+| 摆放 | `updateViewLayout`（binder → WMS） | `Transaction.setPosition`（本地，同一帧） |
+| 宽度/高度 | 窗口 layout | `SurfaceControlViewHost.relayout` + `setCrop` |
+| Z 序 | WMS 的窗口 layer（`APPLICATION_OVERLAY` = 151000） | `setRelativeLayer(sc, 窗口 leash, +1)` |
+| 隐藏 | `removeViewImmediate` | `Transaction.setVisibility(false)`（不绘制也不收触摸） |
+| 触摸 | WMS 投递 | WWM 的 input channel —— 和迷你小窗长按菜单（A31）同一条路 |
+
+**Z 序那一条要单独说**：条跟着**窗口的 leash** 排 Z，而不是一个固定的绝对图层。通知中心/控制中心
+是整个图层层级之上的窗口，所以条照旧"该被盖住时被盖住"（A19 的用户要求没变），同时永远在小窗之上
+（不会被窗口本身压住）。拿不到 leash 时退到 `LAYER_WITHOUT_LEASH`（显示区子图层里的高位），
+也不会压住面板。
+
+### 逐个功能对照（原功能有没有被破坏）
+
+| 原功能（A8/A19/A21 的判据） | 现在靠什么 | 会不会退化 |
+|---|---|---|
+| 宽度 == 小窗宽度、贴窗口下沿、逐帧跟手 | 每帧从 `MiuiFreeformModeTaskInfo` 现读几何 → `setPosition` | 不会，反而少 1~2 帧延迟 |
+| 键盘弹出让位 / 让不开就隐藏 | `layoutFor` 完全没动（`isImeShowing`/`imeHeightPx`） | 不会 |
+| 迷你/贴边不显示 | 模式闸门没动，隐藏方式换成 `setVisibility(false)` | 不会 |
+| 圆角跟小窗一致 | `getCornerRadius()` → `ContactBarView.setCornerRadius` | 不会 |
+| 会话记忆 / 去重 / 群名 / 上限 | `RecentConversations` 的并入逻辑没动（只改了标题闸门，见下） | 见下面第 9 条 |
+| 左右滑动 / 上滑移除 / 点击打开会话 | `ContactBarView` 一行没改，触摸流由 WWM 投递 | **需实测**（唯一换了投递方的东西） |
+| 通知中心/控制中心盖住条 | leash 相对的 Z 序 | 换成新机制，需实测 |
+| 空闲 250ms 采样、动起来逐帧 | 帧循环没动 | 不会 |
+| 热重载后条还在 | `dispose()` → `destroySurface()` 重建 | 需实测 |
+
+### 复查时修掉的问题（都是"会崩 / 永远不出现"，不是审美）
+
+1. **`added = true` 被无条件置上**：事务失败也标记"已显示"，之后 `update()` 只改位置不再 attach ——
+   条会**永久不出现**，而且日志看起来一切正常。现在只有 `apply` 成功才算显示，失败拆掉半成品，
+   日志 `CONTACT_BAR_HIDE reason=TRANSACTION_FAILED`。
+2. **`update()`/`checkLeash()` 里的 transaction 没有 try**：surface 失效后（SurfaceFlinger 重启、
+   显示区重建、旋转、系统界面重启）`setPosition` 会抛 `IllegalArgumentException`，而它跑在主线程的
+   Choreographer 回调里 —— 那就是**系统界面崩溃**。现在失效即整块重建
+   （`CONTACT_BAR_SURFACE_STALE` / `CONTACT_BAR_SURFACE_LOST`）。
+3. **失败后每帧重试**：拖一个小窗就是 60 次/秒反射建 surface + 60 行日志。现在 500ms 退避
+   （`ATTACH_RETRY_MS`）。
+4. **`relayout(LayoutParams)` 这条路根本不存在**（`getMethod` 永远返回 null，白写），尺寸变化只剩
+   `relayout(int,int)`；现在失败会退回 `setView`，再不行整块重建，不会留一个尺寸不对、内容被裁掉的条。
+5. **`LayoutParams.token = Binder()`**：WWM 不是 `system_server`，随机 token 让每次改尺寸都像"另一个
+   窗口"。已删除。
+6. **`error("No display available")` / 构造器探测失败时 `error(...)`**：都跑在主线程，抛出去就是崩。
+   现在返回 null + 一行 WARN。
+7. **`FreeformTask.leash()` 每次读都 `getField`/`getDeclaredField`**（每次复制一遍字段表）：它现在进了
+   每帧路径（排 Z 序），改成访问器按类缓存。
+8. **数据层：`observeEntry` 是多余的** —— 每条通知先单独快照一次，紧接着 `onChanged` 里的
+   `observe()` 又把全部通知快照一遍，同一件事做两次、`CONTACT_BAR_CONV_ACCEPTED` 每个事件打两遍
+   （主线程日志 I/O）。删掉，改成一个会话只打一次的 `CONTACT_BAR_CONV_NEW`。
+9. **「标题是应用名时从正文取发送者」这个新逻辑收紧**：只认 `发送者：消息` 的形状，取不到就**丢弃**
+   这条通知；正文不能当名字（否则「你的微信已在电脑上登录」会变成一条叫这个名字的会话 —— 那正是
+   标题闸门当初要挡的）。纯逻辑抽到 `contactbar/NotificationTitle.kt`，`NotificationTitleTest` 9 条。
+
+### 已经实测过的部分（2026-10-18，只有这些）
+
+改完用 db install -r + killall com.android.systemui 装了本机跑过：
+
+- 新包在**新的系统界面进程**里加载正常，没有崩（CONTACT_BAR_HOOKS_INSTALLED pipeline=false
+  → 随后 CONTACT_BAR_NOTIF_LISTENER_ATTACHED，这是热重载那条路径的正常顺序）；
+- 数据层新日志生效：CONTACT_BAR_CONV_NEW pkg=com.tencent.mm label=Z【武汉纺织大学阳光校区】美团拼好饭群 title=…
+  （一个会话一行，不再每个事件两行 CONV_ACCEPTED）。
+
+**没测到**：条的 surface / 触摸 / Z 序 —— m start --windowingMode 5 在这台 ROM 上开出来的是
+**全屏**窗口（dumpsys window 里 WeChat 是 `(0,0)(fillxfill)`），WMShell 的 freeform 仓库根本不认它，
+所以拿不到真的小窗。下面这些只能用手势开小窗来测。
+
+### 取证
+
+```
+CONTACT_BAR_SURFACE taskId=… displayId=0 name=…      ← surface 建起来了（挂在显示区下）
+CONTACT_BAR_SHOW rect=… items=… leash=true relative=true
+CONTACT_BAR_HIDE reason=MINI|UNFOCUSED|TOO_SMALL|…
+CONTACT_BAR_SURFACE_STALE / _LOST                      ← 失效后自动重建（每次一行，不是每帧）
+CONTACT_BAR_HIDE reason=SURFACE_UNAVAILABLE|NO_DISPLAY|VIEW_HOST_UNAVAILABLE|RELAYOUT_FAILED|TRANSACTION_FAILED
+CONTACT_BAR_CONV_NEW pkg=… label=… title=…             ← 一个会话只出现一次
+```
+
+条不再是一个窗口，`dumpsys window windows` 里**不会**再有 `bubble contact bar`（A19 那条判据作废），
+改看：
+
+```
+adb shell dumpsys SurfaceFlinger --list | findstr ContactBar   # 应该有一层 ContactBarSurface-<taskId>
+adb shell dumpsys input | findstr "bubble contact bar"          # 输入窗口在 = 能点、能划
+```
+
+- [ ] 开一个聊天小窗：条出现在窗口正下方，宽 == 窗口宽（`CONTACT_BAR_SHOW … leash=true relative=true`）
+- [ ] **点一个头像**会话在小窗内打开；**左右滑动**能横拖；**上滑头像**移除一个（`CONTACT_BAR_FORGET`）
+      —— 触摸走的是 WWM 的 input channel，这是这次重构唯一换了投递方的东西
+- [ ] 拖窗口移动/拉伸：条逐帧贴着（`CONTACT_BAR_GEOM` 里 `bar` 的 width == `visual` 的 width），
+      不再"甩"在后面
+- [ ] 下拉通知中心 / 拉出控制中心：条在**下面**（A19 的要求）；收起后照旧贴着窗口
+- [ ] 上滑进迷你、恢复成普通小窗：条消失/回来（`reason=MINI` → `CONTACT_BAR_SHOW`）
+- [ ] 关掉小窗（✕ / 上滑）：条立刻消失（`reason=CLOSING`），跟着的 `TASK_VANISHED` 之后不残留
+- [ ] 两个小窗来回点：条跟着焦点换窗口，Z 序也跟过去（`relative=true`）
+- [ ] 转屏两次（竖 → 横 → 竖）：条的位置/宽度都对，没有跑到屏幕外
+- [ ] `adb shell stop && adb shell start`（或 `killall com.android.systemui`）之后重新开小窗：条能建起来
+      （`CONTACT_BAR_SURFACE` 在新进程里出现一次）；surface 失效那次应能看到 `_STALE`/`_LOST` 并自愈
+- [ ] 热重载（`adb install -r`）：`CONTACT_BAR_DISPOSED` 之后新进程里条照常出现，没有两层的条
+- [ ] 标题是应用名的通知（QQ/微信/TIM）：`CONTACT_BAR_CONV_NEW` 里的 label 是人名才有意义；
+      系统话术（登录提醒/版本更新）不应该冒出一个联系人
