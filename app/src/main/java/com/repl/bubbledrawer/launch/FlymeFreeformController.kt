@@ -34,6 +34,7 @@ import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executor
 import kotlin.math.abs
 
@@ -89,6 +90,33 @@ class FlymeFreeformController(
 
     // System-level SurfaceControl background decoration and outside-tap receiver
     private var backgroundDecoration: FreeformBackgroundDecoration? = null
+
+    /**
+     * taskId → 迷你小窗的 `MiuiFreeformModeTaskInfo`（长按菜单要用它调 ROM 的动画与音频）。
+     *
+     * 只在 `MiuiFreeformModeTouchState.handleMotionEvents`（钩子，见 [hookMiniTouchForMenu]）里写：
+     * 那是 ROM 唯一会把「这条触摸属于哪个迷你小窗」交给我们的地方。
+     *
+     * 「是不是放大状态」**不**记在这里 —— 那个状态属于 ROM（`baseAnimTarget.scaleX` + 框架的
+     * `MiuiFreeFormStackInfo.freeFormScale`），我们只按当前 scale 和 ROM 算出的正常迷你缩放现场判断
+     * （[isMiniScaleEnlarged]），否则记的判断迟早会和 ROM 的真相打架（2026-10-18 用户报的「移动时
+     * 大迷你小窗状态会重置」就是这么来的）。
+     */
+    val miniTaskInfoMap = ConcurrentHashMap<Int, Any>()
+
+    // Flyme-style long-press floating action menu overlay for mini windows (静音 / 放大)
+    val miniMenuOverlay by lazy {
+        FlymeMiniMenuOverlay(
+            context = context,
+            handler = handler,
+            onScaleClicked = { taskId ->
+                toggleMiniWindowScale(taskId)
+            },
+            onDismissed = { taskId ->
+                log("MINI_MENU_DISMISSED taskId=$taskId")
+            }
+        )
+    }
 
     // Gesture tracking for bottom bar
     var gestureDownY = 0f
@@ -150,6 +178,7 @@ class FlymeFreeformController(
     fun dispose() {
         gestureReset()
         cancelMiniFallback()
+        runCatching { miniMenuOverlay.dismiss(animate = false) }
         hideDim()
         windows.clear()
         suspended.clear()
@@ -212,6 +241,7 @@ class FlymeFreeformController(
     fun onTaskVanished(taskId: Int) = onMain {
         windows.remove(taskId)
         suspended.remove(taskId)
+        releaseMiniAudio(taskId)
         if (takeoverCancelledFor == taskId) takeoverCancelledFor = null
         if (maskTaskId == taskId) maskTaskId = null
         // A pending 迷你小窗 conversion must not outlive its window.
@@ -268,6 +298,11 @@ class FlymeFreeformController(
         log("TASK_MODE_CHANGED taskId=$taskId old=$oldMode new=$newMode")
 
         if (newMode == FreeformTask.MODE_NORMAL) {
+            // 不是迷你小窗了：菜单没意义，替它静的音也还回去（见 [releaseMiniAudio]）。
+            releaseMiniAudio(taskId)
+            if (miniMenuOverlay.isShowingForTask(taskId)) {
+                miniMenuOverlay.dismiss(animate = false)
+            }
             // 迷你/贴边 → 普通小窗: the mask comes back for it.
             log("TASK_RESTORED_TO_FREEFORM taskId=$taskId oldMode=$oldMode -> RETAKE TAKEOVER")
             takeoverCancelledFor = null
@@ -283,7 +318,27 @@ class FlymeFreeformController(
     }
 
     fun onTaskClosing(taskId: Int) = onMain {
+        releaseMiniAudio(taskId)
+        if (miniMenuOverlay.isShowingForTask(taskId)) {
+            miniMenuOverlay.dismiss(animate = false)
+        }
         suspendWindow(taskId, "CLOSING")
+    }
+
+    /**
+     * 窗口关掉了：把它还欠着的「静音」还回去（见 [MiniAppAudioHelper.release]）。
+     *
+     * 静音是这个迷你窗口的属性，窗口没了就没人能解除它了 —— 真会留下"从桌面打开同一个应用一声不
+     * 出、也没有入口恢复"的死状态。先取包名，再把 taskInfo 从表里删掉。
+     */
+    private fun releaseMiniAudio(taskId: Int) {
+        val taskInfo = miniTaskInfoMap.remove(taskId) ?: return
+        val packageName = callNoArg(taskInfo, "getPackageName") as? String ?: return
+        val runningTaskInfo = callNoArg(taskInfo, "getTaskInfo")
+        val uid = runCatching {
+            runningTaskInfo?.javaClass?.getField("effectiveUid")?.getInt(runningTaskInfo)
+        }.getOrNull() ?: -1
+        MiniAppAudioHelper.release(context, packageName, uid)
     }
 
     /** The user is grabbing this window's bottom caption: it becomes the mask's window. */
@@ -859,6 +914,213 @@ class FlymeFreeformController(
     }
 
     /**
+     * Restores a mini window back to standard freeform mode (放大 / 还原).
+     */
+    fun restoreMiniToFreeform(taskId: Int): Boolean {
+        val controller = getMiuiFreeformModeController()
+        if (controller == null) {
+            log("RESTORE_MINI_UNAVAILABLE controller is null taskId=$taskId")
+            return false
+        }
+        executeOnShell {
+            runCatching {
+                val miniHandler = runCatching {
+                    controller.javaClass.getDeclaredField("mMiuiFreeformModeMiniStateHandler")
+                        .apply { isAccessible = true }.get(controller)
+                }.getOrNull()
+                if (miniHandler != null) {
+                    val method = miniHandler.javaClass.getMethod("restoreMiniToFreeformMode", Int::class.javaPrimitiveType)
+                    method.isAccessible = true
+                    method.invoke(miniHandler, taskId)
+                    log("RESTORE_MINI_TO_FREEFORM taskId=$taskId via miniHandler")
+                    return@executeOnShell
+                }
+                val method = controller.javaClass.declaredMethods.firstOrNull {
+                    it.name == "restoreMiniToFreeformMode" && it.parameterCount == 1
+                }
+                if (method != null) {
+                    method.isAccessible = true
+                    method.invoke(controller, taskId)
+                    log("RESTORE_MINI_TO_FREEFORM taskId=$taskId via controller")
+                    return@executeOnShell
+                }
+            }.onFailure {
+                log("RESTORE_MINI_TO_FREEFORM_FAILED taskId=$taskId", it)
+            }
+        }
+        return true
+    }
+
+    /**
+     * 迷你小窗「放大 / 还原」：把窗口缩放到「正常迷你的 1.5 倍」，再点一次回到正常迷你。
+     *
+     * 为什么不再自己动 SurfaceControl（2026-10-18，用户报「移动的时候大迷你小窗状态可能会重置」
+     * 「有时候会丢动画」）：那条 leash 的主人是 WMShell，拖动的缩放取自
+     * `MiuiFreeformModeTaskInfo.setDownParams:1167-1184`（`getDownScaleX` = `baseAnimTarget.scaleX`），
+     * 我们只改 SurfaceControl 不改 baseAnimTarget，于是第一次拖动就被 ROM 拉回迷你尺寸；而两条线程
+     * 同时往同一条 leash 提交事务，还会让其中一方的动画直接消失。
+     *
+     * 现在整件事交给 ROM 自己的迷你动画入口：
+     * `MiuiFreeformModeAnimation.startGestureAnimation(11 /*FREEFORM_TO_MINI*/, taskInfo, target):5527-5529`
+     * → `applyFreeformToMiniAnimation:2348-2406`：
+     *
+     *  - Folme 从 `baseAnimTarget` 的当前几何动画到 target 的几何（原生弹簧/阴影/圆角，不丢帧）；
+     *  - 同时下发 `MiuiFreeFormInfoChange.setMiuiFreeformScale(target.scale)` + `setBounds(token, …)`，
+     *    由 `MiuiFreeFormManagerService.setFreeformTaskChangesIfNeed:3221-3222` 落到 `Task.setMiuiFreeformScale`，
+     *    框架的 `MiuiFreeFormStackInfo.freeFormScale` 也跟着变 —— 命中区域、角落吸附、框架侧查询一致；
+     *  - 动画结束（或被打断）时 `MultiTaskingFolmeAnimExecutor:104-106/123-126` →
+     *    `MultiTaskingFolmeControl.updateBaseAnimParam:519-525` 把最终 scale **写回 baseAnimTarget**，
+     *    所以放大状态从这一刻起属于 ROM：之后的拖动、松手、避让、翻转全按放大后的 scale 算，
+     *    我们不需要再补任何一帧，也不用记「哪个 taskId 是放大的」。
+     *
+     * 目标几何（scale / 落点）由纯逻辑 [decideMiniScale] 算，规则是「窗口靠哪边就往哪边长」。
+     *
+     * 失败兜底：ROM 结构对不上（读不到几何、没有这个方法）时退回 ROM 自己的
+     * `restoreMiniToFreeformMode`（[restoreMiniToFreeform]），这一下点击至少不是没反应。
+     */
+    fun toggleMiniWindowScale(taskId: Int): Boolean {
+        val taskInfo = miniTaskInfoMap[taskId]
+        if (taskInfo == null) {
+            log("TOGGLE_MINI_SCALE_FAILED reason=no_task_info taskId=$taskId")
+            return false
+        }
+        // 读几何、建动画参数、起动画都放在 WMShell 线程上：taskInfo 是它的状态，跨线程读会读到
+        // 动画中间的一帧（scale 可能还是 0），也会和 `updateBaseAnimParam` 打架。
+        executeOnShell {
+            val decision = miniScaleDecisionFor(taskInfo)
+            if (decision == null) {
+                log("TOGGLE_MINI_SCALE_FALLBACK reason=no_geometry taskId=$taskId")
+                restoreMiniToFreeform(taskId)
+                return@executeOnShell
+            }
+            val target = buildMiniScaleAnimTarget(taskInfo, decision)
+            val animation = getMiuiFreeformModeAnimation()
+            if (target == null || animation == null || !dispatchMiniScaleAnimation(animation, taskInfo, target)) {
+                log(
+                    "TOGGLE_MINI_SCALE_FALLBACK reason=no_animation taskId=$taskId " +
+                        "target=${target != null} animation=${animation != null}",
+                )
+                restoreMiniToFreeform(taskId)
+                return@executeOnShell
+            }
+            log(
+                "TOGGLE_MINI_SCALE taskId=$taskId enlarged=${decision.enlarged} " +
+                    "scale=${decision.scale} left=${decision.left} top=${decision.top}",
+            )
+        }
+        return true
+    }
+
+    /** 读 ROM 的几何 + 算下一状态；读不出来返回 null（调用方兜底）。只在 WMShell 线程上调用。 */
+    private fun miniScaleDecisionFor(taskInfo: Any): MiniScaleDecision? {
+        val scale = (callNoArg(taskInfo, "getFreeformScale") as? Number)?.toFloat() ?: return null
+        // `getBounds()` = 未缩放 task bounds 摆在视觉位置；`getScaledBounds()` = 它原地放大后的矩形。
+        val base = callNoArg(taskInfo, "getBounds") as? Rect ?: return null
+        val visual = (callNoArg(taskInfo, "getScaledBounds") as? Rect)?.takeUnless { it.isEmpty } ?: base
+        val normal = normalMiniScaleOf(taskInfo, base) ?: return null
+        val dm = context.resources.displayMetrics
+        return decideMiniScale(
+            taskWidth = base.width(),
+            taskHeight = base.height(),
+            currentScale = scale,
+            visualLeft = visual.left,
+            visualTop = visual.top,
+            screenWidth = dm.widthPixels,
+            screenHeight = dm.heightPixels,
+            normalMiniScale = normal,
+            margin = (dm.density * 8f).toInt(),
+        )
+    }
+
+    /** 迷你窗口此刻算不算放大状态（菜单图标用，判断规则与 [decideMiniScale] 完全一致）。 */
+    fun isMiniEnlarged(taskInfo: Any): Boolean {
+        val scale = (callNoArg(taskInfo, "getFreeformScale") as? Number)?.toFloat() ?: return false
+        val base = callNoArg(taskInfo, "getBounds") as? Rect ?: return false
+        val normal = normalMiniScaleOf(taskInfo, base) ?: return false
+        return isMiniScaleEnlarged(scale, normal)
+    }
+
+    /**
+     * ROM 眼里的「正常迷你缩放」：`MiuiMultiWindowUtils.getMiniFreeformScale(context, landscape, 原 bounds, pkg)`
+     * —— 迷你窗口每次进迷你都由 ROM 用这个方法重新算（`MiuiFreeformModeAnimation:3941/4083/4613/5863`），
+     * 所以它才是「不放大时应该多大」的权威，不需要我们记。
+     */
+    private fun normalMiniScaleOf(taskInfo: Any, originBounds: Rect): Float? {
+        val packageName = callNoArg(taskInfo, "getPackageName") as? String ?: return null
+        val landscape = (callNoArg(taskInfo, "isLandscapeFreeform") as? Boolean) ?: false
+        return runCatching {
+            val utils = classLoader.loadClass("android.util.MiuiMultiWindowUtils")
+            val method = utils.getMethod(
+                "getMiniFreeformScale",
+                Context::class.java,
+                Boolean::class.javaPrimitiveType,
+                Rect::class.java,
+                String::class.java,
+            )
+            (method.invoke(null, context, landscape, originBounds, packageName) as? Number)?.toFloat()
+        }.getOrNull()?.takeIf { it.isFinite() && it > 0f }
+    }
+
+    private fun buildMiniScaleAnimTarget(taskInfo: Any, decision: MiniScaleDecision): Any? {
+        val base = callNoArg(taskInfo, "getBounds") as? Rect ?: return null
+        return runCatching {
+            val targetClass = Class.forName(
+                "com.android.wm.shell.multitasking.common.animation.MultiTaskingAnimTarget",
+                false,
+                taskInfo.javaClass.classLoader,
+            )
+            val target = targetClass.getDeclaredConstructor().newInstance()
+            // `setAnimParam(bounds, scaleX, scaleY, anchorY)` 的 bounds 是**未缩放**的 task bounds
+            // 摆在目标位置（`MultiTaskingAnimTarget.getCurrentBounds:88-92`）：缩放由 scale 施加，
+            // 视觉左上角就是 bounds.left/top。
+            val rect = Rect(
+                decision.left,
+                decision.top,
+                decision.left + base.width(),
+                decision.top + base.height(),
+            )
+            targetClass.getMethod(
+                "setAnimParam",
+                Rect::class.java,
+                Float::class.javaPrimitiveType,
+                Float::class.javaPrimitiveType,
+                Float::class.javaPrimitiveType,
+            ).invoke(target, rect, decision.scale, decision.scale, 0f)
+            target
+        }.onFailure {
+            log("TOGGLE_MINI_SCALE_TARGET_FAILED", it)
+        }.getOrNull()
+    }
+
+    /** 11 = ROM 的 `FREEFORM_TO_MINI` 手势动画 id（`MiuiFreeformModeAnimation.startGestureAnimation:5527`）。 */
+    private fun dispatchMiniScaleAnimation(animation: Any, taskInfo: Any, target: Any): Boolean =
+        runCatching {
+            val method = animation.javaClass.methods.firstOrNull {
+                it.name == "startGestureAnimation" &&
+                    it.parameterCount == 3 &&
+                    it.parameterTypes[0] == Int::class.javaPrimitiveType
+            } ?: return@runCatching false
+            method.invoke(animation, 11, taskInfo, target)
+            true
+        }.onFailure {
+            log("TOGGLE_MINI_SCALE_DISPATCH_FAILED", it)
+        }.getOrDefault(false)
+
+    private fun getMiuiFreeformModeAnimation(): Any? {
+        val controller = getMiuiFreeformModeController() ?: return null
+        return runCatching {
+            controller.javaClass.getMethod("getMiuiFreeformModeAnimation").invoke(controller)
+        }.getOrNull() ?: runCatching {
+            controller.javaClass.getDeclaredField("mMiuiFreeformModeAnimation")
+                .apply { isAccessible = true }
+                .get(controller)
+        }.getOrNull()
+    }
+
+    private fun callNoArg(receiver: Any, name: String): Any? =
+        runCatching { receiver.javaClass.getMethod(name).invoke(receiver) }.getOrNull()
+
+    /**
      * The ROM's conversion entry point: the controller's own `fromFreeformToMini(int)` when it has one
      * (HyperOS 3/4: private, hence `declaredMethods`), else the same method on the control facade the
      * ROM exposes to its own SystemUI. Resolved once and cached; a ROM with neither is remembered as
@@ -1270,7 +1532,7 @@ class FlymeFreeformController(
         }
     }
 
-    private fun triggerHapticFeedback() {
+    fun triggerHapticFeedback() {
         runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 vibrator?.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
@@ -1331,6 +1593,33 @@ class FlymeFreeformController(
     companion object {
         const val TAG = "BubbleDrawer"
         @Volatile var instance: FlymeFreeformController? = null
+        @Volatile var suppressSingleTapTaskId: Int = -1
+
+        @JvmStatic
+        fun setDisableTouch(disabled: Boolean) {
+            runCatching {
+                val ctrl = instance?.getMiuiFreeformModeController() ?: savedController
+                if (ctrl == null) {
+                    log("SET_DISABLE_TOUCH_SKIPPED ctrl is null")
+                    return
+                }
+                val method = ctrl.javaClass.declaredMethods.firstOrNull {
+                    it.name == "setDisableTouch" && it.parameterTypes.firstOrNull() == Boolean::class.javaPrimitiveType
+                }
+                if (method != null) {
+                    method.isAccessible = true
+                    method.invoke(ctrl, disabled)
+                    log("SET_DISABLE_TOUCH ctrl.setDisableTouch($disabled)")
+                } else {
+                    val gh = ctrl.javaClass.getDeclaredField("mMiuiFreeformModeGestureHandler")
+                        .apply { isAccessible = true }.get(ctrl)
+                    gh?.javaClass?.getMethod("setDisableTouch", Boolean::class.javaPrimitiveType)?.invoke(gh, disabled)
+                    log("SET_DISABLE_TOUCH gh.setDisableTouch($disabled)")
+                }
+            }.onFailure {
+                log("SET_DISABLE_TOUCH_FAILED disabled=$disabled error=${it.message}")
+            }
+        }
 
         /** Bound on the remembered window map (the ROM itself allows two 小窗). */
         private const val MAX_TRACKED_WINDOWS = 4
@@ -1566,6 +1855,7 @@ class FlymeFreeformController(
             hookMiniBottomUpLimit(module, classLoader)
             hookTopCaptionMove(module, classLoader)
             hookBottomCaptionGestures(module, prefs, classLoader)
+            hookMiniTouchForMenu(module, prefs, classLoader)
             hookResizeFocus(module, classLoader)
             hookTaskExit(module, classLoader)
             hookTaskToFront(module, classLoader)
@@ -2933,6 +3223,336 @@ class FlymeFreeformController(
                     }
                 }
             log("HOOK_INSTALLED_onBottomCaptionHandleMotionEvents")
+        }
+
+        private fun isTouchInsideMiniMenu(ev: MotionEvent): Boolean {
+            val overlay = instance?.miniMenuOverlay ?: return false
+            if (!overlay.isShowing()) return false
+            val bounds = overlay.screenBounds ?: return true
+            val hit = Rect(bounds).apply { inset(-24, -24) }
+            val x = ev.rawX.toInt()
+            val y = ev.rawY.toInt()
+            return hit.contains(x, y)
+        }
+
+        /**
+         * Long press on a mini window (迷你/悬浮小窗长按) triggers Flyme-style floating action menu
+         * (静音 / 放大).
+         */
+        private fun hookMiniTouchForMenu(
+            module: XposedModule,
+            prefs: SharedPreferences,
+            classLoader: ClassLoader,
+        ) {
+            val touchStateClass = runCatching {
+                classLoader.loadClass("com.android.wm.shell.multitasking.miuifreeform.MiuiFreeformModeTouchState")
+            }.getOrNull() ?: return
+
+            var longPressTriggered = false
+            var downX = 0f
+            var downY = 0f
+            var currentMiniTaskId = -1
+            var pendingLongPressRunnable: Runnable? = null
+            val touchSlop = 24f
+
+            touchStateClass.declaredMethods
+                .filter { it.name == "handleMotionEvents" && it.parameterCount == 3 }
+                .forEach { method ->
+                    runCatching {
+                        module.hook(method)
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("bubbledrawer.freeform.mini_touch_events")
+                            .intercept { chain ->
+                                val snap = RemotePrefs.read(prefs)
+                                val ev = chain.args[0] as? MotionEvent
+                                val taskInfo = chain.args[2]
+
+                                if (!snap.flymeMiniMenu || ev == null || taskInfo == null) {
+                                    return@intercept chain.proceed()
+                                }
+
+                                val isMini = runCatching {
+                                    taskInfo.javaClass.getMethod("isMiniState").invoke(taskInfo) as? Boolean
+                                }.getOrNull() == true
+
+                                val taskId = runCatching {
+                                    (taskInfo.javaClass.getMethod("getTaskId").invoke(taskInfo) as? Number)?.toInt()
+                                }.getOrNull() ?: -1
+
+                                if (!isMini || taskId <= 0) {
+                                    pendingLongPressRunnable?.let { instance?.handler?.removeCallbacks(it) }
+                                    pendingLongPressRunnable = null
+                                    return@intercept chain.proceed()
+                                }
+                                instance?.miniTaskInfoMap?.put(taskId, taskInfo)
+
+                                val overlayShowing = instance?.miniMenuOverlay?.isShowingForTask(taskId) == true
+                                if (overlayShowing) {
+                                    when (ev.actionMasked) {
+                                        MotionEvent.ACTION_DOWN -> {
+                                            downX = ev.rawX
+                                            downY = ev.rawY
+                                            log("MINI_MENU_TOUCH_INTERCEPTED_DOWN taskId=$taskId")
+                                            return@intercept null
+                                        }
+                                        MotionEvent.ACTION_MOVE -> {
+                                            val dx = abs(ev.rawX - downX)
+                                            val dy = abs(ev.rawY - downY)
+                                            if (dx > touchSlop || dy > touchSlop) {
+                                                log("MINI_MENU_DISMISSED_BY_DRAG taskId=$taskId dx=$dx dy=$dy")
+                                                instance?.miniMenuOverlay?.dismiss(animate = true)
+                                                setDisableTouch(false)
+                                                return@intercept chain.proceed()
+                                            }
+                                            return@intercept null
+                                        }
+                                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                            log("MINI_MENU_TOUCH_INTERCEPTED_UP taskId=$taskId")
+                                            return@intercept null
+                                        }
+                                    }
+                                    log("MINI_MENU_TOUCH_INTERCEPTED action=${ev.actionMasked} taskId=$taskId")
+                                    return@intercept null
+                                }
+
+                                when (ev.actionMasked) {
+                                    MotionEvent.ACTION_DOWN -> {
+                                        downX = ev.rawX
+                                        downY = ev.rawY
+                                        currentMiniTaskId = taskId
+                                        longPressTriggered = false
+
+                                        if (instance?.miniMenuOverlay?.isShowing() == true &&
+                                            !instance!!.miniMenuOverlay.isShowingForTask(taskId)) {
+                                            instance?.miniMenuOverlay?.dismiss(animate = false)
+                                        }
+
+                                        pendingLongPressRunnable?.let { instance?.handler?.removeCallbacks(it) }
+                                        val r = Runnable {
+                                            if (currentMiniTaskId == taskId) {
+                                                longPressTriggered = true
+                                                suppressSingleTapTaskId = taskId
+                                                instance?.triggerHapticFeedback()
+                                                log("MINI_LONG_PRESS_TRIGGERED taskId=$taskId")
+
+                                                val bounds = runCatching {
+                                                    taskInfo.javaClass.getMethod("getBounds").invoke(taskInfo) as? Rect
+                                                }.getOrNull() ?: Rect(0, 0, 300, 450)
+
+                                                val leash = runCatching {
+                                                    taskInfo.javaClass.getMethod("getLeash").invoke(taskInfo) as? SurfaceControl
+                                                }.getOrNull()
+
+                                                val pkgName = runCatching {
+                                                    taskInfo.javaClass.getMethod("getPackageName").invoke(taskInfo) as? String
+                                                }.getOrNull().orEmpty()
+
+                                                val runningTaskInfo = runCatching {
+                                                    taskInfo.javaClass.getMethod("getTaskInfo").invoke(taskInfo)
+                                                }.getOrNull()
+                                                val uid = runCatching {
+                                                    runningTaskInfo?.javaClass?.getField("effectiveUid")?.getInt(runningTaskInfo)
+                                                }.getOrNull() ?: -1
+                                                val cfg = runCatching {
+                                                    runningTaskInfo?.javaClass?.getField("configuration")?.get(runningTaskInfo) as? android.content.res.Configuration
+                                                }.getOrNull()
+                                                val displayId = runCatching {
+                                                    runningTaskInfo?.javaClass?.getField("displayId")?.getInt(runningTaskInfo)
+                                                }.getOrNull() ?: 0
+
+                                                // 当前缩放，不是「目标」缩放：长按菜单出现时窗口是静止的，
+                                                // 而 destination 在动画被打断时会停在上一轮的值上。
+                                                val miniScale = runCatching {
+                                                    (taskInfo.javaClass.getMethod("getFreeformScale").invoke(taskInfo) as? Number)?.toFloat()
+                                                }.getOrNull()?.takeIf { it.isFinite() && it > 0f } ?: 0.28f
+
+                                                // 菜单的命中区域跟着窗口的**视觉**矩形走：`getScaledBounds()` 就是它
+                                                // （未缩放 bounds 原地放大，见 `MiniScaleToggle.kt` 的坐标约定）。
+                                                val scaledBounds = runCatching {
+                                                    taskInfo.javaClass.getMethod("getScaledBounds").invoke(taskInfo) as? Rect
+                                                }.getOrNull()
+
+                                                // 「放大」状态问 ROM 的 scale，不记在我们自己的表里 —— 见 [toggleMiniWindowScale]。
+                                                val isEnlarged = instance?.isMiniEnlarged(taskInfo) == true
+                                                if (leash != null) {
+                                                    instance?.miniMenuOverlay?.show(
+                                                        taskId = taskId,
+                                                        packageName = pkgName,
+                                                        uid = uid,
+                                                        bounds = bounds,
+                                                        leash = leash,
+                                                        config = cfg,
+                                                        displayId = displayId,
+                                                        miniScale = if (miniScale in 0.05f..0.95f) miniScale else 0.28f,
+                                                        screenBounds = scaledBounds,
+                                                        isEnlarged = isEnlarged,
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        pendingLongPressRunnable = r
+                                        instance?.handler?.postDelayed(r, ViewConfiguration.getLongPressTimeout().toLong())
+                                    }
+                                    MotionEvent.ACTION_MOVE -> {
+                                        val dx = abs(ev.rawX - downX)
+                                        val dy = abs(ev.rawY - downY)
+                                        if (dx > touchSlop || dy > touchSlop) {
+                                            pendingLongPressRunnable?.let { instance?.handler?.removeCallbacks(it) }
+                                            pendingLongPressRunnable = null
+                                            if (instance?.miniMenuOverlay?.isShowingForTask(taskId) == true) {
+                                                instance?.miniMenuOverlay?.dismiss(animate = true)
+                                            }
+                                        }
+                                    }
+                                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                        pendingLongPressRunnable?.let { instance?.handler?.removeCallbacks(it) }
+                                        pendingLongPressRunnable = null
+                                        if (longPressTriggered) {
+                                            longPressTriggered = false
+                                            return@intercept null
+                                        }
+                                    }
+                                }
+                                chain.proceed()
+                            }
+                    }
+                }
+
+            touchStateClass.declaredMethods
+                .filter { it.name == "singleTap" }
+                .forEach { method ->
+                    runCatching {
+                        module.hook(method)
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("bubbledrawer.freeform.mini_single_tap_suppress")
+                            .intercept { chain ->
+                                val taskInfo = chain.args.firstOrNull()
+                                val taskId = runCatching {
+                                    taskInfo?.let { (it.javaClass.getMethod("getTaskId").invoke(it) as? Number)?.toInt() }
+                                }.getOrNull() ?: -1
+
+                                val isOverlayShowing = taskId > 0 && instance?.miniMenuOverlay?.isShowingForTask(taskId) == true
+                                if (taskId > 0 && (suppressSingleTapTaskId == taskId || isOverlayShowing)) {
+                                    suppressSingleTapTaskId = -1
+                                    log("SUPPRESS_SINGLE_TAP taskId=$taskId isOverlayShowing=$isOverlayShowing")
+                                    return@intercept null
+                                }
+                                chain.proceed()
+                            }
+                    }
+                }
+
+            // Hook MulWinSwitchEventHandler: prevent gesture monitor from dispatching or stealing pointer on overlay tap
+            val mwClass = runCatching {
+                classLoader.loadClass("com.android.wm.shell.multitasking.miuimultiwinswitch.miuiwindowdecor.MulWinSwitchEventHandler")
+            }.getOrNull()
+            mwClass?.declaredMethods
+                ?.filter { it.name == "isInterceptDownEvent" && it.parameterCount == 1 }
+                ?.forEach { m ->
+                    runCatching {
+                        module.hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("bubbledrawer.freeform.mulwin_intercept_down")
+                            .intercept { chain ->
+                                val overlay = instance?.miniMenuOverlay
+                                val ev = chain.args[0] as? MotionEvent
+                                if (overlay?.isShowing() == true && ev != null) {
+                                    if (isTouchInsideMiniMenu(ev)) {
+                                        log("MULWIN_INTERCEPT_DOWN_DURING_MINI_MENU (inside bounds) x=${ev.rawX} y=${ev.rawY}")
+                                        return@intercept true
+                                    } else {
+                                        log("MULWIN_OUTSIDE_MINI_MENU_TAP x=${ev.rawX} y=${ev.rawY} -> DISMISS")
+                                        overlay.dismiss(animate = true)
+                                        return@intercept chain.proceed()
+                                    }
+                                }
+                                chain.proceed()
+                            }
+                    }
+                }
+
+            // Hook MiuiFreeformModeGestureHandler.handleMotionEvents: block WMShell handling while menu overlay is active
+            val ghClass = runCatching {
+                classLoader.loadClass("com.android.wm.shell.multitasking.miuifreeform.MiuiFreeformModeGestureHandler")
+            }.getOrNull()
+            ghClass?.declaredMethods
+                ?.filter { it.name == "handleMotionEvents" && it.parameterCount == 2 }
+                ?.forEach { m ->
+                    runCatching {
+                        module.hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("bubbledrawer.freeform.gesture_handler_handle_motion")
+                            .intercept { chain ->
+                                val overlay = instance?.miniMenuOverlay
+                                val ev = chain.args[0] as? MotionEvent
+                                if (overlay?.isShowing() == true && ev != null) {
+                                    if (isTouchInsideMiniMenu(ev)) {
+                                        log("GESTURE_HANDLER_BLOCKED_DURING_MINI_MENU x=${ev.rawX} y=${ev.rawY}")
+                                        val resultClass = m.returnType
+                                        val undefineResult = runCatching {
+                                            val ctor = resultClass.constructors.firstOrNull { it.parameterCount == 3 }
+                                            ctor?.newInstance(-1, -1, null)
+                                        }.getOrNull()
+                                        return@intercept undefineResult
+                                    }
+                                }
+                                chain.proceed()
+                            }
+                    }
+                }
+
+            // Hook MiuiFreeformModeGestureHandler.setDisableTouch: prevent WMShell from resetting mDisableTouch = false while menu is showing
+            ghClass?.declaredMethods
+                ?.filter { it.name == "setDisableTouch" && it.parameterCount == 1 }
+                ?.forEach { m ->
+                    runCatching {
+                        module.hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("bubbledrawer.freeform.gesture_handler_set_disable_touch")
+                            .intercept { chain ->
+                                val disabled = chain.args[0] as? Boolean ?: false
+                                if (instance?.miniMenuOverlay?.isShowing() == true && !disabled) {
+                                    log("PREVENTED_RESET_DISABLE_TOUCH_DURING_MINI_MENU")
+                                    return@intercept null
+                                }
+                                chain.proceed()
+                            }
+                    }
+                }
+
+            // Hook InputMonitor.pilferPointers and InputManager.pilferPointers: prevent stealing pointer while menu is showing
+            val inputMonitorClass = runCatching { classLoader.loadClass("android.view.InputMonitor") }.getOrNull()
+            inputMonitorClass?.declaredMethods
+                ?.filter { it.name == "pilferPointers" && it.parameterCount == 0 }
+                ?.forEach { m ->
+                    runCatching {
+                        module.hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("bubbledrawer.freeform.input_monitor_pilfer")
+                            .intercept { chain ->
+                                if (instance?.miniMenuOverlay?.isShowing() == true) {
+                                    log("BLOCKED_INPUT_MONITOR_PILFER_DURING_MINI_MENU")
+                                    return@intercept null
+                                }
+                                chain.proceed()
+                            }
+                    }
+                }
+
+            val inputManagerClass = runCatching { classLoader.loadClass("android.hardware.input.InputManager") }.getOrNull()
+            inputManagerClass?.declaredMethods
+                ?.filter { it.name == "pilferPointers" && it.parameterCount == 1 }
+                ?.forEach { m ->
+                    runCatching {
+                        module.hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .setId("bubbledrawer.freeform.input_manager_pilfer")
+                            .intercept { chain ->
+                                if (instance?.miniMenuOverlay?.isShowing() == true) {
+                                    log("BLOCKED_INPUT_MANAGER_PILFER_DURING_MINI_MENU")
+                                    return@intercept null
+                                }
+                                chain.proceed()
+                            }
+                    }
+                }
+
+            log("HOOK_INSTALLED_hookMiniTouchForMenu_complete")
         }
 
         private fun hookGestureAnimation(

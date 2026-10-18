@@ -292,6 +292,8 @@ object RemotePrefs {
     const val KEY_FLYME_FREEFORM_SWIPE_UP_HOLD_FREE = "flyme_freeform_swipe_up_hold_free"
     const val KEY_FLYME_FREEFORM_SWIPE_DOWN_FULL = "flyme_freeform_swipe_down_full"
     const val KEY_FLYME_FREEFORM_DIM_BG = "flyme_freeform_dim_bg"
+    const val KEY_FLYME_MINI_MENU = "flyme_mini_menu"
+    const val DEFAULT_FLYME_MINI_MENU = true
 
     /**
      * 「回桌面不收迷你」：全面屏手势上滑回桌面时，ROM 会把**所有**小窗一次性收成迷你小窗。
@@ -471,6 +473,7 @@ object RemotePrefs {
         val flymeFreeformSwipeUpHoldFree: Boolean = DEFAULT_FLYME_FREEFORM_SWIPE_UP_HOLD_FREE,
         val flymeFreeformSwipeDownFull: Boolean = DEFAULT_FLYME_FREEFORM_SWIPE_DOWN_FULL,
         val flymeFreeformDimBg: Boolean = DEFAULT_FLYME_FREEFORM_DIM_BG,
+        val flymeMiniMenu: Boolean = DEFAULT_FLYME_MINI_MENU,
         /** 回桌面不收迷你（见 [KEY_HOME_KEEP_FREEFORM]，与 Flyme 样式总开关无关） */
         val homeKeepFreeform: Boolean = DEFAULT_HOME_KEEP_FREEFORM,
         /** 小窗底部联系人条（Flyme「联系人头像」） */
@@ -603,6 +606,7 @@ object RemotePrefs {
             flymeFreeformSwipeUpHoldFree = sp.getBoolean(KEY_FLYME_FREEFORM_SWIPE_UP_HOLD_FREE, DEFAULT_FLYME_FREEFORM_SWIPE_UP_HOLD_FREE),
             flymeFreeformSwipeDownFull = sp.getBoolean(KEY_FLYME_FREEFORM_SWIPE_DOWN_FULL, DEFAULT_FLYME_FREEFORM_SWIPE_DOWN_FULL),
             flymeFreeformDimBg = sp.getBoolean(KEY_FLYME_FREEFORM_DIM_BG, DEFAULT_FLYME_FREEFORM_DIM_BG),
+            flymeMiniMenu = sp.getBoolean(KEY_FLYME_MINI_MENU, DEFAULT_FLYME_MINI_MENU),
             homeKeepFreeform = sp.getBoolean(KEY_HOME_KEEP_FREEFORM, DEFAULT_HOME_KEEP_FREEFORM),
             contactBar = sp.getBoolean(KEY_CONTACT_BAR, DEFAULT_CONTACT_BAR),
             contactBarMinWidthPct = sp.getInt(KEY_CONTACT_BAR_MIN_WIDTH_PCT, DEFAULT_CONTACT_BAR_MIN_WIDTH_PCT)

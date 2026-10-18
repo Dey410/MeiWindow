@@ -980,3 +980,78 @@ ROM 自己用 `MiuiMultiWindowUtils.getActivityOptions(ctx, 目标包, true)` �
       开关不会生效（那台 ROM 本来也不做批量迷你化）
 - [ ] 开/关 Flyme 样式轻量小窗总开关，本项行为不变
 
+## A31 实验性功能：「迷你小窗长按菜单」的三个修复（2026-10-18 新增）
+
+**用户要的**：「另一个 ai 参考 flyme 小窗内的功能和……做出了迷你小窗长按菜单功能，但目前有点小问题，
+比如移动的时候大迷你小窗状态可能会重置，有时候会丢动画，静音后使用其他方式开启声音不会自动切换
+按钮状态等」。
+
+**菜单是什么**：长按迷你小窗（`MiuiFreeformModeTouchState.handleMotionEvents` 里 300ms 计时）→
+在小窗表面（`SurfaceControlViewHost`，`FlymeMiniMenuOverlay`）弹出两个按钮：
+
+- 静音 / 取消静音（`MiniAppAudioHelper`：`AudioManager.getPlayerVolume/setPlayerVolume` 为主，
+  `OP_PLAY_AUDIO` 兜底）；
+- 放大 / 还原（`FlymeFreeformController.toggleMiniWindowScale`）。
+
+开关在设置 → 实验性功能 → 迷你小窗（悬浮窗）（`flyme_mini_menu`，默认开）。
+
+### 问题 1：移动时「大迷你」状态会重置
+
+原实现是模块自己给 leash 设 scale/position、跑一个 `ValueAnimator`。但那条 leash 的主人是 WMShell：
+拖动的缩放取自 `MiuiFreeformModeTaskInfo.setDownParams:1167-1184`（`getDownScaleX` 就是
+`baseAnimTarget.scaleX`），我们只改 SurfaceControl 不改 `baseAnimTarget`，于是第一次拖动就被 ROM
+按迷你 scale 重算回来 —— 看起来就是"放大状态重置了"。
+
+改法：不再自己动 leash，改调 ROM 自己的迷你动画入口
+`MiuiFreeformModeAnimation.startGestureAnimation(11, taskInfo, target)`（`applyFreeformToMiniAnimation:2348-2406`）。
+它做三件事：Folme 从 `baseAnimTarget` 当前几何动画到 target 几何；下发
+`MiuiFreeFormInfoChange.setMiuiFreeformScale(target.scale)` + `setBounds(token, …)`
+（`MiuiFreeFormManagerService.setFreeformTaskChangesIfNeed:3221-3222` → `Task.setMiuiFreeformScale`）；
+动画结束时 `MultiTaskingFolmeAnimExecutor:123-126` → `MultiTaskingFolmeControl.updateBaseAnimParam:519-525`
+把最终 scale **写回 `baseAnimTarget`**。放大状态从此属于 ROM，之后的拖动/松手/避让/翻转都按它算。
+
+目标几何（放大多少、往哪边长）是纯逻辑 `launch/MiniScaleToggle.kt`（有单测 `MiniScaleToggleTest`）：
+1.5 倍，「窗口靠哪边就往哪边长」，永远夹在屏幕内。
+
+### 问题 2：有时候会丢动画
+
+同一根因的另一面 —— 两条线程往同一条 leash 提交事务（模块的 `ValueAnimator` 在 main，
+ROM 的 Folme 在 `wmshell.*`），谁后提交谁生效，动画就"没播"。现在动画只有 ROM 那一条。
+另外修了一个会吞掉菜单的竞态：退出动画（120ms）里又弹出新菜单时，旧的回调会把新菜单的
+surface 一起拆掉；`FlymeMiniMenuOverlay.dismiss` 现在先把 host/surface 摘出来再动画，只拆自己那一份。
+
+### 问题 3：静音后别处开声音，按钮状态不跟着变
+
+`MiniAppAudioHelper` 原来有一张 `mutedStateByPkg`，点一次静音就永远返回"静音"，所以用音量键、
+音量面板或应用自己的按钮把声音开回来之后，图标还停在"取消静音"。现在：
+
+- 状态**现场读**：播放音量为 0、或 `OP_PLAY_AUDIO` 被忽略，才算静音（不再缓存判定）；
+- 菜单显示期间每 400ms 轮询一次真实状态并刷新图标（`FlymeMiniMenuOverlay.MUTE_POLL_MS`）；
+- 窗口关掉 / 变回普通小窗时，把我们替它做的静音还回去（`MiniAppAudioHelper.release`），
+  避免"应用再也出不了声、又没有入口恢复"的死状态 —— 只还原**我们改过**的那个，用户自己静的音不动。
+
+取证（模块日志 / `adb logcat -s BubbleDrawer`）：
+
+```
+TOGGLE_MINI_SCALE taskId=… enlarged=true scale=… left=… top=…
+TOGGLE_MINI_SCALE_FALLBACK reason=no_geometry|no_animation taskId=…
+Mute toggled: from=false to=true applied=true pkg=…
+Mute icon pkg=… muted=true enlarged=false
+release pkg=… restore=1.0 volume=true appOps=true
+```
+
+`FALLBACK` = 这台 ROM 的接口对不上，已退回 ROM 自带的「迷你 → 普通小窗」
+（`RESTORE_MINI_TO_FREEFORM`），点击仍有结果。
+
+- [ ] 长按迷你小窗 ~300ms → 菜单从小窗里长出来（有一次触感），松手不会触发单击
+- [ ] 点「放大」→ 窗口在**原位置**变大到 1.5 倍（右上角的小窗向右上长、左上角的向左上长），
+      不跳回屏幕中央；再点一次（图标是"还原"）回到正常迷你尺寸，仍贴着原来那个角
+- [ ] 放大后**拖动**它：拖动过程中不闪、松手仍是放大尺寸（不再是"一拖就变回迷你"）
+- [ ] 放大后拖动到屏幕边缘 / 上滑悬停进最近任务再回来 / 转屏再转回：尺寸保持
+- [ ] 连点两次「放大」：第二次打断第一次，最终停在正确尺寸（不会两个动画打架）
+- [ ] 点「静音」：应用声音消失、图标变"取消静音"；再点一次声音回来、图标变回"静音"
+- [ ] 静音后用**音量键 / 音量面板**把声音开回来 → 菜单还开着的话，图标 0.4s 内自己变回"静音"
+- [ ] 静音状态下关掉迷你窗口 → 从桌面重新打开同一个应用：声音正常（不是被静音的死状态）
+- [ ] 长按另一个迷你小窗：菜单跟到那个窗口；点空白处关闭它，新菜单不会被一起拆掉
+- [ ] 关掉「迷你小窗长按菜单」开关：长按无菜单，迷你小窗的拖动/单击与 1.3.3 一致
+- [ ] 体检页原有各项仍 PASS（本项未新增体检判据，参考日志 `HOOK_INSTALLED_hookMiniTouchForMenu_complete`）

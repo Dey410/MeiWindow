@@ -172,6 +172,9 @@
     <string name="exp_swipe_up_hold_free_summary">上滑悬停交还系统原生自由小窗</string>
     <string name="exp_swipe_down_fullscreen">小白条下滑全屏展开</string>
     <string name="exp_swipe_down_fullscreen_summary">下滑直接把当前应用全屏</string>
+    <string name="exp_section_mini_window">迷你小窗（悬浮窗）</string>
+    <string name="exp_flyme_mini_menu">迷你小窗长按菜单</string>
+    <string name="exp_flyme_mini_menu_summary">长按侧边迷你小窗呼出 Flyme 悬浮快捷菜单（静音/取消静音与放大还原）</string>
     <string name="exp_section_home">回到桌面</string>
     <string name="exp_home_keep_freeform">回桌面不收迷你</string>
     <string name="exp_home_keep_freeform_summary">上滑回桌面（含上滑悬停进最近任务）时小窗保持原样，系统不再把它们一起收成迷你小窗；模块自己的「小白条上滑转迷你」不受影响</string>

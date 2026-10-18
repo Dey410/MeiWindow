@@ -391,6 +391,9 @@ object SettingsStore {
     fun setFlymeFreeformDimBg(context: Context, enabled: Boolean) =
         putBoolean(context, RemotePrefs.KEY_FLYME_FREEFORM_DIM_BG, enabled)
 
+    fun setFlymeMiniMenu(context: Context, enabled: Boolean) =
+        putBoolean(context, RemotePrefs.KEY_FLYME_MINI_MENU, enabled)
+
     /**
      * 「回桌面不收迷你」：拦掉 ROM 在回桌面/进最近任务时把**所有**小窗收成迷你小窗
      * （见 [RemotePrefs.KEY_HOME_KEEP_FREEFORM]）。与 Flyme 样式总开关无关，所以不看它。

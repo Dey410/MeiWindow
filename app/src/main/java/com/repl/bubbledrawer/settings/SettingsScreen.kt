@@ -916,6 +916,25 @@ fun ExperimentalSettingsScreen(
                 },
             )
 
+            // --- 迷你小窗 (悬浮窗) ---
+            // 迷你小窗长按菜单独立于 Flyme 样式小窗总开关，任意小窗转为迷你后均可长按操作
+            item(key = "exp-mini-window-title") {
+                SmallTitle(text = stringResource(R.string.exp_section_mini_window))
+            }
+            groupedCardItems(
+                keyPrefix = "exp-mini-window",
+                items = listOf(
+                    CardItem("flyme-mini-menu") {
+                        SwitchRow(
+                            title = stringResource(R.string.exp_flyme_mini_menu),
+                            summary = stringResource(R.string.exp_flyme_mini_menu_summary),
+                            checked = snap.flymeMiniMenu,
+                            onCheckedChange = actions::setFlymeMiniMenu,
+                        )
+                    },
+                ),
+            )
+
             // --- 回到桌面 ---
             // 这一项压的是 ROM 自己的行为（回桌面时把所有小窗收成迷你），和「禁止小窗偏移」同性质：
             // 不开 Flyme 样式小窗也该生效，所以**不**跟总开关联动。

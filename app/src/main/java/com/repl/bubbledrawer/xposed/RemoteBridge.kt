@@ -197,6 +197,9 @@ object RemoteBridge {
             .putBoolean(RemotePrefs.KEY_FLYME_FREEFORM_SWIPE_UP_HOLD_FREE, snap.flymeFreeformSwipeUpHoldFree)
             .putBoolean(RemotePrefs.KEY_FLYME_FREEFORM_SWIPE_DOWN_FULL, snap.flymeFreeformSwipeDownFull)
             .putBoolean(RemotePrefs.KEY_FLYME_FREEFORM_DIM_BG, snap.flymeFreeformDimBg)
+            // 迷你小窗长按菜单（2026-10-18）：和上面这些一样要在共享组里留一份，否则重启 App 后
+            // `syncLocal` 的镜像会把它漏掉，模块那边读到的还是默认值。
+            .putBoolean(RemotePrefs.KEY_FLYME_MINI_MENU, snap.flymeMiniMenu)
             .putBoolean(RemotePrefs.KEY_HOME_KEEP_FREEFORM, snap.homeKeepFreeform)
             .putBoolean(RemotePrefs.KEY_CONTACT_BAR, snap.contactBar)
             .putInt(RemotePrefs.KEY_CONTACT_BAR_MIN_WIDTH_PCT, snap.contactBarMinWidthPct)
