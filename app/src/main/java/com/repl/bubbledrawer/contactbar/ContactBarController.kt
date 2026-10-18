@@ -176,6 +176,8 @@ class ContactBarController(
         // Bind the frame loop to the main thread's Choreographer up front (the constructor itself may
         // run on the module's own thread after a hot reload).
         onMain { mainChoreographer = Choreographer.getInstance() }
+        // 自检：视图宿主的构造器能不能探测到（探测太窄的那次就是条整个不显示，见 resolveViewHostConstructor）。
+        onMain { runCatching { logViewHostProbe() } }
         // 窗口一动就切回逐帧跟随（ROM 的 `startGestureAnimation` hook 转发，见 [onFreeformWindowMotion]）。
         onFreeformWindowMotion = { onMain { kick() } }
         RecentConversations.onChanged = {
@@ -631,27 +633,7 @@ class ContactBarController(
      * 日志里只有 `CONTACT_BAR_VIEW_HOST_FAILED`，条不显示）。
      */
     private fun createSurfaceControlViewHost(context: Context, display: Display, wwm: Any): SurfaceControlViewHost {
-        val ctor = scvhConstructor ?: run {
-            val found = SurfaceControlViewHost::class.java.declaredConstructors
-                .filter { candidate ->
-                    val types = candidate.parameterTypes
-                    types.size >= 3 &&
-                        types[0].isAssignableFrom(context.javaClass) &&
-                        types[1].isAssignableFrom(display.javaClass) &&
-                        types[2].isAssignableFrom(wwm.javaClass) &&
-                        types.drop(3).all { !it.isPrimitive || it == java.lang.Boolean.TYPE }
-                }
-                // 参数最少的最"正统"：三参 > 四参（多出来的那个是名字/调试开关）。
-                .minByOrNull { it.parameterCount }
-            if (found == null) {
-                error(
-                    "No SurfaceControlViewHost(Context, Display, WindowlessWindowManager, …) in " +
-                        SurfaceControlViewHost::class.java.declaredConstructors.toList(),
-                )
-            }
-            runCatching { found.isAccessible = true }
-            found.also { scvhConstructor = it }
-        }
+        val ctor = resolveViewHostConstructor(context, display, wwm.javaClass)
         val args = arrayOfNulls<Any>(ctor.parameterCount)
         args[0] = context
         args[1] = display
@@ -665,6 +647,55 @@ class ContactBarController(
             }
         }
         return ctor.newInstance(*args) as SurfaceControlViewHost
+    }
+
+    /**
+     * 就地挑出能用的那个构造器（结果缓存）。**探测规则必须宽松**：这台 ROM 上只有四参那个
+     * （第四个参数是 String），三参的公开构造器不存在 —— 收窄过一次就是"条永远不出现"。
+     */
+    private fun resolveViewHostConstructor(
+        context: Context,
+        display: Display,
+        wwmClass: Class<*>,
+    ): java.lang.reflect.Constructor<*> {
+        scvhConstructor?.let { return it }
+        val found = SurfaceControlViewHost::class.java.declaredConstructors
+            .filter { candidate ->
+                val types = candidate.parameterTypes
+                types.size >= 3 &&
+                    types[0].isAssignableFrom(context.javaClass) &&
+                    types[1].isAssignableFrom(display.javaClass) &&
+                    types[2].isAssignableFrom(wwmClass) &&
+                    types.drop(3).all { !it.isPrimitive || it == java.lang.Boolean.TYPE }
+            }
+            // 参数最少的最"正统"：三参 > 四参（多出来的那个是名字/调试开关）。
+            .minByOrNull { it.parameterCount }
+        if (found == null) {
+            error(
+                "No SurfaceControlViewHost(Context, Display, WindowlessWindowManager, …) in " +
+                    SurfaceControlViewHost::class.java.declaredConstructors.toList(),
+            )
+        }
+        runCatching { found.isAccessible = true }
+        scvhConstructor = found
+        return found
+    }
+
+    /** 加载时的一次性自检：构造器探测有没有结果（这版 ROM 上曾经因为探测太窄而整条不显示）。 */
+    private fun logViewHostProbe() {
+        val display = displayOrNull() ?: return
+        val wwmClass = runCatching { Class.forName("android.view.WindowlessWindowManager") }.getOrNull()
+            ?: return
+        runCatching {
+            val ctor = resolveViewHostConstructor(host, display, wwmClass)
+            log(
+                Log.INFO,
+                "CONTACT_BAR_VIEW_HOST_CTOR ok=true params=" +
+                    ctor.parameterTypes.joinToString { it.simpleName },
+            )
+        }.onFailure {
+            logger(Log.WARN, "CONTACT_BAR_VIEW_HOST_CTOR ok=false", it)
+        }
     }
 
     /** 视图的"窗口参数"。`token` 必须留空：WWM 不是 `system_server`，随机 token 只会让每个尺寸变化都变成一个新窗口。 */

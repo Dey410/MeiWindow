@@ -1159,15 +1159,33 @@ release pkg=… restore=1.0 volume=true appOps=true
 
 ### 已经实测过的部分（2026-10-18，只有这些）
 
-改完用 db install -r + killall com.android.systemui 装了本机跑过：
+改完用 `adb install -r` + `killall com.android.systemui` 装了本机跑过：
 
-- 新包在**新的系统界面进程**里加载正常，没有崩（CONTACT_BAR_HOOKS_INSTALLED pipeline=false
-  → 随后 CONTACT_BAR_NOTIF_LISTENER_ATTACHED，这是热重载那条路径的正常顺序）；
-- 数据层新日志生效：CONTACT_BAR_CONV_NEW pkg=com.tencent.mm label=Z【武汉纺织大学阳光校区】美团拼好饭群 title=…
-  （一个会话一行，不再每个事件两行 CONV_ACCEPTED）。
+- 新包在**新的系统界面进程**里加载正常，没有崩（`CONTACT_BAR_HOOKS_INSTALLED pipeline=false`
+  → 随后 `CONTACT_BAR_NOTIF_LISTENER_ATTACHED`，这是热重载那条路径的正常顺序）；
+- 数据层新日志生效：`CONTACT_BAR_CONV_NEW pkg=com.tencent.mm label=Z【武汉纺织大学阳光校区】美团拼好饭群 title=…`
+  （一个会话一行，不再每个事件两行 `CONV_ACCEPTED`）；
+- 视图宿主的构造器自检：`CONTACT_BAR_VIEW_HOST_CTOR ok=true params=Context, Display, WindowlessWindowManager, String`
+  —— 这台 ROM 上**只有四参那个**（第四个参数是 String），三参的公开构造器不存在。
 
-**没测到**：条的 surface / 触摸 / Z 序 —— m start --windowingMode 5 在这台 ROM 上开出来的是
-**全屏**窗口（dumpsys window 里 WeChat 是 `(0,0)(fillxfill)`），WMShell 的 freeform 仓库根本不认它，
+### 一次真实的翻车：探测太窄 = 条永远不出现（2026-10-18）
+
+复查时我把构造器探测收窄成"多出来的参数必须是 boolean"，而这台 ROM 一个都匹配不上 ——
+用户当场反馈「联系人条不显示了」，日志是：
+
+```
+CONTACT_BAR_SURFACE taskId=32155 displayId=0 name=Surface(name=ContactBarSurface-32155#886)
+CONTACT_BAR_VIEW_HOST_FAILED taskId=32155          ← 每 500ms 一次（退避重试）
+No SurfaceControlViewHost(Context, Display, WindowlessWindowManager[, boolean]) in […]
+```
+
+教训：**这种跨版本的反射探测只能放宽，不能收窄**；挑不到时把候选列表写进日志。
+现在的规则是「前三个参数对得上就行，其余参数按类型给默认值」，参数最少者优先；
+`init` 里加了一次性自检 `CONTACT_BAR_VIEW_HOST_CTOR`，以后 ROM 换了能第一眼看出。
+（它只是被主线程的 `runCatching` 兜住，所以那次没有崩，只是条不出现。）
+
+**没测到**：条的 surface / 触摸 / Z 序 —— `am start --windowingMode 5` 在这台 ROM 上开出来的是
+**全屏**窗口（`dumpsys window` 里 WeChat 是 `(0,0)(fillxfill)`），WMShell 的 freeform 仓库根本不认它，
 所以拿不到真的小窗。下面这些只能用手势开小窗来测。
 
 ### 取证
