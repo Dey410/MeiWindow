@@ -923,16 +923,29 @@ fun ExperimentalSettingsScreen(
             }
             groupedCardItems(
                 keyPrefix = "exp-mini-window",
-                items = listOf(
-                    CardItem("flyme-mini-menu") {
+                items = buildList {
+                    add(CardItem("flyme-mini-menu") {
                         SwitchRow(
                             title = stringResource(R.string.exp_flyme_mini_menu),
                             summary = stringResource(R.string.exp_flyme_mini_menu_summary),
                             checked = snap.flymeMiniMenu,
                             onCheckedChange = actions::setFlymeMiniMenu,
                         )
-                    },
-                ),
+                    })
+                    // 倍率跟着菜单开关走：菜单关掉时这一项灰着，避免"改了没反应"。
+                    add(CardItem("flyme-mini-enlarge") {
+                        IntSliderRow(
+                            title = stringResource(R.string.exp_flyme_mini_enlarge),
+                            summary = stringResource(R.string.exp_flyme_mini_enlarge_summary),
+                            value = snap.flymeMiniEnlargePct,
+                            min = RemotePrefs.FLYME_MINI_ENLARGE_MIN,
+                            max = RemotePrefs.FLYME_MINI_ENLARGE_MAX,
+                            enabled = snap.flymeMiniMenu,
+                            valueText = { stringResource(R.string.pct_value, it) },
+                            onCommit = actions::setFlymeMiniEnlargePct,
+                        )
+                    })
+                },
             )
 
             // --- 回到桌面 ---

@@ -296,6 +296,19 @@ object RemotePrefs {
     const val DEFAULT_FLYME_MINI_MENU = true
 
     /**
+     * 迷你小窗长按菜单里「放大」的倍率（百分数）。
+     *
+     * 用户 2026-10-18：「再做一个大号迷你小窗的放大倍率滑块，现在默认是 1.5 倍」。
+     * 正常迷你的缩放由 ROM 自己算（`MiuiMultiWindowUtils.getMiniFreeformScale`），这里只存倍数：
+     * 放大后的 scale = 正常迷你 scale × 这个比例（`MiniScaleToggle.decideMiniScale`）。
+     * 上限 200% 是因为再大就会撞上 `MINI_SCALE_MAX`（0.95，再大就不是迷你小窗了）。
+     */
+    const val KEY_FLYME_MINI_ENLARGE_PCT = "flyme_mini_enlarge_pct"
+    const val DEFAULT_FLYME_MINI_ENLARGE_PCT = 150
+    const val FLYME_MINI_ENLARGE_MIN = 110
+    const val FLYME_MINI_ENLARGE_MAX = 200
+
+    /**
      * 「回桌面不收迷你」：全面屏手势上滑回桌面时，ROM 会把**所有**小窗一次性收成迷你小窗。
      *
      * 用户 2026-10-17：「目前上滑时会把所有小窗变为迷你小窗……在实验性功能里加一个“回桌面不收迷你”
@@ -474,6 +487,8 @@ object RemotePrefs {
         val flymeFreeformSwipeDownFull: Boolean = DEFAULT_FLYME_FREEFORM_SWIPE_DOWN_FULL,
         val flymeFreeformDimBg: Boolean = DEFAULT_FLYME_FREEFORM_DIM_BG,
         val flymeMiniMenu: Boolean = DEFAULT_FLYME_MINI_MENU,
+        /** 长按菜单「放大」的倍率（百分数），见 [KEY_FLYME_MINI_ENLARGE_PCT] */
+        val flymeMiniEnlargePct: Int = DEFAULT_FLYME_MINI_ENLARGE_PCT,
         /** 回桌面不收迷你（见 [KEY_HOME_KEEP_FREEFORM]，与 Flyme 样式总开关无关） */
         val homeKeepFreeform: Boolean = DEFAULT_HOME_KEEP_FREEFORM,
         /** 小窗底部联系人条（Flyme「联系人头像」） */
@@ -607,6 +622,8 @@ object RemotePrefs {
             flymeFreeformSwipeDownFull = sp.getBoolean(KEY_FLYME_FREEFORM_SWIPE_DOWN_FULL, DEFAULT_FLYME_FREEFORM_SWIPE_DOWN_FULL),
             flymeFreeformDimBg = sp.getBoolean(KEY_FLYME_FREEFORM_DIM_BG, DEFAULT_FLYME_FREEFORM_DIM_BG),
             flymeMiniMenu = sp.getBoolean(KEY_FLYME_MINI_MENU, DEFAULT_FLYME_MINI_MENU),
+            flymeMiniEnlargePct = sp.getInt(KEY_FLYME_MINI_ENLARGE_PCT, DEFAULT_FLYME_MINI_ENLARGE_PCT)
+                .coerceIn(FLYME_MINI_ENLARGE_MIN, FLYME_MINI_ENLARGE_MAX),
             homeKeepFreeform = sp.getBoolean(KEY_HOME_KEEP_FREEFORM, DEFAULT_HOME_KEEP_FREEFORM),
             contactBar = sp.getBoolean(KEY_CONTACT_BAR, DEFAULT_CONTACT_BAR),
             contactBarMinWidthPct = sp.getInt(KEY_CONTACT_BAR_MIN_WIDTH_PCT, DEFAULT_CONTACT_BAR_MIN_WIDTH_PCT)

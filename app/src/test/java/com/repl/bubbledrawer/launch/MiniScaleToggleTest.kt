@@ -206,4 +206,53 @@ class MiniScaleToggleTest {
         assertFalse(isMiniScaleEnlarged(0.42f, 0f))
         assertFalse(isMiniScaleEnlarged(Float.NaN, 0.42f))
     }
+
+    @Test
+    fun theEnlargeRatioComesFromTheSettingsSlider() {
+        // 设置里存的是百分数（默认 150 = 1.5 倍），到几何计算这里变成倍数。
+        assertEquals(1.5f, miniEnlargeRatioFromPct(150), 1e-4f)
+        assertEquals(1.1f, miniEnlargeRatioFromPct(110), 1e-4f)
+        assertEquals(2.0f, miniEnlargeRatioFromPct(200), 1e-4f)
+        // 越界（旧配置 / 手改的共享组值）夹回滑块范围。
+        assertEquals(1.1f, miniEnlargeRatioFromPct(50), 1e-4f)
+        assertEquals(2.0f, miniEnlargeRatioFromPct(400), 1e-4f)
+    }
+
+    @Test
+    fun aCustomRatioIsUsedForTheEnlargedSize() {
+        val decision = decideMiniScale(
+            taskWidth = TASK_W,
+            taskHeight = TASK_H,
+            currentScale = MINI_SCALE,
+            visualLeft = RIGHT_MINI_LEFT,
+            visualTop = MINI_TOP,
+            screenWidth = SCREEN_W,
+            screenHeight = SCREEN_H,
+            normalMiniScale = MINI_SCALE,
+            margin = MARGIN,
+            ratio = 1.8f,
+        )!!
+
+        assertEquals(1.8f * MINI_SCALE, decision.scale, 1e-4f)
+        // 锚右边缘依然成立：宽度差从左边让出来。
+        assertEquals(RIGHT_MINI_LEFT + MINI_W - Math.round(TASK_W * decision.scale), decision.left)
+    }
+
+    @Test
+    fun aHugeRatioStillCannotEscapeTheMiniScaleCeiling() {
+        val decision = decideMiniScale(
+            taskWidth = TASK_W,
+            taskHeight = TASK_H,
+            currentScale = 0.8f,
+            visualLeft = 100,
+            visualTop = 100,
+            screenWidth = SCREEN_W,
+            screenHeight = SCREEN_H,
+            normalMiniScale = 0.8f,
+            margin = MARGIN,
+            ratio = 2.0f,
+        )!!
+
+        assertEquals(0.95f, decision.scale, 1e-4f)
+    }
 }

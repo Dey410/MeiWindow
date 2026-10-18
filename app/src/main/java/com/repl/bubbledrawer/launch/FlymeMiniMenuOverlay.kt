@@ -355,7 +355,13 @@ class FlymeMiniMenuOverlay(
             val newMute = !currentlyMuted
             val applied = MiniAppAudioHelper.setAppMuted(context, packageName, uid, newMute)
             refreshMuteIcon(force = true)
+            // 用户 2026-10-18：点静音按钮就把面板收掉（和「放大」一致），别让它挡着小窗。
             Log.i(TAG, "Mute toggled: from=$currentlyMuted to=$newMute applied=$applied pkg=$packageName")
+            FlymeFreeformController.log(
+                "MINI_MUTE taskId=$taskId pkg=$packageName uid=$uid from=$currentlyMuted " +
+                    "to=$newMute applied=$applied",
+            )
+            dismiss(animate = true)
         }
 
         scaleBtn.setOnClickListener { v ->

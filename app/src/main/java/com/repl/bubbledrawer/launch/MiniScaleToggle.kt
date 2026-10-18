@@ -1,5 +1,6 @@
 package com.repl.bubbledrawer.launch
 
+import com.repl.bubbledrawer.xposed.RemotePrefs
 import kotlin.math.roundToInt
 
 /**
@@ -20,8 +21,18 @@ import kotlin.math.roundToInt
  * `MiuiFreeformModeAnimation.applyFreeformToMiniAnimation` 正是这么做的（只下发 scale + bounds）。
  */
 
-/** 放大到正常迷你尺寸的几倍。1.5 与 Flyme 的「放大」观感接近，且不会盖满屏幕。 */
+/** 放大到正常迷你尺寸的几倍。默认 1.5 与 Flyme 的「放大」观感接近，且不会盖满屏幕。 */
 internal const val MINI_ENLARGE_RATIO = 1.5f
+
+/**
+ * 设置里的「放大倍率」滑块（百分数）→ 缩放倍数。
+ *
+ * 用户 2026-10-18：「再做一个大号迷你小窗的放大倍率滑块，现在默认是 1.5 倍」。
+ * 范围就是 `RemotePrefs.FLYME_MINI_ENLARGE_MIN/MAX`（110%–200%），越界一律夹回来 ——
+ * 滑块本身已经限制了范围，这里的夹取是给"旧配置/手改的共享组值"兜底。
+ */
+internal fun miniEnlargeRatioFromPct(pct: Int): Float =
+    pct.coerceIn(RemotePrefs.FLYME_MINI_ENLARGE_MIN, RemotePrefs.FLYME_MINI_ENLARGE_MAX) / 100f
 
 /** 大于「正常迷你缩放」这个比例就算放大状态（ROM 自己算出来的 scale 会有 ±1px 的取整误差）。 */
 private const val MINI_ENLARGED_THRESHOLD = 1.05f

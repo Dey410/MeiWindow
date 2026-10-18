@@ -1020,23 +1020,42 @@ ROM 的 Folme 在 `wmshell.*`），谁后提交谁生效，动画就"没播"。�
 另外修了一个会吞掉菜单的竞态：退出动画（120ms）里又弹出新菜单时，旧的回调会把新菜单的
 surface 一起拆掉；`FlymeMiniMenuOverlay.dismiss` 现在先把 host/surface 摘出来再动画，只拆自己那一份。
 
-### 问题 3：静音后别处开声音，按钮状态不跟着变
+### 问题 4：应用没在出声时，静音按钮按了不起作用（2026-10-18 第二轮）
 
-`MiniAppAudioHelper` 原来有一张 `mutedStateByPkg`，点一次静音就永远返回"静音"，所以用音量键、
-音量面板或应用自己的按钮把声音开回来之后，图标还停在"取消静音"。现在：
+静音靠 `setPlayerVolume(config, 0)`，它要一条**活跃的** `AudioPlaybackConfiguration`；应用没在播时
+没有这条通道，`OP_PLAY_AUDIO` 那条兜底又不一定有权限（`MANAGE_APP_OPS_MODES` 一般只给 Settings），
+于是那一次点击什么都没发生 —— 连图标都不变，看着就是个死按钮。
 
-- 状态**现场读**：播放音量为 0、或 `OP_PLAY_AUDIO` 被忽略，才算静音（不再缓存判定）；
-- 菜单显示期间每 400ms 轮询一次真实状态并刷新图标（`FlymeMiniMenuOverlay.MUTE_POLL_MS`）；
-- 窗口关掉 / 变回普通小窗时，把我们替它做的静音还回去（`MiniAppAudioHelper.release`），
-  避免"应用再也出不了声、又没有入口恢复"的死状态 —— 只还原**我们改过**的那个，用户自己静的音不动。
+现在把「静音」拆成**意图**和**事实**（纯逻辑 `launch/MiniMuteState.kt`，7 条单测）：
+
+- 按下静音 → 记下意图，图标立刻显示"已静音"（`MiniMuteState.requestMute`）；
+- 应用此刻没出声 → 注册一次 `AudioManager.registerAudioPlaybackCallback`，等它**真的开始播声音**
+  时在回调里把该 uid 的播放音量压到 0（`MiniAppAudioHelper.playbackCallback`，日志
+  `pending mute applied`），然后意图转成事实、取消监听；
+- 意图**生效过**之后事实优先：别处把声音开回来，图标跟着变回"静音"（不会退回旧版的永久已静音）；
+- 意图**还没机会生效**时，即使读到的音量不是 0 也继续显示"已静音"（用户的意思没变）。
+
+顺带（同一轮用户要求）：「点静音按钮就把面板收掉」，和「放大」一致 —— `FlymeMiniMenuOverlay`
+在点击回调末尾 `dismiss(animate = true)`。
+
+另外把 AppOps 兜底改成**两个签名各自独立尝试**：以前万一 `setMode` 抛 SecurityException，就直接
+返回失败，后面的 `setUidMode` 根本没跑过。
+
+### 放大倍率滑块（2026-10-18 新增）
+
+设置 → 实验性功能 → 迷你小窗（悬浮窗）→「放大倍率」，110%–200%，默认 **150%**（= 原来的 1.5 倍）。
+存的是百分数（`flyme_mini_enlarge_pct`），模块每次点「放大」现读（改完不用重启系统界面），
+倍率仍受 `MINI_SCALE_MAX = 0.95` 与屏幕夹取约束。几何换算见
+`MiniScaleToggle.miniEnlargeRatioFromPct`。
 
 取证（模块日志 / `adb logcat -s BubbleDrawer`）：
 
 ```
 TOGGLE_MINI_SCALE taskId=… enlarged=true scale=… left=… top=…
 TOGGLE_MINI_SCALE_FALLBACK reason=no_geometry|no_animation taskId=…
-Mute toggled: from=false to=true applied=true pkg=…
+MINI_MUTE taskId=… pkg=… uid=… from=false to=true applied=true
 Mute icon pkg=… muted=true enlarged=false
+pending mute applied key=… uid=… volume=0
 release pkg=… restore=1.0 volume=true appOps=true
 ```
 
@@ -1044,14 +1063,19 @@ release pkg=… restore=1.0 volume=true appOps=true
 （`RESTORE_MINI_TO_FREEFORM`），点击仍有结果。
 
 - [ ] 长按迷你小窗 ~300ms → 菜单从小窗里长出来（有一次触感），松手不会触发单击
-- [ ] 点「放大」→ 窗口在**原位置**变大到 1.5 倍（右上角的小窗向右上长、左上角的向左上长），
+- [ ] 点「放大」→ 窗口在**原位置**变大（默认 1.5 倍，右上角的小窗向右上长、左上角的向左上长），
       不跳回屏幕中央；再点一次（图标是"还原"）回到正常迷你尺寸，仍贴着原来那个角
 - [ ] 放大后**拖动**它：拖动过程中不闪、松手仍是放大尺寸（不再是"一拖就变回迷你"）
 - [ ] 放大后拖动到屏幕边缘 / 上滑悬停进最近任务再回来 / 转屏再转回：尺寸保持
 - [ ] 连点两次「放大」：第二次打断第一次，最终停在正确尺寸（不会两个动画打架）
-- [ ] 点「静音」：应用声音消失、图标变"取消静音"；再点一次声音回来、图标变回"静音"
-- [ ] 静音后用**音量键 / 音量面板**把声音开回来 → 菜单还开着的话，图标 0.4s 内自己变回"静音"
+- [ ] 把「放大倍率」拖到 110% 与 200% 各试一次：窗口大小明显不同，200% 也不会铺满屏幕
+      （`MINI_SCALE_MAX` 兜底）；改完立刻点「放大」就生效，不用重启系统界面
+- [ ] 点「静音」：应用声音消失、图标变"取消静音"，**面板随即收起**
+- [ ] 应用**暂停/没在出声**时点「静音」：图标立刻变"取消静音"（不再是没反应的死按钮），
+      然后让它开始播（点播放）：**一开始就是静音**（日志 `pending mute applied`）
+- [ ] 静音后用**音量键 / 音量面板**把声音开回来 → 再长按呼出菜单，图标应显示"静音"
 - [ ] 静音状态下关掉迷你窗口 → 从桌面重新打开同一个应用：声音正常（不是被静音的死状态）
 - [ ] 长按另一个迷你小窗：菜单跟到那个窗口；点空白处关闭它，新菜单不会被一起拆掉
 - [ ] 关掉「迷你小窗长按菜单」开关：长按无菜单，迷你小窗的拖动/单击与 1.3.3 一致
+      （倍率滑块此时是灰的）
 - [ ] 体检页原有各项仍 PASS（本项未新增体检判据，参考日志 `HOOK_INSTALLED_hookMiniTouchForMenu_complete`）

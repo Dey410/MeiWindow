@@ -1019,6 +1019,8 @@ class FlymeFreeformController(
         val visual = (callNoArg(taskInfo, "getScaledBounds") as? Rect)?.takeUnless { it.isEmpty } ?: base
         val normal = normalMiniScaleOf(taskInfo, base) ?: return null
         val dm = context.resources.displayMetrics
+        // 倍率来自设置里的滑块（默认 1.5 倍），每次点击现读：改完滑块不用重启系统界面。
+        val ratio = miniEnlargeRatioFromPct(RemotePrefs.read(prefs).flymeMiniEnlargePct)
         return decideMiniScale(
             taskWidth = base.width(),
             taskHeight = base.height(),
@@ -1029,6 +1031,7 @@ class FlymeFreeformController(
             screenHeight = dm.heightPixels,
             normalMiniScale = normal,
             margin = (dm.density * 8f).toInt(),
+            ratio = ratio,
         )
     }
 
