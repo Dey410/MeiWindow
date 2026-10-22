@@ -1,6 +1,7 @@
 package com.repl.bubbledrawer.shortcut
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -56,16 +57,19 @@ class FunctionPinDetailsTest {
             subLabel = "示例",
             type = ShortcutType.QS_TILE,
             tintColor = 0xFF3366CC.toInt(),
+            tileForeground = true,
         )
         val decoded = FunctionPinDetails.decode(FunctionPinDetails.encode(listOf(tile)))[0]
         assertEquals(ShortcutType.QS_TILE, decoded.type)
         assertEquals(0xFF3366CC.toInt(), decoded.tintColor)
+        assertTrue(decoded.tileForeground)
 
         // 上一代只有四段：key、label、subLabel、intentUri —— 仍要能读，并按快捷方式处理。
         val legacy = FunctionPinDetails.decode("com.x#foo\t旧功能\t宿主\tintent:#Intent;end")
         assertEquals(1, legacy.size)
         assertEquals(ShortcutType.APP_SHORTCUT, legacy[0].type)
         assertNull(legacy[0].tintColor)
+        assertFalse(legacy[0].tileForeground)
     }
 
     @Test

@@ -1834,12 +1834,9 @@ private fun TileGlyphIcon(
         contentAlignment = Alignment.Center,
     ) {
         if (bitmap != null) {
-            val transparent = remember(bitmap) {
-                runCatching { ShortcutRepository.isTransparentBitmap(bitmap) }.getOrDefault(false)
-            }
-            if (transparent) {
+            if (item.tileForeground) {
                 // 归一化会新建一张 192px 图并按 pinKey 缓存（ShortcutRepository normalizedIcons），
-                // 滚出/滚回来不会每次重算。
+                // 滚出/滚回来不会每次重算。前景统一漂白：SystemUI 控制中心磁贴就是这么画的。
                 val normalized = remember(bitmap) {
                     ShortcutRepository.normalizedForeground(item, bitmap)
                 }
@@ -1851,7 +1848,7 @@ private fun TileGlyphIcon(
                     contentScale = ContentScale.Fit,
                 )
             } else {
-                // 没有透明前景：这是应用图标兜底，不是磁贴图形；原样画，别漂成白块。
+                // 没有声明磁贴 icon：这是应用图标兜底，不是磁贴前景；原样画，别漂成白块。
                 Image(
                     bitmap = bitmap.asImageBitmap(),
                     contentDescription = item.label,

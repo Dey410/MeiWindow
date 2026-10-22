@@ -38,6 +38,7 @@ object FunctionPinDetails {
                 // 处理。磁贴与快捷方式都存 `pkg#id`，没有 type 的话扇形会把磁贴当快捷方式启动。
                 item.type.name,
                 (item.tintColor ?: 0).toString(),
+                item.tileForeground.toString(),
             ).joinToString(FIELD.toString()) { escape(it) }
             if (out.length + record.length + 1 > MAX_CHARS) break
             if (out.isNotEmpty()) out.append(RECORD)
@@ -60,6 +61,7 @@ object FunctionPinDetails {
                 runCatching { ShortcutType.valueOf(it) }.getOrDefault(ShortcutType.APP_SHORTCUT)
             } ?: ShortcutType.APP_SHORTCUT
             val tint = parts.getOrNull(5)?.toIntOrNull()?.takeIf { it != 0 }
+            val tileForeground = parts.getOrNull(6)?.toBooleanStrictOrNull() ?: false
             ShortcutItem(
                 id = id.ifEmpty { key },
                 packageName = pkg,
@@ -68,6 +70,7 @@ object FunctionPinDetails {
                 type = type,
                 intentUri = parts.getOrNull(3)?.ifBlank { null },
                 tintColor = tint,
+                tileForeground = tileForeground,
             )
         }
     }

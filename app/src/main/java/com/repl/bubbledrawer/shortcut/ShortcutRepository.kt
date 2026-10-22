@@ -258,7 +258,7 @@ object ShortcutRepository {
         // 指纹含标题与磁贴底色：只按 pinKey 比对会让「快捷方式改名/换图标/磁贴换色」永远同步不到
         // App（那边显示的是缓存）。
         val fingerprint = list.joinToString("|") {
-            "${it.pinKey}=${it.label}=${it.tintColor ?: 0}"
+            "${it.pinKey}=${it.label}=${it.tintColor ?: 0}=${it.tileForeground}"
         }.hashCode()
         if (!force && fingerprint == lastReportedFingerprint) {
             // 内容一字不差：不重复上报。这一条是「App 请求刷新 → SystemUI 上报 → App 存盘 →
@@ -816,6 +816,9 @@ object ShortcutRepository {
                     ?.takeIf { it.isNotBlank() && it != si.name && !it.contains('.') }
             val label = serviceLabel ?: appLabel ?: id.substringAfterLast('.')
 
+            // 服务没有声明 icon 时 `loadIcon` 会退回应用图标，那**不是**磁贴前景：
+            // 此时 tileForeground = false，UI 原样画应用图标，不做漂白/归一化。
+            val declaredIcon = tileInfo.second != null || si.icon != 0
             val icon = tileInfo.second
                 ?: runCatching { si.loadIcon(pm) }.getOrNull()
                 ?: runCatching { pm.getApplicationIcon(si.packageName) }.getOrNull()
@@ -837,6 +840,7 @@ object ShortcutRepository {
                     type = ShortcutType.QS_TILE,
                     iconBitmap = iconBitmap,
                     tintColor = tint,
+                    tileForeground = declaredIcon,
                 ),
             )
         }

@@ -37,6 +37,13 @@ data class ShortcutItem(
      * 面板（SystemUI）和管理页（App）都能直接画，不用各自再读一遍图标。
      */
     val tintColor: Int? = null,
+    /**
+     * 这个 [ShortcutType.QS_TILE] 的 icon 是否真的是**磁贴前景**（透明底图形）。
+     *
+     * `true` → UI 归一化后漂白成白色前景；`false` → 服务没声明 icon，`iconBitmap` 其实是
+     * 应用图标兜底，原样画（把彩色应用图标漂成白块比不漂更糟）。跨进程一起传。
+     */
+    val tileForeground: Boolean = false,
 ) {
     /**
      * 收藏用的稳定标识 `pkg#id`。

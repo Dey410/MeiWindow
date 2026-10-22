@@ -113,6 +113,8 @@ object ShortcutBridge {
         put("isEnabled", item.isEnabled)
         // 磁贴底色：0 = 没有（快捷方式/桌面捷径），非 0 = ARGB。App 侧缓存与面板都靠它。
         put("tint", item.tintColor ?: 0)
+        // 磁贴前景标记：只有它是 true 才归一化+漂白，false 说明 icon 是应用图标兜底。
+        put("tileFg", item.tileForeground)
 
         val bmp = item.iconBitmap
         if (bmp != null && !bmp.isRecycled) {
@@ -149,6 +151,7 @@ object ShortcutBridge {
                 val intentUri = obj.optString("intentUri").ifBlank { null }
                 val isEnabled = obj.optBoolean("isEnabled", true)
                 val tint = obj.optInt("tint", 0).takeIf { it != 0 }
+                val tileForeground = obj.optBoolean("tileFg", false)
 
                 val iconBase64 = obj.optString("iconBmp").ifBlank { null }
                 val iconBmp = iconBase64?.let {
@@ -168,6 +171,7 @@ object ShortcutBridge {
                         appIconBitmap = null,
                         isEnabled = isEnabled,
                         tintColor = tint,
+                        tileForeground = tileForeground,
                     )
                 )
             }
