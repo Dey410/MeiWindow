@@ -20,6 +20,8 @@ interface SettingsActions {
     fun setPanelHeightPct(pct: Int)
     fun setPanelIconDp(dp: Int)
     fun setPanelTextSp(sp: Int)
+    /** 更多应用面板：功能页是否显示应用磁贴。 */
+    fun setPanelShowTiles(enabled: Boolean)
     fun setPanelDismissOutside(mode: Int)
     fun setFanIconCount(count: Int)
 
@@ -98,6 +100,7 @@ class StoreSettingsActions(private val context: Context) : SettingsActions {
     override fun setPanelHeightPct(pct: Int) = SettingsStore.setPanelHeightPct(context, pct)
     override fun setPanelIconDp(dp: Int) = SettingsStore.setPanelIconDp(context, dp)
     override fun setPanelTextSp(sp: Int) = SettingsStore.setPanelTextSp(context, sp)
+    override fun setPanelShowTiles(enabled: Boolean) = SettingsStore.setPanelShowTiles(context, enabled)
     override fun setPanelDismissOutside(mode: Int) = SettingsStore.setPanelDismissOutside(context, mode)
     override fun setFanIconCount(count: Int) = SettingsStore.setFanIconCount(context, count)
     override fun setFanLayers(layers: Int) = SettingsStore.setFanLayers(context, layers)

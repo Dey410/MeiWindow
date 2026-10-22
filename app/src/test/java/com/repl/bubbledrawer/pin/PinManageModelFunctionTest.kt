@@ -94,11 +94,13 @@ class PinManageModelFunctionTest {
         functionPinsOf: () -> List<String> = { emptyList() },
         pinnedFunctionItems: () -> List<ShortcutItem> = { emptyList() },
         onFunctionOrderChange: (List<String>) -> Unit = {},
+        showTiles: Boolean = true,
     ) = PinManageModel(
         loadApps = { persistentListOf() },
         pinsOf = { emptyList() },
         onOrderChange = {},
         recommendConfig = { false to 0 },
+        showTiles = showTiles,
         functionPinsOf = functionPinsOf,
         pinnedFunctionItems = pinnedFunctionItems,
         onFunctionOrderChange = onFunctionOrderChange,
@@ -198,6 +200,27 @@ class PinManageModelFunctionTest {
         )
         // 磁贴不能被丢进单独的分组，也不能复制到别的应用下。
         assertEquals(1, model.groupedFunctions.count { group -> group.items.any { it.type == ShortcutType.QS_TILE } })
+    }
+
+    @Test
+    fun showTilesOffHidesThemFromTheCatalogueAndPinnedArea() {
+        val model = model(
+            functionPinsOf = { listOf(wechatTile.pinKey, wechatScan.pinKey) },
+            pinnedFunctionItems = { listOf(wechatTile, wechatScan) },
+            showTiles = false,
+        )
+        injectShortcuts(model, listOf(wechatScan, wechatTile))
+        model.refreshFunctionPins()
+
+        assertTrue(
+            "关闭「显示磁贴」后，功能页里不能有 QS_TILE",
+            model.groupedFunctions.flatMap { it.items }.none { it.type == ShortcutType.QS_TILE },
+        )
+        assertEquals(
+            "已选区也要隐藏磁贴，但保留快捷方式",
+            listOf(wechatScan.pinKey),
+            model.pinnedFunctions.map { it.pinKey },
+        )
     }
 
     @Test

@@ -38,6 +38,11 @@ class PinManageModel(
      * 那张，这一项只管要不要叠角标。
      */
     val cloneBadge: Boolean = com.repl.bubbledrawer.xposed.RemotePrefs.DEFAULT_CLONE_BADGE,
+    /**
+     * 「显示磁贴」开关（更多应用面板设置）。false 时功能页与「已选功能」都不出现
+     * [com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE]，但收藏键仍保留在存储里。
+     */
+    val showTiles: Boolean = com.repl.bubbledrawer.xposed.RemotePrefs.DEFAULT_PANEL_SHOW_TILES,
     private val loadShortcuts: (suspend () -> Pair<List<com.repl.bubbledrawer.shortcut.ShortcutItem>, List<com.repl.bubbledrawer.shortcut.ShortcutItem>>)? = null,
     initialTab: Int = 0,
     private val functionPinsOf: () -> List<String> = { emptyList() },
@@ -121,8 +126,9 @@ class PinManageModel(
             // [allShortcuts] 里已经含「自己枚举到的」与「宿主给的详情」两半，自己那份优先。
             // 两边都没有才退回占位项 —— 绝不让一条已选功能凭空消失（用户 2026-10-13 的报障）。
             val allMap = allShortcuts.associateBy { it.pinKey }
-            val list = functionPins.map { key ->
-                allMap[key] ?: com.repl.bubbledrawer.shortcut.FunctionPinDetails.placeholder(key)
+            val list = functionPins.mapNotNull { key ->
+                val item = allMap[key] ?: com.repl.bubbledrawer.shortcut.FunctionPinDetails.placeholder(key)
+                if (!showTiles && item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) null else item
             }
             if (!isSearching || searchQuery.isBlank()) return list
             val q = searchQuery.trim()
@@ -154,6 +160,7 @@ class PinManageModel(
             val query = if (isSearching) searchQuery.trim() else ""
             val groups = mutableMapOf<String, MutableList<com.repl.bubbledrawer.shortcut.ShortcutItem>>()
             for (item in allShortcuts) {
+                if (!showTiles && item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) continue
                 val appName = item.subLabel?.ifBlank { null } ?: item.label
                 if (query.isNotEmpty() && !item.label.contains(query, ignoreCase = true) && !appName.contains(query, ignoreCase = true)) {
                     continue

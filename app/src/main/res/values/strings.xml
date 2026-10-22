@@ -123,7 +123,7 @@
     <string name="category_fan">扇形面板外观</string>
     <string name="category_fan_summary">图标数量与大小 · 展开半径 · 振动与自动收起</string>
     <string name="category_panel">更多应用面板</string>
-    <string name="category_panel_summary">面板尺寸 · 图标与文字大小 · 外部收起方式</string>
+    <string name="category_panel_summary">面板尺寸 · 图标与文字大小 · 磁贴显示 · 外部收起方式</string>
     <string name="category_manage">收藏应用管理</string>
     <string name="category_manage_summary">排序与增删快捷启动应用</string>
     <string name="category_experimental">实验性功能</string>

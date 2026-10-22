@@ -346,9 +346,15 @@ class FanHost(
 
     /** 扇形里要显示的功能条目（见 [com.repl.bubbledrawer.shortcut.FunctionFanItems]）。 */
     private fun fanFunctionEntries(): List<ShortcutItem> {
-        val keys = readFunctionPins()
-        if (keys.isEmpty()) return emptyList()
         val details = readFunctionDetails()
+        val showTiles = RemotePrefs.read(prefs).panelShowTiles
+        val keys = readFunctionPins().filter { key ->
+            if (showTiles) return@filter true
+            val item = details.firstOrNull { it.pinKey == key }
+                ?: ShortcutRepository.peekCached(key)
+            item?.type != com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE
+        }
+        if (keys.isEmpty()) return emptyList()
         val entries = com.repl.bubbledrawer.shortcut.FunctionFanItems.resolve(
             keys = keys,
             details = details,
@@ -462,7 +468,12 @@ class FanHost(
         registerUnlockReceiver()
         // pins edits while the fan is open → live rebind (reference :85-96 watch pattern)
         pinsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-            if (key == PrefsPinBackend.KEY || key == PrefsPinBackend.KEY_REV) {
+            if (key == RemotePrefs.KEY_PANEL_SHOW_TILES) {
+                // 开关变了：强制重扫一次，否则 30s 扫描缓存会让 App 侧继续拿着旧清单（关了还在、
+                // 开了没有）。tile 列表本身在 ShortcutRepository 里按这个开关裁剪。
+                logger(Log.INFO, "PANEL_SHOW_TILES_CHANGED on=${RemotePrefs.read(prefs).panelShowTiles}", null)
+                scanShortcuts("SHOW_TILES", force = true)
+            } else if (key == PrefsPinBackend.KEY || key == PrefsPinBackend.KEY_REV) {
                 // The shared group moved. Adopt it only when its stamp is not older than ours —
                 // and NEVER answer a difference by pushing our own copy back: the value and its
                 // rev are two keys that LSPosed mirrors one at a time, so this callback can
@@ -1571,6 +1582,7 @@ class FanHost(
             },
             // 分身角标：面板里的图标与扇子同源（都按这次快照决定要不要叠角标）。
             cloneBadge = RemotePrefs.read(prefs).cloneBadge,
+            showTiles = RemotePrefs.read(prefs).panelShowTiles,
             loadShortcuts = {
                 com.repl.bubbledrawer.shortcut.ShortcutRepository.loadShortcuts(host)
             },

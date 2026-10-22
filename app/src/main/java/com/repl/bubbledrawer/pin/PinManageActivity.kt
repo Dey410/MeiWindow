@@ -103,6 +103,7 @@ class PinManageActivity : ComponentActivity() {
             },
             // 分身角标：图标本身取主空间那张，这一项只决定要不要叠角标（与面板同源设置）。
             cloneBadge = SettingsStore.snapshot(this@PinManageActivity).cloneBadge,
+            showTiles = SettingsStore.snapshot(this@PinManageActivity).panelShowTiles,
             loadShortcuts = { ShortcutRepository.loadShortcuts(this@PinManageActivity) },
             initialTab = initialTab,
             functionPinsOf = { com.repl.bubbledrawer.shortcut.FunctionPinStore.getPins(this@PinManageActivity) },

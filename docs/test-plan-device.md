@@ -1309,12 +1309,14 @@ firstVisibleItemScrollOffset == 0`）时展开收藏区，否则原样吞掉并�
 **需求**：功能页除了快捷方式，还显示控制中心那批「应用磁贴」；磁贴底色用应用图标取色
 （对齐 AppMarket `ui/util/ImageColors.kt` 的 `dominantImageColor`）。
 
-**数据**：`ShortcutRepository.loadQsTiles()` 在 SystemUI 里取
-`MiuiQSHost.getTiles()` 中**已经在控制中心里的** `custom(pkg/cls)` live `QSTile`；
-每条是一个 `ShortcutItem(type = QS_TILE)`，`id` = 服务类名，键仍是 `pkg#class`。
-没有加进控制中心的 `TileService` 不列 —— 它们的真实 icon 必须逐个 bind 才能拿到
-（`CustomTile.handleUpdateState` 用的是 `state.iconSupplier`，不是 `ServiceInfo.icon`）。
-App 进程不枚举（没有 QSTile），只读 `ShortcutBridge`/`ShortcutCacheStore` 的缓存。
+**数据**：`ShortcutRepository.loadQsTiles()` 在 SystemUI 里用
+`Intent("android.service.quicksettings.action.QS_TILE")` + `queryIntentServices` 枚举**所有**
+`TileService`；图标优先合并 `MiuiQSHost.getTiles()` 里 live `QSTile` 的
+`state.iconSupplier`（反编译 `CustomTile.handleUpdateState` 的真实磁贴前景），没有 live 的退回
+`TILE_SERVICE_INFO` / `ServiceInfo` / 应用图标。每条是一个 `ShortcutItem(type = QS_TILE)`，
+`id` = 服务类名，键仍是 `pkg#class`。App 进程不枚举（没有 QSTile），只读
+`ShortcutBridge`/`ShortcutCacheStore` 的缓存。是否显示由更多应用面板的
+**「显示磁贴」**开关（`panel_show_tiles`，默认开）控制。
 
 **取色**：`ui/util/IconColors.kt` 移植 AppMarket 的 `dominantImageColor`：24×24 采样、
 跳过透明/近黑/近白、RGB 高 4 位分桶取最大桶均值、HSL 明度固定 0.45。底色在 SystemUI 扫描时
@@ -1347,6 +1349,7 @@ miuiQSHostAdapterProvider` 反射取，和联系人条的 Dagger 取法同一套
 - [ ] 点「管理」→ 磁贴右上角 ± → 点一下加入「已选功能」，页面当场生效
 - [ ] 划出扇形：已选磁贴作为 tile 出现在收藏应用/功能之后；点它执行对应磁贴动作
 - [ ] 面板里点磁贴直接执行；管理页（主页）点磁贴也能执行（经广播回到 SystemUI）
-- [ ] 没有加入控制中心的应用磁贴不出现；只显示控制中心里已有的那几枚；整机没有时只显示快捷方式
+- [ ] 功能页列出**所有**声明了 TileService 的应用磁贴（包括没加进控制中心的）；整机没有时只显示快捷方式
+- [ ] 更多应用面板 → 关闭「显示磁贴」：功能页里的磁贴全部消失、收藏区也不显示；再打开 → 磁贴回来
 - [ ] 取不到色的磁贴（纯白/纯透明图标）：圆底回退主题主色，不是透明或黑色
 - [ ] 磁贴动作失败时回退打开宿主应用（`QS_TILE_CLICK_FALLBACK_APP`），不是点了没反应

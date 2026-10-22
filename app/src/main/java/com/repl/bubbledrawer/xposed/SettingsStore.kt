@@ -105,6 +105,11 @@ object SettingsStore {
     /** 更多面板图标 dp / 文字 sp（0 = 布局默认）。 */
     fun setPanelIconDp(context: Context, dp: Int) = putInt(context, RemotePrefs.KEY_PANEL_ICON_DP, dp)
     fun setPanelTextSp(context: Context, sp: Int) = putInt(context, RemotePrefs.KEY_PANEL_TEXT_SP, sp)
+
+    /** 更多应用面板：功能页是否显示应用磁贴。 */
+    fun setPanelShowTiles(context: Context, enabled: Boolean) =
+        putBoolean(context, RemotePrefs.KEY_PANEL_SHOW_TILES, enabled)
+
     /** 更多面板点击外部收起方式（0 = 单击，1 = 双击）。 */
     fun setPanelDismissOutside(context: Context, mode: Int) = putInt(context, RemotePrefs.KEY_PANEL_DISMISS_OUTSIDE, mode.coerceIn(0, 1))
 

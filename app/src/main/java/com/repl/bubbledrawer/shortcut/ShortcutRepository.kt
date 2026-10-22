@@ -770,25 +770,138 @@ object ShortcutRepository {
     }
 
     /**
-     * 控制中心里的**应用磁贴**（`TileService`）。返回 [ShortcutType.QS_TILE] 条目，键仍是
-     * `pkg#id`，`id` 是服务类名，与快捷方式天然不会撞。
+     * 所有应用磁贴（`TileService`）。返回 [ShortcutType.QS_TILE] 条目，键仍是 `pkg#id`，
+     * `id` 是服务类名，与快捷方式天然不会撞。
      *
-     * 这里只取 `MiuiQSHost.getTiles()` 里**已经在控制中心里**的 live `QSTile`，原因见
-     * [com.repl.bubbledrawer.xposed.QsTileHost.currentTileItems]：反编译
-     * `CustomTile.handleUpdateState` 表明磁贴的真实 icon 是 `state.iconSupplier`（`Tile.getIcon()`），
-     * 不是 `ServiceInfo.icon`；后者经常是启动图标，会把磁贴画成「圆里套白色圆角矩形」。
+     * 枚举用 `queryIntentServices(QS_TILE)`，保证**没加进控制中心的磁贴也列出来**；图标优先合并
+     * [com.repl.bubbledrawer.xposed.QsTileHost.currentTileItems] 的 live `QSTile.State.iconSupplier`
+     * （反编译 `CustomTile.handleUpdateState` 的真实磁贴前景），没有 live 的退回
+     * `TILE_SERVICE_INFO` / `ServiceInfo` / 应用图标。
      *
-     * 不在控制中心里的 `TileService` 不列：要拿它们的真实 icon 必须逐个 bind（几十个
-     * `TileService` 会让 SystemUI 启动抖动，`TileServices.DEFAULT_MAX_BOUND` 也有上限），
-     * 而「应用磁贴」本来就是用户在控制中心里挑出来的那几枚。
+     * 是否显示由更多应用面板的「显示磁贴」开关控制（`panel_show_tiles`，默认开）。
      */
     private fun loadQsTiles(context: Context, seenKeys: MutableSet<String>): List<ShortcutItem> {
         // 只在 SystemUI 里做：App 进程看不到 QSTile，也没有 SystemUI 的 classloader。
         if (context.packageName != "com.android.systemui") return emptyList()
-        val items = com.repl.bubbledrawer.xposed.QsTileHost.currentTileItems(context)
-        val out = items.filter { seenKeys.add(it.pinKey) }
-        Log.i(TAG, "QS_TILE_SCAN count=${out.size} live=${items.size}")
-        return out
+        if (!SettingsStore.snapshot(context).panelShowTiles) {
+            Log.i(TAG, "QS_TILE_SCAN_SKIPPED show_tiles=false")
+            return emptyList()
+        }
+        val pm = context.packageManager
+        val live = com.repl.bubbledrawer.xposed.QsTileHost.currentTileItems(context)
+            .associateBy { it.pinKey }
+
+        @Suppress("DEPRECATION")
+        val resolved = runCatching {
+            pm.queryIntentServices(
+                Intent("android.service.quicksettings.action.QS_TILE"),
+                PackageManager.GET_META_DATA,
+            )
+        }.getOrNull().orEmpty()
+
+        val out = mutableListOf<ShortcutItem>()
+        for (resolveInfo in resolved) {
+            val si = resolveInfo.serviceInfo ?: continue
+            if (!si.enabled || si.applicationInfo?.enabled != true) continue
+            if (si.packageName == context.packageName) continue
+            val component = android.content.ComponentName(si.packageName, si.name)
+            val key = "${component.packageName}#${component.className}"
+            if (!seenKeys.add(key)) continue
+
+            val liveItem = live[key]
+            if (liveItem != null) {
+                out.add(
+                    liveItem.copy(
+                        subLabel = liveItem.subLabel ?: appLabelOf(pm, si.packageName),
+                    ),
+                )
+                continue
+            }
+
+            val appLabel = appLabelOf(pm, si.packageName)
+            val tileInfo = loadTileServiceInfo(pm, si)
+            val serviceLabel = tileInfo.first?.toString()
+                ?: runCatching { si.loadLabel(pm).toString() }.getOrNull()
+                    ?.takeIf { it.isNotBlank() && it != si.name && !it.contains('.') }
+            val label = serviceLabel ?: appLabel ?: component.className.substringAfterLast('.')
+            val icon = tileInfo.second
+                ?: runCatching { si.loadIcon(pm) }.getOrNull()
+                ?: runCatching { pm.getApplicationIcon(si.packageName) }.getOrNull()
+            val iconBitmap = icon?.let {
+                runCatching { drawableToBitmap(it, ShortcutBridge.ICON_MAX_PX) }.getOrNull()
+            }
+            // 只有透明前景才漂白；服务没声明 icon 退回应用图标时原样画（避免白色圆角方块）。
+            val tileForeground = iconBitmap != null &&
+                runCatching { isTransparentBitmap(iconBitmap) }.getOrDefault(false)
+            val tint = applicationIcon(context, si.packageName)?.let { appIcon ->
+                runCatching { com.repl.bubbledrawer.ui.util.IconColors.dominant(appIcon) }.getOrNull()
+            }
+            out.add(
+                ShortcutItem(
+                    id = component.className,
+                    packageName = component.packageName,
+                    label = label,
+                    subLabel = appLabel,
+                    type = ShortcutType.QS_TILE,
+                    iconBitmap = iconBitmap,
+                    tintColor = tint,
+                    tileForeground = tileForeground,
+                ),
+            )
+        }
+
+        // 反方向兜底：live 里有、query 没返回的（包可见性/服务被禁用的边缘情况）也保留。
+        for (item in live.values) {
+            if (seenKeys.add(item.pinKey)) out.add(item)
+        }
+        Log.i(TAG, "QS_TILE_SCAN count=${out.size} live=${live.size} resolved=${resolved.size}")
+        return out.sortedWith(compareBy({ it.subLabel.orEmpty() }, { it.label }))
+    }
+
+    private fun appLabelOf(pm: PackageManager, packageName: String): String? = runCatching {
+        pm.getApplicationLabel(pm.getApplicationInfo(packageName, 0)).toString()
+    }.getOrNull()?.ifBlank { null }
+
+    /**
+     * 读 `android.service.quicksettings.TILE_SERVICE_INFO` 指向的 XML（`<tile-service-info>`）。
+     * 不少应用只把磁贴的 label/icon 写在这里，service 本身没有 `android:label/icon`。
+     */
+    private fun loadTileServiceInfo(
+        pm: PackageManager,
+        si: android.content.pm.ServiceInfo,
+    ): Pair<CharSequence?, Drawable?> {
+        val metaRes = runCatching {
+            si.metaData?.getInt("android.service.quicksettings.TILE_SERVICE_INFO", 0)
+        }.getOrNull() ?: 0
+        if (metaRes == 0) return null to null
+        val parser = runCatching {
+            si.loadXmlMetaData(pm, "android.service.quicksettings.TILE_SERVICE_INFO")
+        }.getOrNull() ?: return null to null
+        return try {
+            var event = parser.eventType
+            while (event != XmlPullParser.END_DOCUMENT) {
+                if (event == XmlPullParser.START_TAG && parser.name == "tile-service-info") {
+                    val resources = runCatching {
+                        pm.getResourcesForApplication(si.packageName)
+                    }.getOrNull()
+                    val labelRes = parser.getAttributeResourceValue(ANDROID_NS, "label", 0)
+                    val iconRes = parser.getAttributeResourceValue(ANDROID_NS, "icon", 0)
+                    val label = if (labelRes != 0) {
+                        runCatching { resources?.getString(labelRes) }.getOrNull()
+                    } else null
+                    val icon = if (iconRes != 0) {
+                        runCatching { resources?.getDrawable(iconRes, null) }.getOrNull()
+                    } else null
+                    return label to icon
+                }
+                event = parser.next()
+            }
+            null to null
+        } catch (_: Exception) {
+            null to null
+        } finally {
+            runCatching { parser.close() }
+        }
     }
 
     /**
