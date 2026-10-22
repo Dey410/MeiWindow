@@ -1326,8 +1326,8 @@ firstVisibleItemScrollOffset == 0`）时展开收藏区，否则原样吞掉并�
 和该应用的快捷方式挨着。样式与快捷方式同为圆形（`PinManageScreen.QsTileCell`）：圆底填
 `tintColor`，前景取 `QSTile.State.iconSupplier` 的真实磁贴图标（`CustomTile.handleUpdateState`），
 先按透明包围盒归一化，再 `ColorFilter.tint(Color.White)` 全部漂白。
-归一化比例不是快捷方式的 0.62，而是反编译 `MiuiQSIconViewImpl` 里的
-`qs_tile_icon_size / qs_tile_icon_bg_size = 21.33 / 50.18 ≈ 0.425`。
+归一化比例按用户 2026-10-23 的实际效果要求用 **0.62**（与快捷方式一致；
+反编译 `MiuiQSIconViewImpl` 的 `qs_tile_icon_size / qs_tile_icon_bg_size = 21.33 / 50.18 ≈ 0.425` 仅作参考）。
 取不到色回退 `MiuixTheme.colorScheme.primary`；拿到的不是透明前景（应用图标兜底）则原样画、不漂白。
 
 **点击**：磁贴没有 Intent，必须回 SystemUI 走

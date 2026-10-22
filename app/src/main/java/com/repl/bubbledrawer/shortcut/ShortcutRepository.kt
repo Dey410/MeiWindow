@@ -827,10 +827,22 @@ object ShortcutRepository {
             val icon = tileInfo.second
                 ?: runCatching { si.loadIcon(pm) }.getOrNull()
                 ?: runCatching { pm.getApplicationIcon(si.packageName) }.getOrNull()
-            val iconBitmap = icon?.let {
+            val rawBitmap = icon?.let {
                 runCatching { drawableToBitmap(it, ShortcutBridge.ICON_MAX_PX) }.getOrNull()
             }
-            // 只有透明前景才漂白；服务没声明 icon 退回应用图标时原样画（避免白色圆角方块）。
+            // ServiceInfo/应用图标经常是启动图标（白色圆角矩形），不是磁贴前景。它是实底/不透明时，
+            // 去 `createTile` 取一次真正的 state.iconSupplier；拿不到才用原图兜底。
+            val rawIsForeground = rawBitmap != null &&
+                runCatching { isTransparentBitmap(rawBitmap) }.getOrDefault(false)
+            val realIcon = if (!rawIsForeground) {
+                runCatching {
+                    com.repl.bubbledrawer.xposed.QsTileHost.tileIconFor(context, component)
+                }.getOrNull()
+            } else null
+            val iconBitmap = realIcon?.let {
+                runCatching { drawableToBitmap(it, ShortcutBridge.ICON_MAX_PX) }.getOrNull()
+            } ?: rawBitmap
+            // 只有透明前景才漂白；应用图标兜底原样画（避免白色圆角方块）。
             val tileForeground = iconBitmap != null &&
                 runCatching { isTransparentBitmap(iconBitmap) }.getOrDefault(false)
             val tint = applicationIcon(context, si.packageName)?.let { appIcon ->
@@ -1002,12 +1014,10 @@ object ShortcutRepository {
     }
 
     /**
-     * 磁贴前景的归一化比例：反编译 `MiuiQSIconViewImpl` 里图标层大小是
-     * `R.dimen.qs_tile_icon_size`（21.33dp），底层背景是 `R.dimen.qs_tile_icon_bg_size`
-     * （50.18dp）—— 21.33 / 50.18 = **0.425**，不是快捷方式的 0.62。
-     * 这就是“参考 SystemUI 归一化”的具体数值。
+     * 磁贴前景的归一化比例：用户 2026-10-23 看过实际效果后要求「归一化还是用 0.62」，
+     * 所以与快捷方式统一用 0.62（反编译的 21.33/50.18≈0.425 只作参考，不再采用）。
      */
-    const val TILE_ICON_FRACTION = 0.425f
+    const val TILE_ICON_FRACTION = 0.62f
 
     /** 磁贴前景专用缓存：与快捷方式的 0.62 归一化分开，避免同一个 pinKey 互相顶掉。 */
     private val normalizedTileIcons = android.util.LruCache<String, Bitmap>(24)

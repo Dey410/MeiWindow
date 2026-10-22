@@ -365,10 +365,80 @@ object QsTileHost {
         return ok
     }
 
+    /**
+     * 为**不在控制中心里**的 `TileService` 取一次真实 icon（`CustomTile.handleUpdateState` 的
+     * `state.iconSupplier`）。只在 `ShortcutRepository.loadQsTiles` 发现 ServiceInfo icon 是
+     * 启动图标时调用；按 component 缓存，失败不缓存、下次再试。
+     *
+     * 这里确实会短暂 `createTile` + `setListening`（250ms），但只对非 live 的少数磁贴做；
+     * 不做的话它们只能显示 `ServiceInfo.icon`，也就是用户截图里那种「红色圆形里套白色圆角矩形」。
+     */
+    private val resolvedIcons = java.util.concurrent.ConcurrentHashMap<String, Drawable>()
+
+    fun tileIconFor(context: Context, component: ComponentName): Drawable? {
+        val key = component.flattenToShortString()
+        resolvedIcons[key]?.let { return it }
+        if (!ensure(context.classLoader)) return null
+        if (Looper.myLooper() == Looper.getMainLooper()) return null
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var result: Drawable? = null
+        Handler(Looper.getMainLooper()).post {
+            val h = host
+            if (h != null) {
+                val spec = "custom(${component.flattenToShortString()})"
+                val tile = runCatching {
+                    h.javaClass.getMethod("createTile", String::class.java).invoke(h, spec)
+                }.getOrNull()
+                if (tile != null) {
+                    runCatching {
+                        tile.javaClass.getMethod("setTileSpec", String::class.java).invoke(tile, spec)
+                    }
+                    val token = Any()
+                    runCatching {
+                        tile.javaClass.getMethod(
+                            "setListening",
+                            Any::class.java,
+                            Boolean::class.javaPrimitiveType,
+                        ).invoke(tile, token, true)
+                    }
+                    runCatching { tile.javaClass.getMethod("refreshState").invoke(tile) }
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        result = runCatching {
+                            val state = tile.javaClass.getMethod("getState").invoke(tile)
+                            stateIconDrawable(state, context)
+                        }.getOrNull()
+                        runCatching {
+                            tile.javaClass.getMethod(
+                                "setListening",
+                                Any::class.java,
+                                Boolean::class.javaPrimitiveType,
+                            ).invoke(tile, token, false)
+                        }
+                        runCatching { tile.javaClass.getMethod("destroy").invoke(tile) }
+                        latch.countDown()
+                    }, 400L)
+                } else {
+                    latch.countDown()
+                }
+            } else {
+                latch.countDown()
+            }
+        }
+        val finished = runCatching {
+            latch.await(600L, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }.getOrDefault(false)
+        if (finished && result != null) {
+            resolvedIcons[key] = result!!
+        }
+        Log.i(TAG, "QS_TILE_ICON spec=$key finished=$finished ok=${result != null}")
+        return result
+    }
+
     /** 热重载/SystemUI 重启时清掉上一代的句柄。 */
     fun reset() {
         host = null
         systemUiLoader = null
         lastResolveAt = 0L
+        resolvedIcons.clear()
     }
 }
