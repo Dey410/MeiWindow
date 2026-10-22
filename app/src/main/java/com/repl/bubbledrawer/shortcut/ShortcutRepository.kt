@@ -770,126 +770,25 @@ object ShortcutRepository {
     }
 
     /**
-     * 枚举应用磁贴（`TileService`）。返回的是 [ShortcutType.QS_TILE] 条目，键仍是 `pkg#id`，
-     * 但 `id` 是**服务类名**，这样 [ShortcutItem.pinKey] 与快捷方式天然不会撞。
+     * 控制中心里的**应用磁贴**（`TileService`）。返回 [ShortcutType.QS_TILE] 条目，键仍是
+     * `pkg#id`，`id` 是服务类名，与快捷方式天然不会撞。
      *
-     * 只读 `ServiceInfo` 的 label/icon，不在这里 `createTile`：一次扫描几十个磁贴，每个都去
-     * bind 一遍 `TileService` 会让 SystemUI 在启动时抖动；真正的绑定只发生在点击那一刻
-     * （[com.repl.bubbledrawer.xposed.QsTileHost]）。
+     * 这里只取 `MiuiQSHost.getTiles()` 里**已经在控制中心里**的 live `QSTile`，原因见
+     * [com.repl.bubbledrawer.xposed.QsTileHost.currentTileItems]：反编译
+     * `CustomTile.handleUpdateState` 表明磁贴的真实 icon 是 `state.iconSupplier`（`Tile.getIcon()`），
+     * 不是 `ServiceInfo.icon`；后者经常是启动图标，会把磁贴画成「圆里套白色圆角矩形」。
      *
-     * 底色用**宿主应用图标**算，不用磁贴自己的图标：控制中心磁贴图标大量是白色单色图形，
-     * 拿它取色会全部变成同一个灰白。应用图标才是用户在桌面上认得出的那张脸。
+     * 不在控制中心里的 `TileService` 不列：要拿它们的真实 icon 必须逐个 bind（几十个
+     * `TileService` 会让 SystemUI 启动抖动，`TileServices.DEFAULT_MAX_BOUND` 也有上限），
+     * 而「应用磁贴」本来就是用户在控制中心里挑出来的那几枚。
      */
     private fun loadQsTiles(context: Context, seenKeys: MutableSet<String>): List<ShortcutItem> {
-        // 只在 SystemUI 里枚举：App 进程受包可见性限制，queryIntentServices 会给一份**残缺**的
-        // 磁贴清单；那份清单一旦被当成「完整枚举」写进缓存，用户就会看到少了一半磁贴。
-        // App 侧永远读 SystemUI 上报的缓存（与快捷方式同一条路）。
+        // 只在 SystemUI 里做：App 进程看不到 QSTile，也没有 SystemUI 的 classloader。
         if (context.packageName != "com.android.systemui") return emptyList()
-        val pm = context.packageManager
-        @Suppress("DEPRECATION")
-        val resolved = runCatching {
-            pm.queryIntentServices(
-                Intent("android.service.quicksettings.action.QS_TILE"),
-                PackageManager.GET_META_DATA,
-            )
-        }.getOrNull().orEmpty()
-
-        val out = mutableListOf<ShortcutItem>()
-        for (resolveInfo in resolved) {
-            val si = resolveInfo.serviceInfo ?: continue
-            if (!si.enabled || si.applicationInfo?.enabled != true) continue
-            if (si.packageName == context.packageName) continue
-
-            val component = android.content.ComponentName(si.packageName, si.name)
-            val id = component.className
-            val key = "${si.packageName}#$id"
-            if (!seenKeys.add(key)) continue
-
-            val appLabel = runCatching {
-                si.applicationInfo?.let { pm.getApplicationLabel(it).toString() }
-            }.getOrNull()?.ifBlank { null }
-            // 磁贴自己的 label/icon 可能只写在 TILE_SERVICE_INFO 的 XML 里（AOSP 推荐写法），
-            // ServiceInfo.loadLabel/loadIcon 读不到；先读 meta-data，再退回 service，再退回应用。
-            val tileInfo = loadTileServiceInfo(pm, si)
-            val serviceLabel = tileInfo.first?.toString()
-                ?: runCatching { si.loadLabel(pm).toString() }.getOrNull()
-                    ?.takeIf { it.isNotBlank() && it != si.name && !it.contains('.') }
-            val label = serviceLabel ?: appLabel ?: id.substringAfterLast('.')
-
-            // 服务没有声明 icon 时 `loadIcon` 会退回应用图标，那**不是**磁贴前景：
-            // 此时 tileForeground = false，UI 原样画应用图标，不做漂白/归一化。
-            val declaredIcon = tileInfo.second != null || si.icon != 0
-            val icon = tileInfo.second
-                ?: runCatching { si.loadIcon(pm) }.getOrNull()
-                ?: runCatching { pm.getApplicationIcon(si.packageName) }.getOrNull()
-            val iconBitmap = icon?.let {
-                runCatching { drawableToBitmap(it, ShortcutBridge.ICON_MAX_PX) }.getOrNull()
-            }
-
-            // 取色失败（全透明/单色/近白）是正常情况：tint 留空，UI 回退主题 surfaceVariant。
-            val tint = applicationIcon(context, si.packageName)?.let { appIcon ->
-                runCatching { com.repl.bubbledrawer.ui.util.IconColors.dominant(appIcon) }.getOrNull()
-            }
-
-            out.add(
-                ShortcutItem(
-                    id = id,
-                    packageName = si.packageName,
-                    label = label,
-                    subLabel = appLabel,
-                    type = ShortcutType.QS_TILE,
-                    iconBitmap = iconBitmap,
-                    tintColor = tint,
-                    tileForeground = declaredIcon,
-                ),
-            )
-        }
-        Log.i(TAG, "QS_TILE_SCAN count=${out.size} resolved=${resolved.size}")
-        return out.sortedWith(compareBy({ it.subLabel.orEmpty() }, { it.label }))
-    }
-
-    /**
-     * 读 `android.service.quicksettings.TILE_SERVICE_INFO` 指向的 XML（`<tile-service-info>`）。
-     *
-     * 不少应用只把磁贴的 label/icon 写在这里，service 本身没有 `android:label/icon`；只看
-     * `ServiceInfo` 会把磁贴名显示成服务类名。解析失败一律返回空对，调用方按 service/应用兜底。
-     */
-    private fun loadTileServiceInfo(
-        pm: PackageManager,
-        si: android.content.pm.ServiceInfo,
-    ): Pair<CharSequence?, Drawable?> {
-        val metaRes = runCatching {
-            si.metaData?.getInt("android.service.quicksettings.TILE_SERVICE_INFO", 0)
-        }.getOrNull() ?: 0
-        if (metaRes == 0) return null to null
-        val parser = runCatching {
-            si.loadXmlMetaData(pm, "android.service.quicksettings.TILE_SERVICE_INFO")
-        }.getOrNull() ?: return null to null
-        return try {
-            var event = parser.eventType
-            while (event != XmlPullParser.END_DOCUMENT) {
-                if (event == XmlPullParser.START_TAG && parser.name == "tile-service-info") {
-                    val resources = runCatching {
-                        pm.getResourcesForApplication(si.packageName)
-                    }.getOrNull()
-                    val labelRes = parser.getAttributeResourceValue(ANDROID_NS, "label", 0)
-                    val iconRes = parser.getAttributeResourceValue(ANDROID_NS, "icon", 0)
-                    val label = if (labelRes != 0) {
-                        runCatching { resources?.getString(labelRes) }.getOrNull()
-                    } else null
-                    val icon = if (iconRes != 0) {
-                        runCatching { resources?.getDrawable(iconRes, null) }.getOrNull()
-                    } else null
-                    return label to icon
-                }
-                event = parser.next()
-            }
-            null to null
-        } catch (_: Exception) {
-            null to null
-        } finally {
-            runCatching { parser.close() }
-        }
+        val items = com.repl.bubbledrawer.xposed.QsTileHost.currentTileItems(context)
+        val out = items.filter { seenKeys.add(it.pinKey) }
+        Log.i(TAG, "QS_TILE_SCAN count=${out.size} live=${items.size}")
+        return out
     }
 
     /**
@@ -987,6 +886,49 @@ object ShortcutRepository {
             .getOrDefault(bitmap)
         normalizedIcons.put(item.pinKey, normalized)
         return normalized
+    }
+
+    /**
+     * 磁贴前景的归一化比例：反编译 `MiuiQSIconViewImpl` 里图标层大小是
+     * `R.dimen.qs_tile_icon_size`（21.33dp），底层背景是 `R.dimen.qs_tile_icon_bg_size`
+     * （50.18dp）—— 21.33 / 50.18 = **0.425**，不是快捷方式的 0.62。
+     * 这就是“参考 SystemUI 归一化”的具体数值。
+     */
+    const val TILE_ICON_FRACTION = 0.425f
+
+    /** 磁贴前景专用缓存：与快捷方式的 0.62 归一化分开，避免同一个 pinKey 互相顶掉。 */
+    private val normalizedTileIcons = android.util.LruCache<String, Bitmap>(24)
+
+    fun normalizedTileForeground(item: ShortcutItem, bitmap: Bitmap): Bitmap {
+        normalizedTileIcons.get(item.pinKey)?.let { return it }
+        val normalized = runCatching {
+            normalizeTransparentForeground(bitmap, 192, TILE_ICON_FRACTION)
+        }.getOrDefault(bitmap)
+        normalizedTileIcons.put(item.pinKey, normalized)
+        return normalized
+    }
+
+    /**
+     * 位图里有没有可见像素（alpha > 8）。用于兜底：某些 TileService 的 icon 是全透明占位，
+     * 归一化/漂白之后就是一张空图，界面上看起来“所有图标都不显示”。此时 UI 退回应用图标
+     * 或首字。
+     */
+    fun hasVisiblePixels(bitmap: Bitmap): Boolean {
+        if (bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0) return false
+        if (bitmap.config == Bitmap.Config.HARDWARE) return true
+        if (!bitmap.hasAlpha()) return true
+        val stepX = (bitmap.width / 16).coerceAtLeast(1)
+        val stepY = (bitmap.height / 16).coerceAtLeast(1)
+        var y = 0
+        while (y < bitmap.height) {
+            var x = 0
+            while (x < bitmap.width) {
+                if (android.graphics.Color.alpha(bitmap.getPixel(x, y)) > 8) return true
+                x += stepX
+            }
+            y += stepY
+        }
+        return false
     }
 
     /**

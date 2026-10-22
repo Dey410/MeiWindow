@@ -1835,29 +1835,59 @@ private fun TileGlyphIcon(
     ) {
         if (bitmap != null) {
             if (item.tileForeground) {
-                // 归一化会新建一张 192px 图并按 pinKey 缓存（ShortcutRepository normalizedIcons），
+                // 归一化会新建一张 192px 图并按 pinKey 缓存（ShortcutRepository normalizedTileIcons），
                 // 滚出/滚回来不会每次重算。前景统一漂白：SystemUI 控制中心磁贴就是这么画的。
                 val normalized = remember(bitmap) {
-                    ShortcutRepository.normalizedForeground(item, bitmap)
+                    ShortcutRepository.normalizedTileForeground(item, bitmap)
                 }
-                Image(
-                    bitmap = normalized.asImageBitmap(),
-                    contentDescription = item.label,
-                    colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(Color.White),
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Fit,
-                )
+                val visible = remember(normalized) {
+                    ShortcutRepository.hasVisiblePixels(normalized)
+                }
+                if (visible) {
+                    Image(
+                        bitmap = normalized.asImageBitmap(),
+                        contentDescription = item.label,
+                        colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(Color.White),
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit,
+                    )
+                } else {
+                    TileInitial(item.label, size)
+                }
             } else {
                 // 没有声明磁贴 icon：这是应用图标兜底，不是磁贴前景；原样画，别漂成白块。
-                Image(
-                    bitmap = bitmap.asImageBitmap(),
-                    contentDescription = item.label,
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Fit,
-                )
+                // 尺寸仍按 SystemUI 的 qs_tile_icon_size / qs_tile_icon_bg_size = 21.33/50.18
+                // 缩到圆心的 42.5%，不要铺满整个圆。
+                val visible = remember(bitmap) {
+                    ShortcutRepository.hasVisiblePixels(bitmap)
+                }
+                if (visible) {
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = item.label,
+                        modifier = Modifier.size(size * ShortcutRepository.TILE_ICON_FRACTION),
+                        contentScale = ContentScale.Fit,
+                    )
+                } else {
+                    TileInitial(item.label, size)
+                }
             }
+        } else {
+            TileInitial(item.label, size)
         }
     }
+}
+
+/** 连应用图标都拿不到时的兜底：圆底上画磁贴名称首字，绝不出现“空圆”。 */
+@Composable
+private fun TileInitial(label: String, size: Dp) {
+    Text(
+        text = label.take(1),
+        color = Color.White,
+        fontSize = (size.value * 0.36f).sp,
+        fontWeight = FontWeight.Medium,
+        maxLines = 1,
+    )
 }
 
 @Composable

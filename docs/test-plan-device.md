@@ -1309,10 +1309,12 @@ firstVisibleItemScrollOffset == 0`）时展开收藏区，否则原样吞掉并�
 **需求**：功能页除了快捷方式，还显示控制中心那批「应用磁贴」；磁贴底色用应用图标取色
 （对齐 AppMarket `ui/util/ImageColors.kt` 的 `dominantImageColor`）。
 
-**数据**：`ShortcutRepository.loadQsTiles()` 在 SystemUI 里用
-`Intent("android.service.quicksettings.action.QS_TILE")` + `queryIntentServices` 枚举；
+**数据**：`ShortcutRepository.loadQsTiles()` 在 SystemUI 里取
+`MiuiQSHost.getTiles()` 中**已经在控制中心里的** `custom(pkg/cls)` live `QSTile`；
 每条是一个 `ShortcutItem(type = QS_TILE)`，`id` = 服务类名，键仍是 `pkg#class`。
-App 进程不枚举（包可见性会给残缺清单），只读 `ShortcutBridge`/`ShortcutCacheStore` 的缓存。
+没有加进控制中心的 `TileService` 不列 —— 它们的真实 icon 必须逐个 bind 才能拿到
+（`CustomTile.handleUpdateState` 用的是 `state.iconSupplier`，不是 `ServiceInfo.icon`）。
+App 进程不枚举（没有 QSTile），只读 `ShortcutBridge`/`ShortcutCacheStore` 的缓存。
 
 **取色**：`ui/util/IconColors.kt` 移植 AppMarket 的 `dominantImageColor`：24×24 采样、
 跳过透明/近黑/近白、RGB 高 4 位分桶取最大桶均值、HSL 明度固定 0.45。底色在 SystemUI 扫描时
@@ -1320,9 +1322,11 @@ App 进程不枚举（包可见性会给残缺清单），只读 `ShortcutBridge
 
 **展示**：磁贴按**宿主应用**并入快捷方式分组（`PinManageModel.groupedFunctions`），组内排第一，
 和该应用的快捷方式挨着。样式与快捷方式同为圆形（`PinManageScreen.QsTileCell`）：圆底填
-`tintColor`，前景是磁贴 icon —— 先按透明包围盒归一化（`normalizedForeground`），再
-`ColorFilter.tint(Color.White)` 全部漂白，和 SystemUI 控制中心磁贴的画法一致。取不到色回退
-`MiuixTheme.colorScheme.primary`；拿到的不是透明前景（应用图标兜底）则原样画，不漂白。
+`tintColor`，前景取 `QSTile.State.iconSupplier` 的真实磁贴图标（`CustomTile.handleUpdateState`），
+先按透明包围盒归一化，再 `ColorFilter.tint(Color.White)` 全部漂白。
+归一化比例不是快捷方式的 0.62，而是反编译 `MiuiQSIconViewImpl` 里的
+`qs_tile_icon_size / qs_tile_icon_bg_size = 21.33 / 50.18 ≈ 0.425`。
+取不到色回退 `MiuixTheme.colorScheme.primary`；拿到的不是透明前景（应用图标兜底）则原样画、不漂白。
 
 **点击**：磁贴没有 Intent，必须回 SystemUI 走
 `MiuiQSHost.createTile("custom(pkg/cls)").click()`（`QsTileHost`，句柄从
@@ -1343,6 +1347,6 @@ miuiQSHostAdapterProvider` 反射取，和联系人条的 Dagger 取法同一套
 - [ ] 点「管理」→ 磁贴右上角 ± → 点一下加入「已选功能」，页面当场生效
 - [ ] 划出扇形：已选磁贴作为 tile 出现在收藏应用/功能之后；点它执行对应磁贴动作
 - [ ] 面板里点磁贴直接执行；管理页（主页）点磁贴也能执行（经广播回到 SystemUI）
-- [ ] 没有 TileService 的应用不出现空分组；整机没有磁贴时只显示快捷方式
+- [ ] 没有加入控制中心的应用磁贴不出现；只显示控制中心里已有的那几枚；整机没有时只显示快捷方式
 - [ ] 取不到色的磁贴（纯白/纯透明图标）：圆底回退主题主色，不是透明或黑色
 - [ ] 磁贴动作失败时回退打开宿主应用（`QS_TILE_CLICK_FALLBACK_APP`），不是点了没反应
