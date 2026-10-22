@@ -143,31 +143,17 @@ class PinManageModel(
         functionSortKeys.getOrPut(appName) { com.repl.bubbledrawer.pinyin.AppSortKey.of(appName) }
 
     /**
-     * 「应用磁贴」= 控制中心 `TileService` 条目。单独一段画在功能页顶部，不混进下面的
-     * 快捷方式分组：磁贴的图标/底色/点击语义都和快捷方式不同（见 [ShortcutType.QS_TILE]）。
+     * 需求 5：以应用名称为小标题作为分类，应用名称使用拼音排序。
+     *
+     * 应用磁贴（[com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE]）**按宿主应用分进同一组**，
+     * 和该应用的快捷方式一起排：磁贴是应用级入口，排在组内第一条；后面是它的快捷方式。
+     * 用户 2026-10-22：「磁贴按应用分到快捷方式里一起排列」。
      */
-    val tileItems: List<com.repl.bubbledrawer.shortcut.ShortcutItem>
-        get() = allShortcuts.filter { it.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE }
-
-    /** 搜索框对磁贴也生效：按磁贴名 / 宿主应用名过滤。 */
-    val searchedTiles: List<com.repl.bubbledrawer.shortcut.ShortcutItem>
-        get() {
-            val query = if (isSearching) searchQuery.trim() else ""
-            if (query.isEmpty()) return tileItems
-            return tileItems.filter {
-                it.label.contains(query, ignoreCase = true) ||
-                    it.subLabel?.contains(query, ignoreCase = true) == true
-            }
-        }
-
-    /** 需求 5：以应用名称为小标题作为分类，应用名称使用拼音排序 */
     val groupedFunctions: List<AppFunctionGroup>
         get() {
             val query = if (isSearching) searchQuery.trim() else ""
             val groups = mutableMapOf<String, MutableList<com.repl.bubbledrawer.shortcut.ShortcutItem>>()
             for (item in allShortcuts) {
-                // 磁贴单独一段（见 tileItems），不再按宿主应用混进快捷方式分组。
-                if (item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) continue
                 val appName = item.subLabel?.ifBlank { null } ?: item.label
                 if (query.isNotEmpty() && !item.label.contains(query, ignoreCase = true) && !appName.contains(query, ignoreCase = true)) {
                     continue
@@ -178,7 +164,10 @@ class PinManageModel(
                 AppFunctionGroup(
                     appName = appName,
                     sortKey = functionSortKey(appName),
-                    items = items,
+                    // 稳定排序：只把磁贴提到组内第一，快捷方式之间的原有顺序不变。
+                    items = items.sortedWith(
+                        compareBy { if (it.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) 0 else 1 },
+                    ),
                 )
             }.sortedBy { it.sortKey }
         }

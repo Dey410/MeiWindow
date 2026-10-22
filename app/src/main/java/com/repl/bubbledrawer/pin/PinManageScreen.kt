@@ -58,7 +58,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.toArgb
@@ -528,7 +527,6 @@ fun PinManageScreen(
                         }
                     } else {
                         // 功能页：以应用名称为小标题作为分类，应用名称使用拼音排序 (小标题样式与 A-Z 一致)
-                        val tiles = if (model.isSearching) model.searchedTiles else model.tileItems
                         LazyVerticalGrid(
                             columns = GridCells.Fixed(gridSpan),
                             state = fnsGridState,
@@ -543,35 +541,8 @@ fun PinManageScreen(
                                 bottom = topContentPadding + 16.dp,
                             ),
                         ) {
-                            // 「应用磁贴」单独一段：底色/点击语义都与快捷方式不同（见 QsTileCell）。
-                            // 放在所有应用分组之前 —— 它是这一页最像「磁贴」的部分，也最先被看到。
-                            if (tiles.isNotEmpty()) {
-                                item(key = "qs_tiles_header", span = { GridItemSpan(gridSpan) }) {
-                                    LabelRow(stringResource(R.string.qs_tiles_section))
-                                }
-                                items(
-                                    items = tiles,
-                                    key = { "qs_tile_${it.pinKey}" },
-                                    span = { GridItemSpan(1) },
-                                ) { item ->
-                                    QsTileCell(
-                                        item = item,
-                                        iconDp = iconDp,
-                                        textSp = textSp,
-                                        showBadge = model.manageMode,
-                                        isPinned = model.isFunctionPinned(item),
-                                        onTap = {
-                                            if (model.manageMode) {
-                                                model.toggleFunctionPin(item)
-                                            } else {
-                                                onLaunchShortcut?.invoke(item)
-                                            }
-                                        },
-                                    )
-                                }
-                            }
                             // 功能页原本没有任何空态：读不到快捷方式时整页是白的，连"在加载"都看不出来。
-                            if (model.groupedFunctions.isEmpty() && tiles.isEmpty()) {
+                            if (model.groupedFunctions.isEmpty()) {
                                 item(key = "functions_empty", span = { GridItemSpan(gridSpan) }) {
                                     EmptyHintRow(stringResource(R.string.functions_catalog_empty))
                                 }
@@ -585,24 +556,38 @@ fun PinManageScreen(
                                     key = { "group_fn_${group.appName}_${it.pinKey}" },
                                     span = { GridItemSpan(1) },
                                 ) { item ->
-                                    ShortcutCell(
-                                        item = item,
-                                        iconDp = iconDp,
-                                        textSp = textSp,
-                                        onTap = {
-                                            if (model.manageMode) {
-                                                model.toggleFunctionPin(item)
-                                            } else {
-                                                onLaunchShortcut?.invoke(item)
-                                            }
-                                        },
-                                        showAppBadge = false,
-                                        showBadge = model.manageMode,
-                                        isPinned = model.isFunctionPinned(item),
-                                    )
+                                    val onTap: () -> Unit = {
+                                        if (model.manageMode) {
+                                            model.toggleFunctionPin(item)
+                                        } else {
+                                            onLaunchShortcut?.invoke(item)
+                                        }
+                                    }
+                                    // 同一组里磁贴用圆形取色样式，快捷方式保持原样；两者的
+                                    // 收藏/启动回调完全一致，所以只分渲染，不分交互。
+                                    if (item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) {
+                                        QsTileCell(
+                                            item = item,
+                                            iconDp = iconDp,
+                                            textSp = textSp,
+                                            showBadge = model.manageMode,
+                                            isPinned = model.isFunctionPinned(item),
+                                            onTap = onTap,
+                                        )
+                                    } else {
+                                        ShortcutCell(
+                                            item = item,
+                                            iconDp = iconDp,
+                                            textSp = textSp,
+                                            onTap = onTap,
+                                            showAppBadge = false,
+                                            showBadge = model.manageMode,
+                                            isPinned = model.isFunctionPinned(item),
+                                        )
+                                    }
                                 }
                             }
-                            if (model.groupedFunctions.isNotEmpty() || tiles.isNotEmpty()) {
+                            if (model.groupedFunctions.isNotEmpty()) {
                                 item(key = "bottom_fns", span = { GridItemSpan(gridSpan) }) { PageBottomSpacer() }
                             }
                         }
@@ -910,21 +895,35 @@ private fun SharedPinsSection(
                                         )
                                     }
                                     is PinnedEntry.Function -> {
-                                        ShortcutCell(
-                                            item = entry.item,
-                                            iconDp = iconDp,
-                                            textSp = textSp,
-                                            onTap = {
-                                                if (model.manageMode) {
-                                                    model.toggleFunctionPin(entry.item)
-                                                } else {
-                                                    onLaunchShortcut?.invoke(entry.item)
-                                                }
-                                            },
-                                            showAppBadge = true, // 需求 6: 收藏的功能左下角显示所属应用图标
-                                            showBadge = model.manageMode,
-                                            isPinned = true,
-                                        )
+                                        val onTap: () -> Unit = {
+                                            if (model.manageMode) {
+                                                model.toggleFunctionPin(entry.item)
+                                            } else {
+                                                onLaunchShortcut?.invoke(entry.item)
+                                            }
+                                        }
+                                        // 已选区的磁贴也保持圆形取色样式：透明白色磁贴图标如果走
+                                        // ShortcutCell 会被垫到浅色底上，直接看不见。
+                                        if (entry.item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) {
+                                            QsTileCell(
+                                                item = entry.item,
+                                                iconDp = iconDp,
+                                                textSp = textSp,
+                                                showBadge = model.manageMode,
+                                                isPinned = true,
+                                                onTap = onTap,
+                                            )
+                                        } else {
+                                            ShortcutCell(
+                                                item = entry.item,
+                                                iconDp = iconDp,
+                                                textSp = textSp,
+                                                onTap = onTap,
+                                                showAppBadge = true, // 需求 6: 收藏的功能左下角显示所属应用图标
+                                                showBadge = model.manageMode,
+                                                isPinned = true,
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -1730,11 +1729,16 @@ private fun ShortcutCell(
 }
 
 /**
- * 「应用磁贴」单元格：底色来自图标取色（[ShortcutItem.tintColor]），图标下垫一层 90% 白圆，
- * 保证白色单色磁贴图标在浅色底上也看得见。
+ * 「应用磁贴」单元格：**和快捷方式同一种圆形样式**，圆内填图标取色（[ShortcutItem.tintColor]）。
  *
- * 为什么整格都铺色而不是只给图标垫一块：控制中心的磁贴本来就是「有底色的一块」，这样才像
- * 磁贴而不是普通应用图标。文字颜色按底色 luminance 自动黑/白。
+ * 磁贴只有前景（`TileService` 的 icon 通常是透明底单色图形），所以渲染分两步：
+ *  1. **归一化**：裁掉透明边、按包围盒等比缩到圆心，复用 [ShortcutRepository.normalizedForeground]
+ *     （与快捷方式透明图标同一套 `normalizeTransparentForeground`）；
+ *  2. **漂白**：`ColorFilter.tint(Color.White)`，无论原图标是白/彩/灰，统一成白色前景 ——
+ *     这是 SystemUI 控制中心磁贴的画法，也保证深色圆底上看得清。
+ *
+ * 如果拿到的根本不是透明前景（服务没有 icon，退回成了应用图标），就不漂白、原样画：
+ * 把一张彩色应用图标漂成白块比不漂更糟。
  */
 @Composable
 private fun QsTileCell(
@@ -1747,45 +1751,24 @@ private fun QsTileCell(
 ) {
     val iconSize = (if (iconDp > 0) iconDp else 50).dp
     val titleSp = if (textSp > 0) textSp else 12
-    val tint = item.tintColor?.let { Color(it) } ?: MiuixTheme.colorScheme.surfaceVariant
-    val contentColor = if (tint.luminance() > 0.55f) {
-        Color.Black.copy(alpha = 0.86f)
-    } else {
-        Color.White
-    }
-    // 磁贴图标大量是白色单色图形：底板不能再垫白色，否则图标直接消失。按前景明暗反过来垫。
-    val lightIcon = remember(item.pinKey) {
-        item.iconBitmap?.let { bitmap ->
-            runCatching { ShortcutRepository.isLightForeground(bitmap) }.getOrDefault(false)
-        } ?: false
-    }
-    val iconPlate = if (lightIcon) Color.Black.copy(alpha = 0.28f) else Color.White.copy(alpha = 0.90f)
+    val tint = item.tintColor?.let { Color(it) } ?: MiuixTheme.colorScheme.primary
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 3.dp, vertical = 4.dp)
-            .clip(RoundedCornerShape(14.dp))
-            .background(tint)
+            .clip(RoundedCornerShape(8.dp))
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
                 onClick = onTap,
             )
-            .padding(vertical = 10.dp),
+            .padding(vertical = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Box {
-            Box(
-                modifier = Modifier
-                    .size(iconSize)
-                    .clip(CircleShape)
-                    .background(iconPlate),
-            )
-            ShortcutIcon(
+            TileGlyphIcon(
                 item = item,
                 size = iconSize,
-                showAppBadge = false,
-                plateColor = iconPlate,
+                tint = tint,
             )
             if (showBadge) {
                 Image(
@@ -1803,12 +1786,80 @@ private fun QsTileCell(
         }
         Text(
             text = item.label,
-            modifier = Modifier.padding(top = 8.dp, start = 4.dp, end = 4.dp),
-            color = contentColor,
+            modifier = Modifier.padding(top = 10.dp, start = 4.dp, end = 4.dp),
+            color = MiuixTheme.colorScheme.onSurface,
             fontSize = titleSp.sp,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+    }
+}
+
+/**
+ * 磁贴圆形图标：圆底 = 取色；前景 = 磁贴 icon（透明前景归一化 + 漂白）。
+ *
+ * 图标来源优先级与 [ShortcutIcon] 一致：`ShortcutItem.iconBitmap` → `iconDrawable` → 异步
+ * 应用图标。前两者由 SystemUI 扫描时带回；第三方进程的管理页只有缓存里的 bitmap。
+ */
+@Composable
+private fun TileGlyphIcon(
+    item: ShortcutItem,
+    size: Dp,
+    tint: Color,
+) {
+    val context = LocalContext.current
+    var fallbackBmp by remember(item.packageName, item.id) {
+        mutableStateOf<android.graphics.Bitmap?>(null)
+    }
+    val drawableBmp = remember(item.iconDrawable) {
+        item.iconDrawable?.let {
+            runCatching { ShortcutRepository.drawableToBitmap(it, ShortcutBridge.ICON_MAX_PX) }.getOrNull()
+        }
+    }
+    val raw = item.iconBitmap ?: drawableBmp
+    if (raw == null && fallbackBmp == null && item.packageName.isNotEmpty()) {
+        LaunchedEffect(item.packageName) {
+            fallbackBmp = withContext(Dispatchers.IO) {
+                ShortcutRepository.applicationIcon(context, item.packageName)
+            }
+        }
+    }
+    val bitmap = raw ?: fallbackBmp
+
+    Box(
+        modifier = Modifier
+            .size(size)
+            .clip(CircleShape)
+            .background(tint),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (bitmap != null) {
+            val transparent = remember(bitmap) {
+                runCatching { ShortcutRepository.isTransparentBitmap(bitmap) }.getOrDefault(false)
+            }
+            if (transparent) {
+                // 归一化会新建一张 192px 图并按 pinKey 缓存（ShortcutRepository normalizedIcons），
+                // 滚出/滚回来不会每次重算。
+                val normalized = remember(bitmap) {
+                    ShortcutRepository.normalizedForeground(item, bitmap)
+                }
+                Image(
+                    bitmap = normalized.asImageBitmap(),
+                    contentDescription = item.label,
+                    colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(Color.White),
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Fit,
+                )
+            } else {
+                // 没有透明前景：这是应用图标兜底，不是磁贴图形；原样画，别漂成白块。
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = item.label,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Fit,
+                )
+            }
+        }
     }
 }
 
@@ -1817,11 +1868,6 @@ private fun ShortcutIcon(
     item: ShortcutItem,
     size: Dp,
     showAppBadge: Boolean = false,
-    /**
-     * 透明底图标的底座颜色覆盖。磁贴格子里底色本身已经是取色，不能再让 `surfaceVariant`
-     * 盖上去（白色单色磁贴图标会直接消失）；普通快捷方式传 null，保持原行为。
-     */
-    plateColor: Color? = null,
 ) {
     val context = LocalContext.current
     var fallbackBmp by remember(item.packageName, item.id) { mutableStateOf<android.graphics.Bitmap?>(null) }
@@ -1866,7 +1912,7 @@ private fun ShortcutIcon(
                 val normalizedBmp = remember(activeBmp) {
                     ShortcutRepository.normalizedForeground(item, activeBmp)
                 }
-                val plateBg = plateColor ?: if (isLight) {
+                val plateBg = if (isLight) {
                     MiuixTheme.colorScheme.surfaceVariant
                 } else {
                     Color.White

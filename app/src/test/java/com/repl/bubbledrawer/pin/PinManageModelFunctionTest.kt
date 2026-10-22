@@ -81,6 +81,15 @@ class PinManageModelFunctionTest {
         type = ShortcutType.DESKTOP_PINNED,
     )
 
+    private val wechatTile = ShortcutItem(
+        id = "com.tencent.mm/.TileService",
+        packageName = "com.tencent.mm",
+        label = "微信磁贴",
+        subLabel = "微信",
+        type = ShortcutType.QS_TILE,
+        tintColor = 0xFF22AA55.toInt(),
+    )
+
     private fun model(
         functionPinsOf: () -> List<String> = { emptyList() },
         pinnedFunctionItems: () -> List<ShortcutItem> = { emptyList() },
@@ -174,6 +183,21 @@ class PinManageModelFunctionTest {
             "分组必须按拼音排序",
             groups.map { it.appName }.indexOf("微信") < groups.map { it.appName }.indexOf("支付宝"),
         )
+    }
+
+    @Test
+    fun tilesJoinTheirAppGroupAndComeFirst() {
+        val model = model()
+        injectShortcuts(model, listOf(wechatScan, alipayScan, wechatPay, wechatTile))
+
+        val wechat = model.groupedFunctions.first { it.appName == "微信" }
+        assertEquals(
+            "磁贴按宿主应用并入快捷方式组，并排在组内第一条；快捷方式之间顺序不变",
+            listOf("微信磁贴", "扫一扫", "收付款"),
+            wechat.items.map { it.label },
+        )
+        // 磁贴不能被丢进单独的分组，也不能复制到别的应用下。
+        assertEquals(1, model.groupedFunctions.count { group -> group.items.any { it.type == ShortcutType.QS_TILE } })
     }
 
     @Test

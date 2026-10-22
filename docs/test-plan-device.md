@@ -1318,9 +1318,11 @@ App 进程不枚举（包可见性会给残缺清单），只读 `ShortcutBridge
 跳过透明/近黑/近白、RGB 高 4 位分桶取最大桶均值、HSL 明度固定 0.45。底色在 SystemUI 扫描时
 用**宿主应用图标**算好，存 `ShortcutItem.tintColor`，随 JSON / `FunctionPinDetails` 过桥。
 
-**展示**：功能页顶部新增「应用磁贴」段（`PinManageScreen.QsTileCell`）。整格铺 `tintColor`；
-图标下垫白/黑圆底（按 `isLightForeground` 自动反过来）保证白色单色磁贴图标可见；文字颜色按
-底色 luminance 自动黑/白。取不到色回退 `surfaceVariant`。
+**展示**：磁贴按**宿主应用**并入快捷方式分组（`PinManageModel.groupedFunctions`），组内排第一，
+和该应用的快捷方式挨着。样式与快捷方式同为圆形（`PinManageScreen.QsTileCell`）：圆底填
+`tintColor`，前景是磁贴 icon —— 先按透明包围盒归一化（`normalizedForeground`），再
+`ColorFilter.tint(Color.White)` 全部漂白，和 SystemUI 控制中心磁贴的画法一致。取不到色回退
+`MiuixTheme.colorScheme.primary`；拿到的不是透明前景（应用图标兜底）则原样画，不漂白。
 
 **点击**：磁贴没有 Intent，必须回 SystemUI 走
 `MiuiQSHost.createTile("custom(pkg/cls)").click()`（`QsTileHost`，句柄从
@@ -1335,11 +1337,12 @@ miuiQSHostAdapterProvider` 反射取，和联系人条的 Dagger 取法同一套
 - `QS_TILE_HOST_UNAVAILABLE` / `QS_TILE_HOST_REJECTED`：句柄没拿到，磁贴点击会回退；
 - `QS_TILE_CLICK spec=… ok=…`、`QS_TILE_CREATE_NULL`、`QS_TILE_CLICK_FAILED`：逐次点击结果。
 
-- [ ] 功能页出现「应用磁贴」段；不同应用底色不同，且都是中等明度（不刺眼、不发黑）
-- [ ] 白色单色磁贴图标在底色上仍看得清（黑/白圆底自动反过来）
+- [ ] 同一应用分组里，磁贴排在快捷方式**前面**；不同应用圆底颜色不同、都是中等明度
+- [ ] 圆底是取色、前景是**白色**归一化磁贴图标（不是整格卡片、不是原彩色图标）
+- [ ] 白色单色磁贴图标在深色圆底上看得清；浅色圆底也不会和图标糊在一起
 - [ ] 点「管理」→ 磁贴右上角 ± → 点一下加入「已选功能」，页面当场生效
 - [ ] 划出扇形：已选磁贴作为 tile 出现在收藏应用/功能之后；点它执行对应磁贴动作
 - [ ] 面板里点磁贴直接执行；管理页（主页）点磁贴也能执行（经广播回到 SystemUI）
-- [ ] 未声明任何 TileService 的机器：功能页没有「应用磁贴」段，不显示空标题
-- [ ] 取不到色的磁贴（纯白/纯透明图标）：底色回退主题色，不是透明或黑色
+- [ ] 没有 TileService 的应用不出现空分组；整机没有磁贴时只显示快捷方式
+- [ ] 取不到色的磁贴（纯白/纯透明图标）：圆底回退主题主色，不是透明或黑色
 - [ ] 磁贴动作失败时回退打开宿主应用（`QS_TILE_CLICK_FALLBACK_APP`），不是点了没反应
