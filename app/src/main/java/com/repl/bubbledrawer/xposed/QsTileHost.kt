@@ -139,9 +139,25 @@ object QsTileHost {
             Log.w(TAG, "QS_TILE_LIST_NO_HOST")
             return emptyList()
         }
-        // 只读 live QSTile 的快照，不创建/绑定任何东西；直接在扫描线程读，避免「扫描线程持锁 →
-        // 投主线程 → 主线程又要同一把锁」的死锁窗口。
-        return runCatching { collectLiveTiles(context) }.getOrDefault(emptyList())
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return runCatching { collectLiveTiles(context) }.getOrDefault(emptyList())
+        }
+        // 读 QSTile.State 放到主线程（SystemUI 的状态对象按主线程更新）；但**必须有超时**：
+        // 扫描线程持着 ShortcutRepository 的锁，绝不能无限等主线程。
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var result: List<ShortcutItem> = emptyList()
+        Handler(Looper.getMainLooper()).post {
+            result = runCatching { collectLiveTiles(context) }.getOrDefault(emptyList())
+            latch.countDown()
+        }
+        val finished = runCatching {
+            latch.await(900L, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }.getOrDefault(false)
+        if (!finished) {
+            Log.w(TAG, "QS_TILE_LIST_TIMEOUT")
+            return emptyList()
+        }
+        return result
     }
 
     private fun collectLiveTiles(context: Context): List<ShortcutItem> {
