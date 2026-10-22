@@ -808,11 +808,16 @@ object ShortcutRepository {
             val appLabel = runCatching {
                 si.applicationInfo?.let { pm.getApplicationLabel(it).toString() }
             }.getOrNull()?.ifBlank { null }
-            val serviceLabel = runCatching { si.loadLabel(pm).toString() }.getOrNull()
-                ?.takeIf { it.isNotBlank() && it != si.name && !it.contains('.') }
+            // 磁贴自己的 label/icon 可能只写在 TILE_SERVICE_INFO 的 XML 里（AOSP 推荐写法），
+            // ServiceInfo.loadLabel/loadIcon 读不到；先读 meta-data，再退回 service，再退回应用。
+            val tileInfo = loadTileServiceInfo(pm, si)
+            val serviceLabel = tileInfo.first?.toString()
+                ?: runCatching { si.loadLabel(pm).toString() }.getOrNull()
+                    ?.takeIf { it.isNotBlank() && it != si.name && !it.contains('.') }
             val label = serviceLabel ?: appLabel ?: id.substringAfterLast('.')
 
-            val icon = runCatching { si.loadIcon(pm) }.getOrNull()
+            val icon = tileInfo.second
+                ?: runCatching { si.loadIcon(pm) }.getOrNull()
                 ?: runCatching { pm.getApplicationIcon(si.packageName) }.getOrNull()
             val iconBitmap = icon?.let {
                 runCatching { drawableToBitmap(it, ShortcutBridge.ICON_MAX_PX) }.getOrNull()
@@ -837,6 +842,50 @@ object ShortcutRepository {
         }
         Log.i(TAG, "QS_TILE_SCAN count=${out.size} resolved=${resolved.size}")
         return out.sortedWith(compareBy({ it.subLabel.orEmpty() }, { it.label }))
+    }
+
+    /**
+     * 读 `android.service.quicksettings.TILE_SERVICE_INFO` 指向的 XML（`<tile-service-info>`）。
+     *
+     * 不少应用只把磁贴的 label/icon 写在这里，service 本身没有 `android:label/icon`；只看
+     * `ServiceInfo` 会把磁贴名显示成服务类名。解析失败一律返回空对，调用方按 service/应用兜底。
+     */
+    private fun loadTileServiceInfo(
+        pm: PackageManager,
+        si: android.content.pm.ServiceInfo,
+    ): Pair<CharSequence?, Drawable?> {
+        val metaRes = runCatching {
+            si.metaData?.getInt("android.service.quicksettings.TILE_SERVICE_INFO", 0)
+        }.getOrNull() ?: 0
+        if (metaRes == 0) return null to null
+        val parser = runCatching {
+            si.loadXmlMetaData(pm, "android.service.quicksettings.TILE_SERVICE_INFO")
+        }.getOrNull() ?: return null to null
+        return try {
+            var event = parser.eventType
+            while (event != XmlPullParser.END_DOCUMENT) {
+                if (event == XmlPullParser.START_TAG && parser.name == "tile-service-info") {
+                    val resources = runCatching {
+                        pm.getResourcesForApplication(si.packageName)
+                    }.getOrNull()
+                    val labelRes = parser.getAttributeResourceValue(ANDROID_NS, "label", 0)
+                    val iconRes = parser.getAttributeResourceValue(ANDROID_NS, "icon", 0)
+                    val label = if (labelRes != 0) {
+                        runCatching { resources?.getString(labelRes) }.getOrNull()
+                    } else null
+                    val icon = if (iconRes != 0) {
+                        runCatching { resources?.getDrawable(iconRes, null) }.getOrNull()
+                    } else null
+                    return label to icon
+                }
+                event = parser.next()
+            }
+            null to null
+        } catch (_: Exception) {
+            null to null
+        } finally {
+            runCatching { parser.close() }
+        }
     }
 
     /**
