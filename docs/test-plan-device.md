@@ -1303,3 +1303,43 @@ firstVisibleItemScrollOffset == 0`）时展开收藏区，否则原样吞掉并�
 - [ ] 主页 → 收藏应用管理 → 同样操作（两处共用同一个模型/页面）
 - [ ] 搜到**已收藏**的应用：徽标是 `−`，点一下取消收藏（徽标变 `+`）
 - [ ] 退出搜索回到列表：★ 区与徽标一致（不会出现"点了但没进 ★ 区"）
+
+## A34 功能页「应用磁贴」与图标取色（2026-10-22）
+
+**需求**：功能页除了快捷方式，还显示控制中心那批「应用磁贴」；磁贴底色用应用图标取色
+（对齐 AppMarket `ui/util/ImageColors.kt` 的 `dominantImageColor`）。
+
+**数据**：`ShortcutRepository.loadQsTiles()` 在 SystemUI 里用
+`Intent("android.service.quicksettings.action.QS_TILE")` + `queryIntentServices` 枚举；
+每条是一个 `ShortcutItem(type = QS_TILE)`，`id` = 服务类名，键仍是 `pkg#class`。
+App 进程不枚举（包可见性会给残缺清单），只读 `ShortcutBridge`/`ShortcutCacheStore` 的缓存。
+
+**取色**：`ui/util/IconColors.kt` 移植 AppMarket 的 `dominantImageColor`：24×24 采样、
+跳过透明/近黑/近白、RGB 高 4 位分桶取最大桶均值、HSL 明度固定 0.45。底色在 SystemUI 扫描时
+用**宿主应用图标**算好，存 `ShortcutItem.tintColor`，随 JSON / `FunctionPinDetails` 过桥。
+
+**展示**：功能页顶部新增「应用磁贴」段（`PinManageScreen.QsTileCell`）。整格铺 `tintColor`；
+图标下垫白/黑圆底（按 `isLightForeground` 自动反过来）保证白色单色磁贴图标可见；文字颜色按
+底色 luminance 自动黑/白。取不到色回退 `surfaceVariant`。
+
+**点击**：磁贴没有 Intent，必须回 SystemUI 走
+`MiuiQSHost.createTile("custom(pkg/cls)").click()`（`QsTileHost`，句柄从
+`SystemUIAppComponentFactoryBase.systemUIInitializer → getSysUIComponent() →
+miuiQSHostAdapterProvider` 反射取，和联系人条的 Dagger 取法同一套路）。面板/扇形直接执行；
+管理页（App 进程，没有 `BIND_QUICK_SETTINGS_TILE`）发 `ACTION_CLICK_QS_TILE` 广播交给 SystemUI，
+`FanHost` 校验发送方后执行。失败回退「启动宿主应用」，日志 `QS_TILE_CLICK_FALLBACK_APP`。
+
+**日志判据**：
+- `QS_TILE_SCAN count=… resolved=…`：扫到几枚 / PM 返回几个候选；
+- `QS_TILE_HOST_READY class=…`：Dagger 句柄拿到了；
+- `QS_TILE_HOST_UNAVAILABLE` / `QS_TILE_HOST_REJECTED`：句柄没拿到，磁贴点击会回退；
+- `QS_TILE_CLICK spec=… ok=…`、`QS_TILE_CREATE_NULL`、`QS_TILE_CLICK_FAILED`：逐次点击结果。
+
+- [ ] 功能页出现「应用磁贴」段；不同应用底色不同，且都是中等明度（不刺眼、不发黑）
+- [ ] 白色单色磁贴图标在底色上仍看得清（黑/白圆底自动反过来）
+- [ ] 点「管理」→ 磁贴右上角 ± → 点一下加入「已选功能」，页面当场生效
+- [ ] 划出扇形：已选磁贴作为 tile 出现在收藏应用/功能之后；点它执行对应磁贴动作
+- [ ] 面板里点磁贴直接执行；管理页（主页）点磁贴也能执行（经广播回到 SystemUI）
+- [ ] 未声明任何 TileService 的机器：功能页没有「应用磁贴」段，不显示空标题
+- [ ] 取不到色的磁贴（纯白/纯透明图标）：底色回退主题色，不是透明或黑色
+- [ ] 磁贴动作失败时回退打开宿主应用（`QS_TILE_CLICK_FALLBACK_APP`），不是点了没反应

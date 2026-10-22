@@ -111,6 +111,8 @@ object ShortcutBridge {
         put("type", item.type.name)
         put("intentUri", item.intentUri ?: "")
         put("isEnabled", item.isEnabled)
+        // 磁贴底色：0 = 没有（快捷方式/桌面捷径），非 0 = ARGB。App 侧缓存与面板都靠它。
+        put("tint", item.tintColor ?: 0)
 
         val bmp = item.iconBitmap
         if (bmp != null && !bmp.isRecycled) {
@@ -146,6 +148,7 @@ object ShortcutBridge {
                 val type = runCatching { ShortcutType.valueOf(typeName) }.getOrDefault(ShortcutType.APP_SHORTCUT)
                 val intentUri = obj.optString("intentUri").ifBlank { null }
                 val isEnabled = obj.optBoolean("isEnabled", true)
+                val tint = obj.optInt("tint", 0).takeIf { it != 0 }
 
                 val iconBase64 = obj.optString("iconBmp").ifBlank { null }
                 val iconBmp = iconBase64?.let {
@@ -164,6 +167,7 @@ object ShortcutBridge {
                         iconBitmap = iconBmp,
                         appIconBitmap = null,
                         isEnabled = isEnabled,
+                        tintColor = tint,
                     )
                 )
             }

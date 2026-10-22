@@ -227,9 +227,18 @@ class PinManageActivity : ComponentActivity() {
                         backdrop = backdrop,
                         scrollBehavior = scrollBehavior,
                         onLaunchShortcut = { item ->
-                            // 与小窗启动同一条规则：App 进程走「系统闸门」（见上面 onLaunch 的注释），
-                            // 不再自己拼 freeform ActivityOptions。
-                            ShortcutRepository.launchShortcut(this@PinManageActivity, item, viaGate = true)
+                            if (item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) {
+                                // 管理页在 App 进程，没有 BIND_QUICK_SETTINGS_TILE，绑不了 TileService；
+                                // 交给 SystemUI 执行（FanHost 里有对应的导出广播，带发送方校验）。
+                                com.repl.bubbledrawer.xposed.QsTileHost.requestClick(
+                                    this@PinManageActivity,
+                                    item,
+                                )
+                            } else {
+                                // 与小窗启动同一条规则：App 进程走「系统闸门」（见上面 onLaunch 的注释），
+                                // 不再自己拼 freeform ActivityOptions。
+                                ShortcutRepository.launchShortcut(this@PinManageActivity, item, viaGate = true)
+                            }
                         },
                     )
                 }

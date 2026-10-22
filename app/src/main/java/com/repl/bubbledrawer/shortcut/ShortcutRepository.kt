@@ -255,8 +255,11 @@ object ShortcutRepository {
             lastReportedFingerprint = if (ok) EMPTY_FINGERPRINT else 0
             return ScanReport(0, if (ok) ShortcutBridge.ReportResult.SENT else ShortcutBridge.ReportResult.FAILED)
         }
-        // 指纹含标题：只按 pinKey 比对会让「快捷方式改名/换图标」永远同步不到 App（那边显示的是缓存）。
-        val fingerprint = list.joinToString("|") { "${it.pinKey}=${it.label}" }.hashCode()
+        // 指纹含标题与磁贴底色：只按 pinKey 比对会让「快捷方式改名/换图标/磁贴换色」永远同步不到
+        // App（那边显示的是缓存）。
+        val fingerprint = list.joinToString("|") {
+            "${it.pinKey}=${it.label}=${it.tintColor ?: 0}"
+        }.hashCode()
         if (!force && fingerprint == lastReportedFingerprint) {
             // 内容一字不差：不重复上报。这一条是「App 请求刷新 → SystemUI 上报 → App 存盘 →
             // 通知监听者 → 又请求刷新」那个环的最后一道闸 —— 只要数据没变，环就断了。
@@ -404,6 +407,16 @@ object ShortcutRepository {
             Log.w(TAG, "LauncherApps scan failed in SystemUI", it)
         }
 
+        // 注入控制中心的应用磁贴（TileService）。扫描要在 LauncherApps 之后：万一快捷方式枚举
+        // 失败，磁贴仍然应该出现在功能页里；两者的键空间不同（磁贴 id 是服务类名），不会撞。
+        runCatching {
+            for (tile in loadQsTiles(context, seenKeys)) {
+                result.add(tile)
+            }
+        }.onFailure {
+            Log.w(TAG, "QS_TILE_SCAN_FAILED", it)
+        }
+
         // 注入桌面固定快捷方式
         runCatching {
             val desktopShortcuts = loadDesktopShortcuts(context)
@@ -436,7 +449,11 @@ object ShortcutRepository {
         // 1. 优先尝试直接从 LauncherApps 扫描（在 SystemUI 进程内直接成功）
         var launcherAppsSuccess = false
         val scanned = runCatching { scanSystemUiShortcutsInternal(context) }.getOrNull()
-        if (!scanned.isNullOrEmpty() && scanned.any { it.shortcutInfo != null }) {
+        // 磁贴条目没有 shortcutInfo（那是 LauncherApps 专有的）；只看 shortcutInfo 会让「机器上
+        // 没有快捷方式、但有一堆应用磁贴」的清单被误判成「枚举失败」。
+        if (!scanned.isNullOrEmpty() &&
+            (scanned.any { it.shortcutInfo != null } || scanned.any { it.type == ShortcutType.QS_TILE })
+        ) {
             launcherAppsSuccess = true
             for (item in scanned) {
                 if (seenKeys.add(item.pinKey)) {
@@ -753,6 +770,76 @@ object ShortcutRepository {
     }
 
     /**
+     * 枚举应用磁贴（`TileService`）。返回的是 [ShortcutType.QS_TILE] 条目，键仍是 `pkg#id`，
+     * 但 `id` 是**服务类名**，这样 [ShortcutItem.pinKey] 与快捷方式天然不会撞。
+     *
+     * 只读 `ServiceInfo` 的 label/icon，不在这里 `createTile`：一次扫描几十个磁贴，每个都去
+     * bind 一遍 `TileService` 会让 SystemUI 在启动时抖动；真正的绑定只发生在点击那一刻
+     * （[com.repl.bubbledrawer.xposed.QsTileHost]）。
+     *
+     * 底色用**宿主应用图标**算，不用磁贴自己的图标：控制中心磁贴图标大量是白色单色图形，
+     * 拿它取色会全部变成同一个灰白。应用图标才是用户在桌面上认得出的那张脸。
+     */
+    private fun loadQsTiles(context: Context, seenKeys: MutableSet<String>): List<ShortcutItem> {
+        // 只在 SystemUI 里枚举：App 进程受包可见性限制，queryIntentServices 会给一份**残缺**的
+        // 磁贴清单；那份清单一旦被当成「完整枚举」写进缓存，用户就会看到少了一半磁贴。
+        // App 侧永远读 SystemUI 上报的缓存（与快捷方式同一条路）。
+        if (context.packageName != "com.android.systemui") return emptyList()
+        val pm = context.packageManager
+        @Suppress("DEPRECATION")
+        val resolved = runCatching {
+            pm.queryIntentServices(
+                Intent("android.service.quicksettings.action.QS_TILE"),
+                PackageManager.GET_META_DATA,
+            )
+        }.getOrNull().orEmpty()
+
+        val out = mutableListOf<ShortcutItem>()
+        for (resolveInfo in resolved) {
+            val si = resolveInfo.serviceInfo ?: continue
+            if (!si.enabled || si.applicationInfo?.enabled != true) continue
+            if (si.packageName == context.packageName) continue
+
+            val component = android.content.ComponentName(si.packageName, si.name)
+            val id = component.className
+            val key = "${si.packageName}#$id"
+            if (!seenKeys.add(key)) continue
+
+            val appLabel = runCatching {
+                si.applicationInfo?.let { pm.getApplicationLabel(it).toString() }
+            }.getOrNull()?.ifBlank { null }
+            val serviceLabel = runCatching { si.loadLabel(pm).toString() }.getOrNull()
+                ?.takeIf { it.isNotBlank() && it != si.name && !it.contains('.') }
+            val label = serviceLabel ?: appLabel ?: id.substringAfterLast('.')
+
+            val icon = runCatching { si.loadIcon(pm) }.getOrNull()
+                ?: runCatching { pm.getApplicationIcon(si.packageName) }.getOrNull()
+            val iconBitmap = icon?.let {
+                runCatching { drawableToBitmap(it, ShortcutBridge.ICON_MAX_PX) }.getOrNull()
+            }
+
+            // 取色失败（全透明/单色/近白）是正常情况：tint 留空，UI 回退主题 surfaceVariant。
+            val tint = applicationIcon(context, si.packageName)?.let { appIcon ->
+                runCatching { com.repl.bubbledrawer.ui.util.IconColors.dominant(appIcon) }.getOrNull()
+            }
+
+            out.add(
+                ShortcutItem(
+                    id = id,
+                    packageName = si.packageName,
+                    label = label,
+                    subLabel = appLabel,
+                    type = ShortcutType.QS_TILE,
+                    iconBitmap = iconBitmap,
+                    tintColor = tint,
+                ),
+            )
+        }
+        Log.i(TAG, "QS_TILE_SCAN count=${out.size} resolved=${resolved.size}")
+        return out.sortedWith(compareBy({ it.subLabel.orEmpty() }, { it.label }))
+    }
+
+    /**
      * 读取小米桌面固定在桌面的快捷方式：
      * content://com.miui.home.launcher.settings/favorites
      */
@@ -904,6 +991,12 @@ object ShortcutRepository {
         useFreeform: Boolean = SettingsStore.snapshot(context).freeform,
         viaGate: Boolean = false,
     ): Boolean {
+        // 磁贴没有 Intent/ShortcutInfo，走不了这里；调用方必须先分流到 QsTileHost（见 FanHost /
+        // PanelContentFactory / PinManageActivity）。真漏到这里就明确失败，别去 start 一个空 Intent。
+        if (item.type == ShortcutType.QS_TILE) {
+            Log.w(TAG, "LAUNCH_SHORTCUT_REJECTED_QS_TILE pkg=${item.packageName} id=${item.id}")
+            return false
+        }
         val requestFreeform = useFreeform && item.packageName.isNotEmpty()
         // 走闸门时不带 options：留给 system_server 的闸门（ROM 自己那条路）生成。
         val gate = requestFreeform && viaGate

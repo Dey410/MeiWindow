@@ -34,6 +34,9 @@ class SystemUiHookInstaller(
     fun install(classLoader: ClassLoader) {
         // Keep the resolved classloader for the back-gesture corner gate below.
         appClassLoader = classLoader
+        // 控制中心磁贴的执行入口要拿 SystemUI 的 classloader 走 Dagger 取 MiuiQSHost；
+        // 面板里的 FanContext.classLoader 是模块的，不能拿它找系统类。
+        runCatching { com.repl.bubbledrawer.xposed.QsTileHost.install(classLoader) }
         // Install hooks for Flyme-style lightweight freeform window
         runCatching {
             com.repl.bubbledrawer.launch.FlymeFreeformController.installHooks(module, prefs, classLoader)
@@ -99,6 +102,8 @@ class SystemUiHookInstaller(
         runCatching { com.repl.bubbledrawer.launch.FlymeFreeformController.freeformObserver = null }
         runCatching { contactBar?.dispose() }
         contactBar = null
+        // 上一代 classloader 里的 MiuiQSHost 句柄不能跨代使用（热重载后类都换了）。
+        runCatching { com.repl.bubbledrawer.xposed.QsTileHost.reset() }
         runCatching { flymeController?.dispose() }
         flymeController = null
         runCatching { inputMonitor?.dispose() }
@@ -116,6 +121,7 @@ class SystemUiHookInstaller(
     fun reinstall(context: Context) {
         appContext = context
         appClassLoader = appClassLoader ?: context.classLoader
+        runCatching { com.repl.bubbledrawer.xposed.QsTileHost.install(appClassLoader!!) }
         if (bound.compareAndSet(false, true)) {
             module.log(Log.INFO, TAG, "SYSTEMUI_CORNER_REINSTALLED_AFTER_HOT_RELOAD")
             startInputMonitor(context)

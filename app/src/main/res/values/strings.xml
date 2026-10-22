@@ -199,7 +199,8 @@
     <string name="pinned_functions_title">已选功能</string>
     <string name="pinned_functions_empty">点击下方功能添加到已选</string>
     <string name="panel_functions_empty">暂未添加功能\n点击右上角加号前往添加</string>
-    <string name="functions_catalog_empty">还没有读取到功能\n应用提供的快捷方式会显示在这里</string>
+    <string name="functions_catalog_empty">还没有读取到功能\n应用提供的快捷方式与磁贴会显示在这里</string>
+    <string name="qs_tiles_section">应用磁贴</string>
     <string name="add">添加</string>
 
     <!-- 轻量打开（六开关） -->

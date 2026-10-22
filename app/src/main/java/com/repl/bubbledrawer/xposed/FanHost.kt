@@ -408,6 +408,7 @@ class FanHost(
     private var pinsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
     private var syncFromAppReceiver: android.content.BroadcastReceiver? = null
     private var shortcutRequestReceiver: android.content.BroadcastReceiver? = null
+    private var tileClickReceiver: android.content.BroadcastReceiver? = null
 
     private val scope = kotlinx.coroutines.CoroutineScope(
         kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob(),
@@ -436,9 +437,14 @@ class FanHost(
         // 「已选功能」也进扇形：排在收藏应用之后，顺序 = 用户点选顺序。数据源见 fanFunctionEntries()。
         dock.functionItems = { fanFunctionEntries() }
         dock.onFunctionSelected = { item ->
-            // 快捷方式不是应用：走 ShortcutRepository（LauncherApps/Intent 两条路），小窗开关从远程组读
-            // —— 默认参数会去读 App 进程才有的设置，hook 进程读到的是系统界面自己的 cfg。
-            ShortcutRepository.launchShortcut(host, item, RemotePrefs.read(prefs).freeform)
+            if (item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) {
+                // 磁贴必须回到 SystemUI 的 TileService 绑定路径；没有 Intent 可发（见 QsTileHost）。
+                QsTileHost.click(host, item)
+            } else {
+                // 快捷方式不是应用：走 ShortcutRepository（LauncherApps/Intent 两条路），小窗开关从远程组读
+                // —— 默认参数会去读 App 进程才有的设置，hook 进程读到的是系统界面自己的 cfg。
+                ShortcutRepository.launchShortcut(host, item, RemotePrefs.read(prefs).freeform)
+            }
         }
         scope.launch {
             runCatching { repo.loadAll() }
@@ -613,6 +619,31 @@ class FanHost(
                 Context.RECEIVER_EXPORTED,
             )
         }.onSuccess { syncFromAppReceiver = syncFromApp }
+
+        // 管理页（App 进程）点「应用磁贴」时没有绑定权限，发广播让 SystemUI 代跑。
+        // 这个接收者必须导出，所以同样校验发送方；磁贴点击本身不写任何数据，仍只认模块 App。
+        val tileClick = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context?, i: Intent?) {
+                if (i?.action != QsTileHost.ACTION_CLICK_TILE) return
+                if (!isFromModuleApp(this)) {
+                    logger(Log.WARN, "QS_TILE_CLICK_REJECTED sender=${runCatching { sentFromUid }.getOrNull()}", null)
+                    return
+                }
+                val pkg = i.getStringExtra(QsTileHost.EXTRA_PACKAGE).orEmpty()
+                val cls = i.getStringExtra(QsTileHost.EXTRA_CLASS).orEmpty()
+                val label = i.getStringExtra("tile_label").orEmpty()
+                if (pkg.isBlank() || cls.isBlank()) return
+                mainHandler.post { QsTileHost.click(host, pkg, cls, label) }
+            }
+        }
+        runCatching {
+            host.registerReceiver(
+                tileClick,
+                IntentFilter(QsTileHost.ACTION_CLICK_TILE),
+                Context.RECEIVER_EXPORTED,
+            )
+        }.onSuccess { tileClickReceiver = tileClick }
+            .onFailure { logger(Log.WARN, "QS_TILE_CLICK_REGISTER_FAILED", it) }
 
         // SCREEN_OFF → retract (original mo864f :1049-1056 → m9254Z)
         val r = object : android.content.BroadcastReceiver() {
@@ -1797,6 +1828,8 @@ class FanHost(
         syncFromAppReceiver = null
         shortcutRequestReceiver?.let { runCatching { host.unregisterReceiver(it) } }
         shortcutRequestReceiver = null
+        tileClickReceiver?.let { runCatching { host.unregisterReceiver(it) } }
+        tileClickReceiver = null
         pinsListener?.let { runCatching { prefs.unregisterOnSharedPreferenceChangeListener(it) } }
         pinsListener = null
         mainHandler.removeCallbacks(timeout)

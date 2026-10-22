@@ -144,7 +144,13 @@ object PanelContentFactory {
         onClose: () -> Unit,
         onFocusChange: ((Boolean) -> Unit)? = null,
         onLaunchShortcut: ((com.repl.bubbledrawer.shortcut.ShortcutItem) -> Unit)? = { item ->
-            com.repl.bubbledrawer.shortcut.ShortcutRepository.launchShortcut(context, item)
+            // 磁贴不是快捷方式：它必须在 SystemUI 里 createTile(...).click()，没有 Intent 可发。
+            // 面板本来就跑在 SystemUI 进程，直接执行即可。
+            if (item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) {
+                com.repl.bubbledrawer.xposed.QsTileHost.click(context, item)
+            } else {
+                com.repl.bubbledrawer.shortcut.ShortcutRepository.launchShortcut(context, item)
+            }
             onClose()
         },
     ): ComposeView {

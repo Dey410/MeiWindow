@@ -9,6 +9,14 @@ enum class ShortcutType {
     APP_SHORTCUT,
     /** 来自桌面 Provider (content://.../favorites) 的桌面固定捷径 */
     DESKTOP_PINNED,
+
+    /**
+     * 控制中心的「应用磁贴」：应用声明的 `TileService`（`android.service.quicksettings.action.QS_TILE`）。
+     *
+     * 它和快捷方式不是一回事：启动要回到 SystemUI 里 `createTile("custom(pkg/cls)").click()`，
+     * 不能在 App 进程绑服务（`BIND_QUICK_SETTINGS_TILE` 是 signature|privileged）。
+     */
+    QS_TILE,
 }
 
 data class ShortcutItem(
@@ -23,6 +31,12 @@ data class ShortcutItem(
     val iconDrawable: Drawable? = null,
     val appIconBitmap: Bitmap? = null,
     val isEnabled: Boolean = true,
+    /**
+     * 磁贴底色（ARGB）。只对 [ShortcutType.QS_TILE] 有值：SystemUI 扫描时用**宿主应用图标**算好，
+     * 随 [com.repl.bubbledrawer.shortcut.ShortcutBridge] / [FunctionPinDetails] 一起过桥 ——
+     * 面板（SystemUI）和管理页（App）都能直接画，不用各自再读一遍图标。
+     */
+    val tintColor: Int? = null,
 ) {
     /**
      * 收藏用的稳定标识 `pkg#id`。
