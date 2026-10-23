@@ -358,6 +358,15 @@ class FlymeFreeformController(
         if (taskId <= 0) return -1
         if (windows.size > MAX_TRACKED_WINDOWS) windows.clear()
         val previous = windows[taskId]
+        // 小窗风暴熔断报点（用户 2026-10-23，见 FreeformStormGuard）：**新**小窗任务就是风暴的
+        // 直接信号（酷安那次每 ~300ms 弹一对）。只在第一次记住时报 —— 同一任务的
+        // raw→rich 升级、聚焦、回前台都不算第二次；正常人手速开不出这种密度。
+        if (previous == null) {
+            val stormPkg = FreeformTask.packageName(taskInfo)
+            if (stormPkg != null && com.repl.bubbledrawer.lightopen.FreeformStormGuard.processWide.record(stormPkg)) {
+                log("STORM_TRIGGER pkg=$stormPkg")
+            }
+        }
         val previousIsRaw = previous != null && FreeformTask.mode(previous) == FreeformTask.MODE_NONE
         if (previous == null || (previousIsRaw && FreeformTask.mode(taskInfo) != FreeformTask.MODE_NONE)) {
             windows[taskId] = taskInfo

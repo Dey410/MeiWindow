@@ -897,6 +897,13 @@ class LightOpenSystemUi(
      * 应用已经有一个全屏任务时，没有 MULTIPLE_TASK 的话 PendingIntent 只会把那个任务提到前台（仍旧全屏）。
      */
     private fun freeformBundle(context: Context, packageName: String, pendingIntentLaunch: Boolean): Bundle? {
+        // 小窗风暴熔断（用户 2026-10-23，见 FreeformStormGuard）：冷却期内**连注入的小窗参数也不给** ——
+        // 否则用户在风暴里再点一次通知，又点着一把火。返回 null = 各调用点按原样放行（普通启动），
+        // 这正是想要的降级：那条通知全屏打开是完全正常的（同日对照实验）。
+        if (com.repl.bubbledrawer.lightopen.FreeformStormGuard.processWide.isSuppressing(packageName)) {
+            module.log(Log.INFO, TAG, "LIGHT_OPEN_STORM_COOLDOWN pkg=$packageName")
+            return null
+        }
         val miuiOptions = runCatching {
             activityOptionsMethod?.invoke(null, context, packageName, true, false) as? ActivityOptions
         }.getOrNull()

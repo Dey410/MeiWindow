@@ -1367,3 +1367,27 @@ miuiQSHostAdapterProvider` 反射取，和联系人条的 Dagger 取法同一套
 - [ ] 加载期间不闪「还没有读取到功能」空态
 - [ ] 没有功能时：加载完成后再显示空态
 - [ ] 面板和主页收藏管理页两个宿主都生效
+
+## A36 小窗风暴熔断（2026-10-23）
+
+**背景（真机取证 work_logs/crash_repro_2026-10-23.log）**：竖屏通知开启小窗后点酷安的
+升级通知，目标页落进一个全新的 freeform 任务当任务根，酷安的 `UpgradeManagerActivity`
+判「非正常入口」→ 回闪屏重启（`MainActivity` CLEAR_TASK），路由又把它送回来，无限乒乓；
+它的路由 Intent 自带 `NEW_TASK|MULTIPLE_TASK`，每轮都开新任务，ROM 的
+`addLaunchFreeformActivityOptionIfNeed` 链式继承 freeform —— 31 秒弹了上百个小窗。
+同一条通知全屏打开完全正常（对照实验）。
+
+**熔断**（`FreeformStormGuard`，两进程各持一份）：2 秒内同一包满 5 次「小窗授予 /
+新小窗任务」判为风暴 → 冷却 15s（冷却结束后 30s 内再风暴按 ×4 放大，上限 120s）：
+
+- system_server：`LightOpenGate.installStormBreaker` 拦
+  `MiuiMultiWindowUtils.getActivityOptions`，冷却期返回 null（该方法本来就允许 null）；
+- SystemUI：`FlymeFreeformController.rememberWindow` 报新小窗任务，
+  `LightOpenSystemUi.freeformBundle` 在冷却期退化为普通打开。
+
+- [ ] 复现原场景（竖屏通知小窗 + 点酷安升级通知）：小窗最多弹出 4~5 个即停止，不再连环弹
+- [ ] 日志出现 `LIGHT_OPEN_STORM_TRIGGER` / `LIGHT_OPEN_STORM_SUPPRESS`（system 侧）
+      与 `STORM_TRIGGER`（systemui 侧）
+- [ ] 冷却期内再点同一条通知：普通打开（不弹小窗）；冷却结束后恢复小窗
+- [ ] 风暴期间应用自身的连环启动退化为全屏形态，不再新增小窗
+- [ ] 正常手动快速连开几个小窗：不触发熔断；一个应用风暴时其它应用小窗不受影响

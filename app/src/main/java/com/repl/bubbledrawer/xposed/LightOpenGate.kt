@@ -7,6 +7,7 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.util.Log
+import com.repl.bubbledrawer.lightopen.FreeformStormGuard
 import com.repl.bubbledrawer.lightopen.LightOpen
 import com.repl.bubbledrawer.lightopen.LightOpenDecision
 import com.repl.bubbledrawer.lightopen.LightOpenSettings
@@ -114,6 +115,54 @@ class LightOpenGate(
                 "mode=${settings.jumpMode} targets=${settings.jumpTargetCount} " +
                 "share=${settings.shareToApp} text=${settings.textAction}",
         )
+        installStormBreaker()
+    }
+
+    /**
+     * 小窗风暴熔断（用户 2026-10-23，见 [com.repl.bubbledrawer.lightopen.FreeformStormGuard]）：
+     * 酷安的通知目标页在小窗里自我重启死循环，每轮开新任务 + ROM 链式继承 freeform，
+     * 31 秒弹了上百个小窗。
+     *
+     * 拦 `MiuiMultiWindowUtils.getActivityOptions` 的全部重载：**每次"要给小窗参数"都过这里**
+     * （链式继承 `addLaunchFreeformActivityOptionIfNeed` 造参数、以及闸门命中后 ROM 自己造参数）。
+     * 计数达阈值就对该包冷却；冷却期返回 null —— 这个方法本来就允许返回 null
+     * （"该应用不给小窗"，MIUI 名单外的应用天天拿到 null），ROM 各调用方都按 null 走原生路径。
+     */
+    private fun installStormBreaker() {
+        val utils = loadClass("android.util.MiuiMultiWindowUtils")
+        val methods = utils?.declaredMethods?.filter { it.name == "getActivityOptions" }.orEmpty()
+        if (methods.isEmpty()) {
+            module.log(Log.WARN, TAG, "LIGHT_OPEN_STORM_TARGET_UNAVAILABLE")
+            return
+        }
+        for ((index, method) in methods.withIndex()) {
+            module.hook(method)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .setId("bubbledrawer.lightopen.storm$index")
+                .intercept { chain ->
+                    // 签名是 (Context, String 包名, …)，包名永远在 1；兜底再找第一个字符串。
+                    val pkg = chain.args.getOrNull(1) as? String
+                        ?: chain.args.filterIsInstance<String>().firstOrNull()
+                    if (pkg.isNullOrEmpty()) return@intercept chain.proceed()
+                    if (FreeformStormGuard.processWide.isSuppressing(pkg)) {
+                        module.log(
+                            Log.INFO,
+                            TAG,
+                            "LIGHT_OPEN_STORM_SUPPRESS pkg=$pkg remainingMs=${FreeformStormGuard.processWide.remainingCooldownMs(pkg)}",
+                        )
+                        return@intercept null
+                    }
+                    if (FreeformStormGuard.processWide.record(pkg)) {
+                        module.log(
+                            Log.WARN,
+                            TAG,
+                            "LIGHT_OPEN_STORM_TRIGGER pkg=$pkg cooldownMs=${FreeformStormGuard.processWide.remainingCooldownMs(pkg)}",
+                        )
+                    }
+                    chain.proceed()
+                }
+        }
+        module.log(Log.INFO, TAG, "LIGHT_OPEN_STORM_BREAKER_INSTALLED methods=${methods.size}")
     }
 
     /** 返回 null = 不干预（走原生判定）。 */
