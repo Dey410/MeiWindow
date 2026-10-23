@@ -99,30 +99,4 @@ class MiniMuteStateTest {
         assertEquals(setOf(other), state.pendingKeys())
         assertTrue(state.observe(other, liveMuted = false))
     }
-
-    /**
-     * 2026-10-23 用户报「静音后手机按键无法调节音量」：音量键解除静音要看到**已经生效**的静音，
-     * 而 `pendingKeys()` 只服务"等它出声再补刀"，生效过的就不在里面了。
-     */
-    @Test
-    fun mutedKeysAlsoCountsMutesThatAlreadyTookEffect() {
-        val state = MiniMuteState()
-        state.requestMute(KEY)
-        assertTrue(state.observe(KEY, liveMuted = true))
-
-        assertTrue(state.pendingKeys().isEmpty())
-        assertEquals(setOf(KEY), state.mutedKeys())
-    }
-
-    @Test
-    fun mutedKeysDropsWhatWasUnmutedOrForgotten() {
-        val state = MiniMuteState()
-        state.requestMute(KEY)
-        state.requestUnmute(KEY)
-        assertTrue(state.mutedKeys().isEmpty())
-
-        state.requestMute(KEY)
-        state.forget(KEY)
-        assertTrue(state.mutedKeys().isEmpty())
-    }
 }

@@ -547,11 +547,6 @@ class FlymeMiniMenuOverlay(
         handler.post {
             runCatching {
                 host.javaClass.getMethod("release").invoke(host)
-            }.onFailure {
-                // 释放失败 = 这个 SCVH 窗口（连同它的输入通道）留在系统里：菜单看不见了，
-                // 但硬件键可能还被它接着。以前这里静默吞掉，正是「关掉菜单后音量键失灵」的温床。
-                Log.e(TAG, "release view host failed", it)
-                FlymeFreeformController.log("MINI_MENU_HOST_RELEASE_FAILED error=${it.message}")
             }
         }
     }

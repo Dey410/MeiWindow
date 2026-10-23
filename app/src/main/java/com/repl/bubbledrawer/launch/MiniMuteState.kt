@@ -49,13 +49,6 @@ internal class MiniMuteState {
     /** 所有还没生效的静音请求（播放回调要按它补刀）。 */
     fun pendingKeys(): Set<String> = requested.filterNot { it in applied }.toSet()
 
-    /**
-     * 所有「我们按过静音、还没解除」的应用 —— 包括已经生效的。
-     *
-     * 音量键解除静音要用它：生效过的静音不在 [pendingKeys] 里（那条集合只服务播放回调）。
-     */
-    fun mutedKeys(): Set<String> = requested.toSet()
-
     /** 窗口没了：连意图一起忘掉，否则会在后台继续静音一个没有入口恢复的应用。 */
     fun forget(key: String) {
         requested.remove(key)

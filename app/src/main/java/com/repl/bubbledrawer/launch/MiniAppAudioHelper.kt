@@ -1,14 +1,10 @@
 package com.repl.bubbledrawer.launch
 
 import android.app.AppOpsManager
-import android.content.BroadcastReceiver
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -47,15 +43,6 @@ object MiniAppAudioHelper {
     /** 持久化键前缀，值是"静音前的播放音量"。 */
     private const val STORE_PREFIX = "restore."
 
-    /**
-     * 音量广播与 extra 名。`AudioManager` 里这几个常量是 `@hide`，编译期取不到，
-     * 直接写字面量（值来自 ROM 的 AudioService，见 `sendVolumeUpdate`）。
-     */
-    private const val ACTION_VOLUME_CHANGED = "android.media.VOLUME_CHANGED_ACTION"
-    private const val EXTRA_VOLUME_STREAM_TYPE = "android.media.EXTRA_VOLUME_STREAM_TYPE"
-    private const val EXTRA_VOLUME_STREAM_VALUE = "android.media.EXTRA_VOLUME_STREAM_VALUE"
-    private const val EXTRA_PREV_VOLUME_STREAM_VALUE = "android.media.EXTRA_PREV_VOLUME_STREAM_VALUE"
-
     /** 「静音 / 未静音」的意图与事实，见 [MiniMuteState]。 */
     private val muteState = MiniMuteState()
 
@@ -78,10 +65,6 @@ object MiniAppAudioHelper {
     /** 停止待生效静音用的播放回调；只有存在待生效请求时才注册。 */
     private var watchRegistered = false
     private var watchContext: Context? = null
-
-    /** 音量键监听（见 [volumeReceiver]）：静音的应用正在出声时按音量键调大就解除静音。 */
-    private var volumeWatchRegistered = false
-    private var volumeWatchContext: Context? = null
 
     /** 待还原音量的持久化，见 [ensureStore]。 */
     private var store: SharedPreferences? = null
@@ -112,34 +95,9 @@ object MiniAppAudioHelper {
         }
     }
 
-    /**
-     * 音量键监听（2026-10-23，用户报「小窗长按静音后手机按键无法调节音量」）。
-     *
-     * 静音是把应用的**播放音量**（`PlayerProxy` 的乘数）压到 0；音量键调的是**媒体流**音量，
-     * 两者相乘 —— 流音量怎么变，0 乘出来还是 0。所以静音中的应用正在出声时，只要用户按的是
-     * 音量键"调大"，就当成"我要声音"：把播放音量还原成静音前的大小。
-     * 调小不解除（已经是 0，再小没有意义），和系统媒体音量在 0 时的行为一致。
-     *
-     * 不 hook 按键：`VOLUME_CHANGED_ACTION` 是 AudioService 每次改流音量都会发的系统广播。
-     */
-    private val volumeReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action != ACTION_VOLUME_CHANGED) return
-            val stream = intent.getIntExtra(EXTRA_VOLUME_STREAM_TYPE, -1)
-            if (stream != AudioManager.STREAM_MUSIC) return
-            val now = intent.getIntExtra(EXTRA_VOLUME_STREAM_VALUE, -1)
-            val before = intent.getIntExtra(EXTRA_PREV_VOLUME_STREAM_VALUE, -1)
-            if (now <= before) return
-            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-            unmuteForVolumeKey(context, audioManager)
-        }
-    }
-
     private fun appKey(packageName: String, uid: Int): String = "$packageName@$uid"
 
     private fun uidOfKey(key: String): Int? = key.substringAfterLast('@', "").toIntOrNull()
-
-    private fun pkgOfKey(key: String): String = key.substringBeforeLast('@')
 
     /**
      * 控制器启动时调一次：把上个进程（SystemUI 重启前）没还完的音量捞回来。
@@ -167,7 +125,6 @@ object MiniAppAudioHelper {
             val volume = (value as? Number)?.toFloat() ?: return@forEach
             pendingRestore[key.removePrefix(STORE_PREFIX)] = volume
         }
-        if (pendingRestore.isNotEmpty()) Log.i(TAG, "pending restore loaded size=${pendingRestore.size}")
         return sp
     }
 
@@ -200,7 +157,6 @@ object MiniAppAudioHelper {
             if (targets.any { setPlayerVolume(audioManager, it, volume) }) {
                 clearPendingRestore(key)
                 appliedAny = true
-                Log.i(TAG, "pending restore applied key=$key volume=$volume")
             }
         }
         return appliedAny
@@ -238,59 +194,10 @@ object MiniAppAudioHelper {
             }
             savePendingRestore(key, restore)
             startWatch(context, audioManager)
-            Log.i(TAG, "restore deferred pkg=$packageName uid=$uid volume=$restore (nothing playing)")
             return false
         }
         savePendingRestore(key, restore)
         return false
-    }
-
-    /**
-     * 音量键调大：静音中的应用正在出声就把它的播放音量还回去。
-     *
-     * 没在出声的应用直接跳过 —— 不能因为用户给别的应用调音量，就顺手把它解除静音。
-     */
-    private fun unmuteForVolumeKey(context: Context, audioManager: AudioManager) {
-        val keys = muteState.mutedKeys()
-        if (keys.isEmpty()) return
-        for (key in keys) {
-            val uid = uidOfKey(key) ?: continue
-            val configs = activeConfigs(audioManager, uid)
-            if (configs.isEmpty()) continue
-            val restore = savedVolumeByApp[key] ?: 1f
-            if (configs.any { setPlayerVolume(audioManager, it, restore) }) {
-                savedVolumeByApp.remove(key)
-                clearPendingRestore(key)
-                muteState.requestUnmute(key)
-                setAppOpsAudioMode(context, pkgOfKey(key), uid, mute = false)
-                Log.i(TAG, "volume key unmute pkg=${pkgOfKey(key)} uid=$uid restore=$restore")
-            }
-        }
-        stopVolumeWatchIfIdle()
-    }
-
-    private fun startVolumeWatch(context: Context) {
-        val ctx = context.applicationContext ?: context
-        volumeWatchContext = ctx
-        if (volumeWatchRegistered) return
-        val filter = IntentFilter(ACTION_VOLUME_CHANGED)
-        val ok = runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                ctx.registerReceiver(volumeReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                ctx.registerReceiver(volumeReceiver, filter)
-            }
-        }.onFailure { Log.w(TAG, "register volume receiver failed", it) }.isSuccess
-        volumeWatchRegistered = ok
-        Log.i(TAG, "volume watch registered=$ok")
-    }
-
-    private fun stopVolumeWatchIfIdle() {
-        if (muteState.mutedKeys().isNotEmpty()) return
-        if (!volumeWatchRegistered) return
-        volumeWatchRegistered = false
-        runCatching { volumeWatchContext?.unregisterReceiver(volumeReceiver) }
-        Log.i(TAG, "volume watch unregistered")
     }
 
     /**
@@ -345,8 +252,6 @@ object MiniAppAudioHelper {
         val appOpsApplied = setAppOpsAudioMode(context, packageName, uid, mute)
 
         if (mute) {
-            // 静音期间盯着音量键：静音是"播放音量乘数 = 0"，用户按键调媒体音量时得能把它开回来。
-            startVolumeWatch(context)
             muteState.requestMute(key)
             // 没压到正在播的那条通道 = 应用此刻没声音：等它出声再压（见 playbackCallback）。
             if (audioManager != null && !volumeApplied) {
@@ -355,7 +260,6 @@ object MiniAppAudioHelper {
         } else {
             muteState.requestUnmute(key)
             stopWatchIfIdle(audioManager)
-            stopVolumeWatchIfIdle()
         }
 
         val pending = muteState.hasPendingMute(key)
@@ -381,20 +285,17 @@ object MiniAppAudioHelper {
         muteState.forget(key)
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         var volumeRestored = false
-        var deferred = false
         val restore = savedVolumeByApp[key]
         if (restore != null) {
             // 应用没在出声时这一笔还不掉，restoreVolume 会把它记成待还原。
             volumeRestored = restoreVolume(context, audioManager, packageName, uid, key, fallback = restore)
-            deferred = !volumeRestored
         }
         val appOpsCleared = setAppOpsAudioMode(context, packageName, uid, mute = false)
         stopWatchIfIdle(audioManager)
-        stopVolumeWatchIfIdle()
         Log.i(
             TAG,
             "release pkg=$packageName uid=$uid restore=$restore " +
-                "volume=$volumeRestored deferred=$deferred appOps=$appOpsCleared",
+                "volume=$volumeRestored appOps=$appOpsCleared",
         )
     }
 
