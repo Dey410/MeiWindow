@@ -382,11 +382,17 @@ class FlymeMiniMenuOverlay(
         }
 
         // Layout params for WindowlessWindowManager
+        //
+        // 2026-10-23 用户报「静音后按音量键完全没反应，系统音量条都不弹」：菜单本身不需要键盘，
+        // 但 `TYPE_APPLICATION` 默认是**可聚焦**的 —— 这个全屏窗口一旦拿到输入焦点，菜单关掉后
+        // 焦点不一定会还给下面的小窗，硬件键（音量键）就被吞掉了。加 `FLAG_NOT_FOCUSABLE`
+        // 让它永远不参与键盘焦点，触摸/点击不受影响。
         val lp = WindowManager.LayoutParams(
             width,
             height,
             WindowManager.LayoutParams.TYPE_APPLICATION,
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
             title = "FlymeMiniMenuOverlay-$taskId"
@@ -541,6 +547,11 @@ class FlymeMiniMenuOverlay(
         handler.post {
             runCatching {
                 host.javaClass.getMethod("release").invoke(host)
+            }.onFailure {
+                // 释放失败 = 这个 SCVH 窗口（连同它的输入通道）留在系统里：菜单看不见了，
+                // 但硬件键可能还被它接着。以前这里静默吞掉，正是「关掉菜单后音量键失灵」的温床。
+                Log.e(TAG, "release view host failed", it)
+                FlymeFreeformController.log("MINI_MENU_HOST_RELEASE_FAILED error=${it.message}")
             }
         }
     }

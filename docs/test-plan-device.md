@@ -1416,3 +1416,5 @@ miuiQSHostAdapterProvider` 反射取，和联系人条的 Dagger 取法同一套
 - [ ] 重启 SystemUI / 重启手机后，之前静音的应用不会再被钉在 0
 - [ ] 另一个正在播放的应用调音量，不会把后台静音的应用解除静音
 - [ ] 长按菜单的黑色遮罩：四角与系统小窗圆角完全重合（遮罩画直角、由窗口 leash 裁剪）
+- [ ] 长按菜单（含点静音）关闭后立刻按音量键：系统音量条正常弹出（菜单窗口已改 `FLAG_NOT_FOCUSABLE`，
+      不再抢键盘焦点；失败时日志 `MINI_MENU_HOST_RELEASE_FAILED`）
