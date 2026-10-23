@@ -1583,8 +1583,8 @@ class FanHost(
             // 分身角标：面板里的图标与扇子同源（都按这次快照决定要不要叠角标）。
             cloneBadge = RemotePrefs.read(prefs).cloneBadge,
             showTiles = RemotePrefs.read(prefs).panelShowTiles,
-            loadShortcuts = {
-                com.repl.bubbledrawer.shortcut.ShortcutRepository.loadShortcuts(host)
+            loadShortcuts = { onProgress ->
+                com.repl.bubbledrawer.shortcut.ShortcutRepository.loadShortcuts(host, onProgress)
             },
             functionPinsOf = { readFunctionPins() },
             // 已选功能的详情（名称/宿主/启动 Intent）：面板据此渲染，不依赖自己那份枚举结果。

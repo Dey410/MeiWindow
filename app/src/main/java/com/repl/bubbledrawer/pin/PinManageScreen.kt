@@ -541,8 +541,18 @@ fun PinManageScreen(
                                 bottom = topContentPadding + 16.dp,
                             ),
                         ) {
+                            // 功能页加载中：进度条 + 第 x 个 / 共 y 个。加载完才把空态显示出来，
+                            // 否则会先闪一下「还没有读取到功能」再被列表顶掉。
+                            if (model.functionLoading) {
+                                item(key = "functions_loading", span = { GridItemSpan(gridSpan) }) {
+                                    FunctionLoadingRow(
+                                        loaded = model.functionLoaded,
+                                        total = model.functionTotal,
+                                    )
+                                }
+                            }
                             // 功能页原本没有任何空态：读不到快捷方式时整页是白的，连"在加载"都看不出来。
-                            if (model.groupedFunctions.isEmpty()) {
+                            if (model.groupedFunctions.isEmpty() && !model.functionLoading) {
                                 item(key = "functions_empty", span = { GridItemSpan(gridSpan) }) {
                                     EmptyHintRow(stringResource(R.string.functions_catalog_empty))
                                 }
@@ -1092,6 +1102,54 @@ private fun HeadRow(headText: String) {
 }
 
 /** 暂无已添加应用 */
+/**
+ * 功能页加载进度：Miuix 官方 [LinearProgressIndicator] + 「第 x 个 / 共 y 个」。
+ *
+ * total 是扫描前的估算值，可能出现 total 还没到、loaded 已经到的情况；调用方已经保证
+ * `functionTotal >= functionLoaded`，这里再夹一次，进度条不会超过 100%。
+ * total=0（还没估完）时传 null，走官方不确定态动画。
+ */
+@Composable
+private fun FunctionLoadingRow(loaded: Int, total: Int) {
+    val safeTotal = total.coerceAtLeast(loaded)
+    val progress = if (safeTotal > 0) {
+        (loaded.toFloat() / safeTotal).coerceIn(0f, 1f)
+    } else {
+        null
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = stringResource(R.string.functions_loading),
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                style = MiuixTheme.textStyles.body2,
+            )
+            Text(
+                text = stringResource(
+                    R.string.functions_loading_progress,
+                    loaded,
+                    safeTotal,
+                ),
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                style = MiuixTheme.textStyles.body2,
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        top.yukonga.miuix.kmp.basic.LinearProgressIndicator(
+            modifier = Modifier.fillMaxWidth(),
+            progress = progress,
+        )
+    }
+}
+
 @Composable
 private fun EmptyHintRow(text: String) {
     Box(

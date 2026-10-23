@@ -222,10 +222,75 @@ object ShortcutRepository {
     /**
      * 同时加载快捷方式（功能）与桌面固定捷径。
      */
-    fun loadShortcuts(context: Context): Pair<List<ShortcutItem>, List<ShortcutItem>> {
-        val appShortcuts = loadAppShortcuts(context)
+    fun loadShortcuts(
+        context: Context,
+        onProgress: ((loaded: Int, total: Int) -> Unit)? = null,
+    ): Pair<List<ShortcutItem>, List<ShortcutItem>> {
+        val progress = onProgress?.let { ShortcutProgress(it, countCandidates(context)) }
+        val appShortcuts = loadAppShortcuts(context, progress)
+        // 扫描里已经注入过桌面捷径并计过数；这里再读一次只为返回给调用方（去重由调用方做），
+        // 不再重复推进进度，否则数字会超过总数。
         val desktopShortcuts = loadDesktopShortcuts(context)
+        progress?.setDone(appShortcuts.size + desktopShortcuts.size)
         return Pair(appShortcuts, desktopShortcuts)
+    }
+
+    /** 粗略的总数：LauncherApps 快捷方式 + 应用磁贴 + 桌面捷径 + 微信/支付宝兜底 2 条。 */
+    private fun countCandidates(context: Context): Int {
+        var total = 2
+        runCatching {
+            val launcherApps = context.getSystemService(Context.LAUNCHER_APPS_SERVICE) as? LauncherApps
+            val userManager = context.getSystemService(Context.USER_SERVICE) as? UserManager
+            val profiles = userManager?.userProfiles ?: listOf(Process.myUserHandle())
+            if (launcherApps != null) {
+                for (profile in profiles) {
+                    val q = LauncherApps.ShortcutQuery().setQueryFlags(1051)
+                    total += launcherApps.getShortcuts(q, profile)?.size ?: 0
+                }
+            }
+        }
+        runCatching {
+            @Suppress("DEPRECATION")
+            total += context.packageManager.queryIntentServices(
+                Intent("android.service.quicksettings.action.QS_TILE"),
+                0,
+            ).size
+        }
+        runCatching {
+            val cursor = context.contentResolver.query(
+                Uri.parse("content://com.miui.home.launcher.settings/favorites"),
+                arrayOf("_id"),
+                null,
+                null,
+                null,
+            )
+            cursor?.use { total += it.count }
+        }
+        return total.coerceAtLeast(1)
+    }
+
+    /** 扫描进度：total 是估算值，done 只增不减；total < done 时自动抬高，避免 1/0。 */
+    internal class ShortcutProgress(
+        private val callback: (Int, Int) -> Unit,
+        initialTotal: Int,
+    ) {
+        private var total = initialTotal.coerceAtLeast(1)
+        private var done = 0
+
+        fun step(count: Int = 1) {
+            done += count
+            emit()
+        }
+
+        fun setDone(value: Int) {
+            if (value > done) done = value
+            emit()
+        }
+
+        private fun emit() {
+            if (done > total) total = done
+            callback(done, total)
+        }
     }
 
     /**
@@ -310,24 +375,38 @@ object ShortcutRepository {
      * 强制刷新（App 明确要求，且发送方已被验证是模块自己）穿透这两个节流：让它拿到的一定是新结果，
      * 否则「刚装的应用看不到」会被 3s 窗口里的旧结果"确认"成一次完整枚举。
      */
-    fun scanSystemUiShortcutsInternal(context: Context, force: Boolean = false): List<ShortcutItem> =
+    internal fun scanSystemUiShortcutsInternal(
+        context: Context,
+        force: Boolean = false,
+        progress: ShortcutProgress? = null,
+    ): List<ShortcutItem> =
         synchronized(scanLock) {
             val now = SystemClock.uptimeMillis()
             val age = now - lastScanAt
             if (!force) {
-                if (lastScan.isNotEmpty() && age < SCAN_TTL_MS) return lastScan
-                if (age < SCAN_MIN_INTERVAL_MS) return lastScan
+                if (lastScan.isNotEmpty() && age < SCAN_TTL_MS) {
+                    progress?.setDone(lastScan.size)
+                    return lastScan
+                }
+                if (age < SCAN_MIN_INTERVAL_MS) {
+                    progress?.setDone(lastScan.size)
+                    return lastScan
+                }
             }
-            val outcome = scanSystemUiShortcutsUncached(context)
+            val outcome = scanSystemUiShortcutsUncached(context, progress)
             lastScan = outcome.items
             lastScanLauncherAppsOk = outcome.launcherAppsOk
             lastScanAt = now
+            progress?.setDone(outcome.items.size)
             outcome.items
         }
 
     private class ScanOutcome(val items: List<ShortcutItem>, val launcherAppsOk: Boolean)
 
-    private fun scanSystemUiShortcutsUncached(context: Context): ScanOutcome {
+    private fun scanSystemUiShortcutsUncached(
+        context: Context,
+        progress: ShortcutProgress? = null,
+    ): ScanOutcome {
         val result = mutableListOf<ShortcutItem>()
         val seenKeys = mutableSetOf<String>()
         val density = context.resources.displayMetrics.densityDpi
@@ -400,6 +479,7 @@ object ShortcutRepository {
                                 iconDrawable = icon,
                             )
                         )
+                        progress?.step()
                     }
                 }
             }
@@ -410,7 +490,7 @@ object ShortcutRepository {
         // 注入控制中心的应用磁贴（TileService）。扫描要在 LauncherApps 之后：万一快捷方式枚举
         // 失败，磁贴仍然应该出现在功能页里；两者的键空间不同（磁贴 id 是服务类名），不会撞。
         runCatching {
-            for (tile in loadQsTiles(context, seenKeys)) {
+            for (tile in loadQsTiles(context, seenKeys, progress)) {
                 result.add(tile)
             }
         }.onFailure {
@@ -419,7 +499,7 @@ object ShortcutRepository {
 
         // 注入桌面固定快捷方式
         runCatching {
-            val desktopShortcuts = loadDesktopShortcuts(context)
+            val desktopShortcuts = loadDesktopShortcuts(context, progress)
             for (d in desktopShortcuts) {
                 if (seenKeys.add(d.pinKey)) {
                     result.add(d)
@@ -442,13 +522,16 @@ object ShortcutRepository {
      * 上报**只发生在 [scanAndReportFromSystemUi]**：面板每次打开都会走到这里，而「每次打开都
      * 重新分片上报几百张图标」既贵又没有必要（App 只在缓存空/过期时才要新数据）。
      */
-    fun loadAppShortcuts(context: Context): List<ShortcutItem> {
+    internal fun loadAppShortcuts(
+        context: Context,
+        progress: ShortcutProgress? = null,
+    ): List<ShortcutItem> {
         val result = mutableListOf<ShortcutItem>()
         val seenKeys = mutableSetOf<String>()
 
         // 1. 优先尝试直接从 LauncherApps 扫描（在 SystemUI 进程内直接成功）
         var launcherAppsSuccess = false
-        val scanned = runCatching { scanSystemUiShortcutsInternal(context) }.getOrNull()
+        val scanned = runCatching { scanSystemUiShortcutsInternal(context, progress = progress) }.getOrNull()
         // 磁贴条目没有 shortcutInfo（那是 LauncherApps 专有的）；只看 shortcutInfo 会让「机器上
         // 没有快捷方式、但有一堆应用磁贴」的清单被误判成「枚举失败」。
         if (!scanned.isNullOrEmpty() &&
@@ -483,6 +566,8 @@ object ShortcutRepository {
 
         // 4. 微信、支付宝扫一扫与付款码核心兜底
         injectEssentialShortcuts(context, result, seenKeys)
+        // 缓存/XML 分支没有逐条 step：这里把进度推到最终条数（只增不减）。
+        progress?.setDone(result.size)
         return result
     }
 
@@ -780,7 +865,11 @@ object ShortcutRepository {
      *
      * 是否显示由更多应用面板的「显示磁贴」开关控制（`panel_show_tiles`，默认开）。
      */
-    private fun loadQsTiles(context: Context, seenKeys: MutableSet<String>): List<ShortcutItem> {
+    private fun loadQsTiles(
+        context: Context,
+        seenKeys: MutableSet<String>,
+        progress: ShortcutProgress? = null,
+    ): List<ShortcutItem> {
         // 只在 SystemUI 里做：App 进程看不到 QSTile，也没有 SystemUI 的 classloader。
         if (context.packageName != "com.android.systemui") return emptyList()
         if (!SettingsStore.snapshot(context).panelShowTiles) {
@@ -860,11 +949,15 @@ object ShortcutRepository {
                     tileForeground = tileForeground,
                 ),
             )
+            progress?.step()
         }
 
         // 反方向兜底：live 里有、query 没返回的（包可见性/服务被禁用的边缘情况）也保留。
         for (item in live.values) {
-            if (seenKeys.add(item.pinKey)) out.add(item)
+            if (seenKeys.add(item.pinKey)) {
+                out.add(item)
+                progress?.step()
+            }
         }
         Log.i(TAG, "QS_TILE_SCAN count=${out.size} live=${live.size} resolved=${resolved.size}")
         return out.sortedWith(compareBy({ it.subLabel.orEmpty() }, { it.label }))
@@ -920,7 +1013,10 @@ object ShortcutRepository {
      * 读取小米桌面固定在桌面的快捷方式：
      * content://com.miui.home.launcher.settings/favorites
      */
-    fun loadDesktopShortcuts(context: Context): List<ShortcutItem> {
+    internal fun loadDesktopShortcuts(
+        context: Context,
+        progress: ShortcutProgress? = null,
+    ): List<ShortcutItem> {
         val result = mutableListOf<ShortcutItem>()
         val favoritesUri = Uri.parse("content://com.miui.home.launcher.settings/favorites")
         val pm = context.packageManager
@@ -988,6 +1084,7 @@ object ShortcutRepository {
                             iconBitmap = finalBitmap,
                         )
                     )
+                    progress?.step()
                 }
             }
         }.onFailure {

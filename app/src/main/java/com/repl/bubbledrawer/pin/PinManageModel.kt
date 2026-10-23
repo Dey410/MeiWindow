@@ -43,7 +43,7 @@ class PinManageModel(
      * [com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE]，但收藏键仍保留在存储里。
      */
     val showTiles: Boolean = com.repl.bubbledrawer.xposed.RemotePrefs.DEFAULT_PANEL_SHOW_TILES,
-    private val loadShortcuts: (suspend () -> Pair<List<com.repl.bubbledrawer.shortcut.ShortcutItem>, List<com.repl.bubbledrawer.shortcut.ShortcutItem>>)? = null,
+    private val loadShortcuts: (suspend (onProgress: (Int, Int) -> Unit) -> Pair<List<com.repl.bubbledrawer.shortcut.ShortcutItem>, List<com.repl.bubbledrawer.shortcut.ShortcutItem>>)? = null,
     initialTab: Int = 0,
     private val functionPinsOf: () -> List<String> = { emptyList() },
     /**
@@ -99,6 +99,18 @@ class PinManageModel(
         private set
 
     var desktopShortcuts: List<com.repl.bubbledrawer.shortcut.ShortcutItem> by mutableStateOf(emptyList())
+        private set
+
+    /**
+     * 功能页加载进度：`ShortcutRepository` 每扫到一条就回调一次，面板顶部据此画进度条 +
+     * 「第 x 个 / 共 y 个」。total 是扫描前的估算值（LauncherApps + 磁贴 + 桌面捷径 + 兜底），
+     * done 只增不减；total 小于 done 时自动抬高，不会出现 3/2。
+     */
+    var functionLoading: Boolean by mutableStateOf(false)
+        private set
+    var functionLoaded: Int by mutableStateOf(0)
+        private set
+    var functionTotal: Int by mutableStateOf(0)
         private set
 
     /**
@@ -304,30 +316,47 @@ class PinManageModel(
             rebuild()
             // 键与详情一起刷新（详情决定「面板能不能把已选功能画出来」，见 allShortcuts）。
             refreshFunctionPins()
-            loadShortcuts?.let { loader ->
-                runCatching {
-                    val (appsList, desktopList) = kotlinx.coroutines.withContext(Dispatchers.IO) {
-                        loader()
-                    }
-                    appShortcuts = appsList
-                    desktopShortcuts = desktopList
-                }
-            }
+            loadShortcuts?.let { loader -> loadFunctionShortcuts(loader) }
         }
     }
 
     @MainThread
     fun refreshShortcuts() {
         scope.launch {
-            loadShortcuts?.let { loader ->
-                runCatching {
-                    val (appsList, desktopList) = kotlinx.coroutines.withContext(Dispatchers.IO) {
-                        loader()
+            loadShortcuts?.let { loader -> loadFunctionShortcuts(loader) }
+        }
+    }
+
+    /**
+     * 功能页统一加载入口：进度状态与结果赋值只在这里，reload / 面板刷新不会各写一半。
+     * 回调来自 IO 线程，状态写入切回 Main；`finally` 保证异常时进度条也会消失。
+     */
+    private suspend fun loadFunctionShortcuts(
+        loader: suspend (onProgress: (Int, Int) -> Unit) -> Pair<
+            List<com.repl.bubbledrawer.shortcut.ShortcutItem>,
+            List<com.repl.bubbledrawer.shortcut.ShortcutItem>
+            >,
+    ) {
+        functionLoading = true
+        functionLoaded = 0
+        functionTotal = 0
+        try {
+            runCatching {
+                val (appsList, desktopList) = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    loader { loaded, total ->
+                        scope.launch {
+                            functionLoaded = loaded
+                            functionTotal = total.coerceAtLeast(loaded)
+                        }
                     }
-                    appShortcuts = appsList
-                    desktopShortcuts = desktopList
                 }
+                appShortcuts = appsList
+                desktopShortcuts = desktopList
+                functionLoaded = appsList.size + desktopList.size
+                functionTotal = functionTotal.coerceAtLeast(functionLoaded)
             }
+        } finally {
+            functionLoading = false
         }
     }
 
