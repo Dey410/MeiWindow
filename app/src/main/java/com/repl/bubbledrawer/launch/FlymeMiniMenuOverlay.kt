@@ -252,11 +252,12 @@ class FlymeMiniMenuOverlay(
         }
         rootLayout = root
 
-        val cornerRadius = density * 18f * scaleFactor
+        // 遮罩画成**直角矩形**，圆角交给窗口 leash 自己裁（2026-10-23 用户实测：系统确实会裁）。
+        // 以前这里自绘 `18dp × 1/scale` 的圆角，和 ROM 给小窗的真实圆角对不上，四角会露出黑边；
+        // 这个 SurfaceControl 是 leash 的子层，父层的圆角裁剪对子层同样生效。
         val bgDrawable = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
             setColor(0x33000000) // Flyme 20% black mask
-            this.cornerRadius = cornerRadius
         }
 
         val menuContainer = FrameLayout(fanContext).apply {
@@ -265,7 +266,6 @@ class FlymeMiniMenuOverlay(
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
             background = bgDrawable
-            clipToOutline = true
             isClickable = true
             isFocusable = false
         }

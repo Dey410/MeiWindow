@@ -150,6 +150,8 @@ class FlymeFreeformController(
         instance = this
         currentModule = module
         savedContext = context
+        // 上个进程（SystemUI 重启前）没来得及还原的静音音量：这次启动补上，见 MiniAppAudioHelper.attach。
+        MiniAppAudioHelper.attach(context)
         // Outside tap (the 黑色遮罩 itself is the touch target: a trusted overlay with an input
         // receiver registered for it, see FreeformBackgroundDecoration). Runs on the main thread.
         backgroundDecoration = FreeformBackgroundDecoration(context, classLoader, prefs) {
