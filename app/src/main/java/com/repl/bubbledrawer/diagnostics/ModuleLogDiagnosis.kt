@@ -104,10 +104,10 @@ object ModuleLogDiagnosis {
         "FREEFORM_SCALE", "FREEFORM_OFFSET_SKIPPED", "RESTORE_AVOID_SKIPPED",
         "PROBE prefs", "PREFS_APPLIED", "HOT_RELOADED", "SYSTEMUI_RESTART",
         "MINI_SWIPE", "SYSTEMUI_CORNER_SPY", "FLYME_FREEFORM_HOOKS_REINSTALL_FAILED",
-        // 边角手势（见 CornerInputMonitor）：MON_DOWN/MON_STROKE_END 是每一笔的结局，
-        // MON_SYSTEM_CANCEL 是"这一笔被系统抢走"的唯一证据。
+        // 边角手势（见 CornerInputMonitor 与 LauncherMonitorRegion）：MON_DOWN/MON_STROKE_END 是每一笔的结局，
+        // MON_SYSTEM_CANCEL 是"这一笔被系统抢走"的唯一证据，ARBITER_ 是 system_server 对 swipe-up 的裁剪仲裁。
         "MON_DOWN", "MON_STROKE_END", "MON_ACTIVATE", "MON_SYSTEM_CANCEL", "MON_INPUT_READY",
-        "MON_PILFER", "MON_WARMUP", "SYSTEMUI_CORNER_READY", "MON_IME_PROBE",
+        "MON_PILFER", "MON_WARMUP", "SYSTEMUI_CORNER_READY", "MON_IME_PROBE", "ARBITER_",
         // 功能页（快捷方式）：扫没扫到、送没送到、面板里的编辑有没有交给 App。
         "SHORTCUT_SCAN", "SHORTCUT_REFRESH_REJECTED", "FUNCTION_WRITE_HANDOFF",
         "FUNCTION_REMOTE_CHANGED", "FUNCTION_SYNC_FROM_APP_",
@@ -965,8 +965,9 @@ object ModuleLogDiagnosis {
             val recv = Regex("recv=(-?\\d+)").find(down)?.groupValues?.get(1)?.toIntOrNull()
             val pil = Regex("pil=(-?\\d+)").find(down)?.groupValues?.get(1)?.toIntOrNull()
             val ime = Regex("ime=(\\d+)px").find(down)?.groupValues?.get(1)?.toIntOrNull()
-            val observe = mode != null && mode != "pre-own"
-            val slow = lat != null && lat > SLOW_PREOWN_MS
+            val cropped = mode == "cropped"
+            val observe = mode != null && mode != "pre-own" && !cropped
+            val slow = !cropped && lat != null && lat > SLOW_PREOWN_MS
             // 慢在哪一段：recv = dispatcher 投递到模块线程，pil = 模块自己的处理 + binder pilferPointers。
             // 这个拆分是 2026-10-12 那次排查的关键（用户报「时灵时不灵」）：那次是 recv 大 ——
             // 看门狗每 250ms 在输入线程上做两次 binder 调用，正好把偶尔一笔 DOWN 顶到 15ms。
@@ -982,9 +983,14 @@ object ModuleLogDiagnosis {
                 DiagnosisCheck(
                     id = "gesture.preown",
                     group = CheckGroup.GESTURE,
-                    title = "最近一次角落按下有没有抢下指针流",
+                    title = if (cropped) {
+                        "最近一次角落按下处理方式"
+                    } else {
+                        "最近一次角落按下有没有抢下指针流"
+                    },
                     status = when {
                         mode == null -> CheckStatus.INFO
+                        cropped -> CheckStatus.PASS
                         observe -> CheckStatus.FAIL
                         slow -> CheckStatus.WARN
                         else -> CheckStatus.PASS
@@ -992,6 +998,9 @@ object ModuleLogDiagnosis {
                     detail = when {
                         mode == null ->
                             "这一版还没有记录抢占方式（日志行：${trimPrefix(down)}）"
+                        cropped ->
+                            "桌面 swipe-up 已被 system_server 裁出角落，按下时无需抢占指针流" +
+                                "（纯观察，普通点击原样留给应用，滑动达阈值才接管）"
                         observe && ime != null && ime > 0 ->
                             "只观察（键盘弹着，按设计不抢）：这一笔系统仍可能同时回桌面"
                         observe ->
@@ -1019,12 +1028,13 @@ object ModuleLogDiagnosis {
             )
         }
 
-        // 时延分布：单看"最近一笔"会被运气误导（一笔 15ms 可能只是恰好撞上系统忙），
-        // `MON_LAT n=… p50=… p90=… max=… slow(>8ms)=…` 是模块每 20 笔打一次的汇总。
+        // 时延分布：仅当还在用旧的 DOWN 抢占模式（`mode=pre-own`）时才有意义；
+        // 如果最新一笔已经是 `mode=cropped`（无需在 DOWN 竞速抢流），就不再把旧的抢跑时延摆出来误导用户。
+        val latestCropped = down?.contains("mode=cropped") == true
         val latSummary = lines.lastOrNull { it.contains("MON_LAT ") }
         val latSlow = lines.lastOrNull { it.contains("MON_LAT_SLOW") }
         val latLine = latSummary ?: latSlow
-        if (latLine != null) {
+        if (latLine != null && !latestCropped) {
             val slowCount = Regex("slow\\(>\\d+ms\\)=(\\d+)").find(latLine)?.groupValues?.get(1)?.toIntOrNull()
             val p90 = Regex("p90=(\\d+)").find(latLine)?.groupValues?.get(1)?.toIntOrNull()
             val max = Regex("max=(\\d+)").find(latLine)?.groupValues?.get(1)?.toIntOrNull()
@@ -1077,6 +1087,34 @@ object ModuleLogDiagnosis {
                     status = CheckStatus.WARN,
                     detail = "探针窗口没建起来：键盘弹着的时候角落也会被抢下，键盘上的角落点击要靠补发",
                     evidence = trimPrefix(probeMissing),
+                ),
+            )
+        }
+
+        val arbiterCrop = lines.lastOrNull { it.contains("ARBITER_CROP ") }
+        val arbiterHooked = lines.lastOrNull { it.contains("ARBITER_HOOKED") }
+        if (arbiterCrop != null || arbiterHooked != null) {
+            val ok = arbiterCrop?.contains("ok=true") == true
+            val cropDesc = arbiterCrop?.let { markerWord(it, "crop=") }
+            add(
+                DiagnosisCheck(
+                    id = "gesture.arbiter_crop",
+                    group = CheckGroup.GESTURE,
+                    title = "桌面 swipe-up 监视器角落裁剪（system_server）",
+                    status = when {
+                        arbiterCrop != null && ok -> CheckStatus.PASS
+                        arbiterCrop != null -> CheckStatus.WARN
+                        else -> CheckStatus.INFO
+                    },
+                    detail = when {
+                        arbiterCrop != null && ok ->
+                            "已把桌面 swipe-up 的输入表面裁为 $cropDesc：角落按下不会送给桌面，无需竞速"
+                        arbiterCrop != null ->
+                            "尝试裁剪桌面 swipe-up 失败（见原文），回退到 SystemUI 侧 DOWN 抢占"
+                        else ->
+                            "已在 system_server 安装监视器钩子，等待捕获 InputManagerService 并应用裁剪"
+                    },
+                    evidence = trimPrefix((arbiterCrop ?: arbiterHooked)!!),
                 ),
             )
         }

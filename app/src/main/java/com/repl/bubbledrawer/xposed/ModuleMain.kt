@@ -35,6 +35,7 @@ class ModuleMain : XposedModule() {
      */
     private var lightOpenSystemUi: LightOpenSystemUi? = null
     private var lightOpenGate: LightOpenGate? = null
+    private var launcherMonitorRegion: LauncherMonitorRegion? = null
 
     /** system_server 的 classloader（热重载后重建闸门钩子要用）。 */
     private var systemServerClassLoader: ClassLoader? = null
@@ -139,6 +140,11 @@ class ModuleMain : XposedModule() {
         runCatching {
             LightOpenGate(this, prefs).also { lightOpenGate = it }.install(param.classLoader)
         }.onFailure { log(Log.WARN, TAG, "LIGHT_OPEN_GATE_INSTALL_FAILED", it) }
+        runCatching {
+            LauncherMonitorRegion(this, prefs) { pr, msg, t ->
+                if (t != null) log(pr, TAG, msg, t) else log(pr, TAG, msg)
+            }.also { launcherMonitorRegion = it }.install(param.classLoader)
+        }.onFailure { log(Log.WARN, TAG, "ARBITER_INSTALL_FAILED", it) }
     }
 
     /**
@@ -160,9 +166,11 @@ class ModuleMain : XposedModule() {
             param.setSavedInstanceState(arrayOf(processName, context, loader))
         }.onFailure { log(Log.WARN, TAG, "HOT_RELOAD_STATE_SAVE_FAILED", it) }
         runCatching { systemUiInstaller?.dispose() }
+        runCatching { launcherMonitorRegion?.dispose() }
         systemUiInstaller = null
         lightOpenSystemUi = null
         lightOpenGate = null
+        launcherMonitorRegion = null
         return true
     }
 
@@ -218,12 +226,16 @@ class ModuleMain : XposedModule() {
         // 只有重启才能恢复。classloader 用启动时存下的那个，取不到就退回系统 classloader
         // （system_server 的框架类都在 boot classpath 上，够用）。
         if (processName == PROCESS_SYSTEM) {
+            val effectiveLoader = loader ?: systemServerClassLoader ?: ClassLoader.getSystemClassLoader()
             runCatching {
                 val prefs = configuration ?: getRemotePreferences(RemotePrefs.GROUP).also {
                     configuration = it
                 }
                 LightOpenGate(this, prefs).also { lightOpenGate = it }
-                    .install(loader ?: systemServerClassLoader ?: ClassLoader.getSystemClassLoader())
+                    .install(effectiveLoader)
+                LauncherMonitorRegion(this, prefs) { pr, msg, t ->
+                    if (t != null) log(pr, TAG, msg, t) else log(pr, TAG, msg)
+                }.also { launcherMonitorRegion = it }.install(effectiveLoader)
             }.onFailure { log(Log.WARN, TAG, "HOT_RELOAD_LIGHT_OPEN_GATE_FAILED", it) }
         }
     }

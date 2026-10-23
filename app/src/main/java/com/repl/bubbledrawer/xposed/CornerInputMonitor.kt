@@ -185,6 +185,16 @@ class CornerInputMonitor(
     @Volatile
     private var imeHeightCache = 0
 
+    /**
+     * True while `system_server`'s [LauncherMonitorRegion] has cropped `[Gesture Monitor] swipe-up`
+     * out of the bottom corners (`Settings.Global[bubbledrawer_arbiter_crop_active] == 1`).
+     * When true, `com.miui.home` never receives `ACTION_DOWN` in the corners at all, so we do NOT
+     * need to pre-own (`pilferPointers`) at `ACTION_DOWN` — we stay a pure observer (`mode=cropped`)
+     * and only pilfer on `SpyAction.Activate` once the finger has traveled past the threshold.
+     */
+    @Volatile
+    private var arbiterCropActive = false
+
     /** Returns true only if the display is interactive and the keyguard is NOT locked. */
     private fun isUnlockedAndInteractive(): Boolean = deviceInteractive && !keyguardLocked
 
@@ -194,6 +204,13 @@ class CornerInputMonitor(
     private fun refreshState() {
         deviceInteractive = runCatching { powerManager?.isInteractive != false }.getOrDefault(true)
         keyguardLocked = runCatching { keyguardManager?.isKeyguardLocked == true }.getOrDefault(false)
+        arbiterCropActive = runCatching {
+            android.provider.Settings.Global.getInt(
+                context.contentResolver,
+                LauncherMonitorRegion.SETTING_ARBITER_CROP_ACTIVE,
+                0,
+            ) == 1
+        }.getOrDefault(false)
     }
 
     /**
@@ -1200,7 +1217,13 @@ class CornerInputMonitor(
         // read when a corner swipe goes HOME with the fan.
         val inPreOwnStrip = inPreOwnStrip(y)
         val imePx = imeVisibleHeightPx()
-        val owned = imePx <= 0 && inPreOwnStrip && pilferMonitor()
+        val cropped = arbiterCropActive
+        // 当 system_server 已经把桌面的 `[Gesture Monitor] swipe-up` 裁出左右下角时（`cropped == true`），
+        // 角落的 ACTION_DOWN 根本不会发给 com.miui.home，因此不再需要在按下瞬间调 `pilferPointers()` 抢跑：
+        // 保持纯观察（`owned = false, mode=cropped`），普通点击和短距离滑动全部原封不动留给前景 App，
+        // 只有手指真正滑满触发阈值（`Stroke.move -> SpyAction.Activate`）时才接管指针流打开扇面。
+        // 仅当 `system_server` 裁剪未生效时，才回退到旧的 DOWN 预抢占（`mode=pre-own`）。
+        val owned = !cropped && imePx <= 0 && inPreOwnStrip && pilferMonitor()
         val now = SystemClock.uptimeMillis()
         // 时延拆成两段：recv = dispatcher 投递到我们线程（大了说明我们的 Looper 被别的活挡住 / 系统忙），
         // pil = 我们的处理 + binder `pilferPointers`（大了说明是我们自己慢）。lat 是这两段之和，
@@ -1208,21 +1231,28 @@ class CornerInputMonitor(
         val recv = (downRecvUptime - ev.downTime).coerceAtLeast(0)
         val pil = (now - downRecvUptime).coerceAtLeast(0)
         val lat = recv + pil
-        latency.record(lat.toInt())
-        if (lat > latency.slowMs) {
-            logger(
-                Log.WARN,
-                "MON_LAT_SLOW side=$side lat=$lat recv=$recv pil=$pil owned=$owned band=$inPreOwnStrip " +
-                    "ime=${imePx}px " + latency.summary(),
-                null,
-            )
-        } else if (latency.dueForReport(LAT_REPORT_EVERY)) {
-            logger(Log.INFO, "MON_LAT " + latency.summary(), null)
+        if (!cropped) {
+            latency.record(lat.toInt())
+            if (lat > latency.slowMs) {
+                logger(
+                    Log.WARN,
+                    "MON_LAT_SLOW side=$side lat=$lat recv=$recv pil=$pil owned=$owned band=$inPreOwnStrip " +
+                        "ime=${imePx}px " + latency.summary(),
+                    null,
+                )
+            } else if (latency.dueForReport(LAT_REPORT_EVERY)) {
+                logger(Log.INFO, "MON_LAT " + latency.summary(), null)
+            }
+        }
+        val mode = when {
+            cropped -> "cropped"
+            owned -> "pre-own"
+            else -> "observe"
         }
         logger(
             Log.INFO,
             "MON_DOWN side=$side x=$x y=$y box=${cornerBoxPx()} band=$inPreOwnStrip " +
-                "ime=${imePx}px mode=${if (owned) "pre-own" else "observe"} " +
+                "ime=${imePx}px mode=$mode " +
                 "lat=$lat recv=$recv pil=$pil " + boundsForLog(),
             null,
         )

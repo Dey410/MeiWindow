@@ -259,6 +259,27 @@ class ModuleLogDiagnosisTest {
     }
 
     @Test
+    fun aCroppedCornerStrokeNeedsNoPreOwnAndHidesStaleLatency() {
+        // system_server 已经把 swipe-up 裁出角落时，MON_DOWN 记为 mode=cropped：
+        // 按下时不需要抢占指针流，因此判定为 PASS，且隐藏旧的抢占时延分布。
+        val lines = HEALTHY.map {
+            if (it.contains("MON_DOWN ")) it.replace("mode=pre-own", "mode=cropped") else it
+        } + listOf(
+            "${LOGCAT_PREFIX}ARBITER_CROP reason=imsCapturedViaPilfer token=BinderProxy name=[Gesture Monitor] swipe-up crop=[114,0][1106,2656] ok=true",
+            "${LOGCAT_PREFIX}MON_LAT n=20 p50=2ms p90=3ms max=5ms slow(>8ms)=0",
+        )
+        val checks = checksOf(lines)
+        val preown = checks.first { it.id == "gesture.preown" }
+        val arbiter = checks.first { it.id == "gesture.arbiter_crop" }
+
+        assertEquals(CheckStatus.PASS, preown.status)
+        assertTrue(preown.detail.contains("无需抢占指针流"))
+        assertEquals(CheckStatus.PASS, arbiter.status)
+        assertTrue(arbiter.detail.contains("[114,0][1106,2656]"))
+        assertFalse(checks.any { it.id == "gesture.latency" })
+    }
+
+    @Test
     fun aPreOwnThatTookTooLongIsWorthAWarning() {
         // 抢是抢了，但用了 52ms —— 这一笔是靠运气赢的（正常值 ~2ms）。
         val lines = HEALTHY.map {
