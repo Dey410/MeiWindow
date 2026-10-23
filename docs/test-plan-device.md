@@ -854,6 +854,10 @@ adb logcat -s BubbleDrawer | findstr PRESSURE_CALIBRATION
 - [ ] 通知归属正确：点第三方应用的通知时，日志里 `pkg=` 是**发通知的那个应用**，
       而不是 `android` / `com.android.systemui`（MIUI 会用自己的 PendingIntent 转手）
 - [ ] **误伤检查**：在应用内点一个链接（如 Gemini 里点链接）→ 保持全屏，日志没有 `LIGHT_OPEN_FREEFORM`
+- [ ] **下拉小窗不受影响**（2026-10-23 用户报）：开着「竖屏点通知」时，在通知栏把一条通知**下拉** →
+      系统自带的下拉小窗正常打开；日志出现 `LIGHT_OPEN_SKIP_MINI_WINDOW` 或
+      `LIGHT_OPEN_OPTIONS_SKIP_MINI_WINDOW`，且不应出现 `LIGHT_OPEN_OPTIONS_APPLIED`
+      （我们的点击 bundle 不能盖掉 ROM 自己的下拉小窗 options）
 
 ### 控制中心（SystemUI 侧）
 - [ ] 开「长按磁贴」：控制中心长按 WiFi / 蓝牙（原生磁贴）→ 设置页小窗打开；

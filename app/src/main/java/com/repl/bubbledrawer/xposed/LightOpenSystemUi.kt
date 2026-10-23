@@ -103,6 +103,9 @@ class LightOpenSystemUi(
 
     private val armed = AtomicReference<Armed?>(null)
 
+    /** 清理"没被取走的上膛"用：延迟一点点，给可能异步的 ActivityStarter 留出取走的时间。 */
+    private val armClearHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
     /** `MiuiMultiWindowUtils.getActivityOptions(Context, String, boolean, boolean)`（miui-framework.jar）。 */
     private val activityOptionsMethod: Method? by lazy {
         runCatching {
@@ -410,6 +413,10 @@ class LightOpenSystemUi(
             .intercept { chain ->
                 val settings = watcher.current()
                 if (!settings.enabled) return@intercept chain.proceed()
+                if (isRomMiniWindowLaunch()) {
+                    module.log(Log.INFO, TAG, "LIGHT_OPEN_SKIP_MINI_WINDOW source=notifPublic")
+                    return@intercept chain.proceed()
+                }
                 val pendingIntent = chain.args.getOrNull(0) as? PendingIntent
                 val intent = chain.args.getOrNull(1) as? Intent
                 val entry = chain.args.getOrNull(2)
@@ -436,7 +443,9 @@ class LightOpenSystemUi(
                         "creator=$creatorPackage portrait=$portrait decision=$decision " +
                         "entry=${entry != null} ${settings.summary()}",
                 )
-                if (decision == LightOpenDecision.FORCE_FREEFORM && packageName != null && context != null) {
+                val token = if (decision == LightOpenDecision.FORCE_FREEFORM &&
+                    packageName != null && context != null
+                ) {
                     arm(
                         packageName = packageName,
                         pendingIntentLaunch = true,
@@ -444,8 +453,13 @@ class LightOpenSystemUi(
                         decision = decision,
                         context = context,
                     )
+                } else null
+                try {
+                    chain.proceed()
+                } finally {
+                    // 点击本身同步造 options（ARM 与 OPTIONS_APPLIED 同毫秒），返回即作废残留上膛。
+                    clearArmIfUnused(token)
                 }
-                chain.proceed()
             }
         module.log(Log.INFO, TAG, "LIGHT_OPEN_NOTIFICATION_ARM_HOOK_INSTALLED params=${method.parameterCount}")
     }
@@ -494,10 +508,11 @@ class LightOpenSystemUi(
                     "LIGHT_OPEN_TILE_VIEW_ENTER tile=${tile?.javaClass?.simpleName} target=$target " +
                         "decision=$decision ${settings.summary()}",
                 )
-                if (decision == LightOpenDecision.FORCE_FREEFORM && target != null && context != null) {
+                val token = if (decision == LightOpenDecision.FORCE_FREEFORM && target != null && context != null) {
                     arm(target, pendingIntentLaunch = false, source = "tileView", decision = decision, context = context)
-                }
+                } else null
                 chain.proceed()
+                clearArmIfUnused(token)
             }
         module.log(Log.INFO, TAG, "LIGHT_OPEN_TILE_VIEW_HOOK_INSTALLED")
     }
@@ -602,8 +617,9 @@ class LightOpenSystemUi(
                 }
                 // 只上膛，不接管：这次启动仍旧走 MIUI 自己的 ActivityStarter（动画/面板收起都保持原样），
                 // 只是它造 options 的时候会把小窗 bundle 拿走。
-                arm(target, pendingIntentLaunch = false, source = "tile", decision = decision, context = context)
+                val token = arm(target, pendingIntentLaunch = false, source = "tile", decision = decision, context = context)
                 chain.proceed()
+                clearArmIfUnused(token)
             }
         module.log(Log.INFO, TAG, "LIGHT_OPEN_CONTROL_CENTER_HOOK_INSTALLED")
     }
@@ -648,10 +664,11 @@ class LightOpenSystemUi(
                 .intercept { chain ->
                     val pendingIntent = chain.args.firstOrNull() as? PendingIntent
                     val context = getContext(readField(chain.thisObject, "mContext") as? Context)
-                    if (pendingIntent != null && context != null) {
+                    val token = if (pendingIntent != null && context != null) {
                         armFromPendingIntent(pendingIntent, context, "post.pi")
-                    }
+                    } else null
                     chain.proceed()
+                    clearArmIfUnused(token)
                 }
             installed++
         }
@@ -681,10 +698,11 @@ class LightOpenSystemUi(
                 .intercept { chain ->
                     val intent = chain.args.firstOrNull() as? Intent
                     val context = getContext(readField(chain.thisObject, "mContext") as? Context)
-                    if (intent != null && context != null) {
+                    val token = if (intent != null && context != null) {
                         armFromIntent(intent, context, "post.intent")
-                    }
+                    } else null
                     chain.proceed()
+                    clearArmIfUnused(token)
                 }
             intentInstalled++
         }
@@ -695,9 +713,9 @@ class LightOpenSystemUi(
         )
     }
 
-    private fun armFromIntent(intent: Intent, context: Context, source: String) {
+    private fun armFromIntent(intent: Intent, context: Context, source: String): Armed? {
         val settings = watcher.current()
-        if (!settings.enabled) return
+        if (!settings.enabled) return null
         val target = targetPackage(context, intent)
         // 同一个 API 既被控制中心磁贴用、也被灵动岛/焦点通知用（真机取证：插件 dex 里
         // `miui.systemui.util.FocusNotificationUtil` 与各 `*Tile` 都调它），靠调用栈区分是谁发起的。
@@ -714,8 +732,8 @@ class LightOpenSystemUi(
             "LIGHT_OPEN_ARM_INTENT_ENTER source=$source kind=$kind target=$target " +
                 "decision=$decision ${settings.summary()}",
         )
-        if (target == null || decision != LightOpenDecision.FORCE_FREEFORM) return
-        arm(
+        if (target == null || decision != LightOpenDecision.FORCE_FREEFORM) return null
+        return arm(
             packageName = target,
             // 通知点开是"启动一个 PendingIntent 语义"（可能已有全屏任务）→ 需要 NEW_TASK|MULTIPLE_TASK；
             // 磁贴长按是普通 startActivity → 不需要。
@@ -734,6 +752,8 @@ class LightOpenSystemUi(
      * 通知优先（灵动岛/焦点通知的类名更容易识别），磁贴作为兜底。
      */
     private fun classifyLaunch(): LaunchKind {
+        // ROM 自己的下拉小窗路径（拖拽控制器 / AppMiniWindowManagerImpl）不参与我们的规则。
+        if (isRomMiniWindowLaunch()) return LaunchKind.UNKNOWN
         var kind = LaunchKind.UNKNOWN
         for (frame in Throwable().stackTrace) {
             val name = frame.className
@@ -755,9 +775,9 @@ class LightOpenSystemUi(
         return kind
     }
 
-    private fun armFromPendingIntent(pendingIntent: PendingIntent, context: Context, source: String) {
+    private fun armFromPendingIntent(pendingIntent: PendingIntent, context: Context, source: String): Armed? {
         val settings = watcher.current()
-        if (!settings.enabled) return
+        if (!settings.enabled) return null
         val creatorPackage = runCatching { pendingIntent.creatorPackage }.getOrNull()
         val creatorUid = runCatching { pendingIntent.creatorUid }.getOrDefault(-1)
         // 点悬浮通知时 MIUI 递进来的是一个 **SystemUI 自己造的** PendingIntent（真机日志：
@@ -777,8 +797,8 @@ class LightOpenSystemUi(
             "LIGHT_OPEN_ARM_PI_ENTER source=$source pkg=$packageName creator=$creatorPackage uid=$creatorUid " +
                 "inner=$innerPackage portrait=$portrait decision=$decision",
         )
-        if (decision != LightOpenDecision.FORCE_FREEFORM || packageName == null) return
-        arm(packageName, pendingIntentLaunch = true, source = source, decision = decision, context = context)
+        if (decision != LightOpenDecision.FORCE_FREEFORM || packageName == null) return null
+        return arm(packageName, pendingIntentLaunch = true, source = source, decision = decision, context = context)
     }
 
     /** 通知属于哪个应用：`NotificationEntry.mSbn.packageName`（ExpandedNotification 继承 StatusBarNotification）。 */
@@ -812,6 +832,12 @@ class LightOpenSystemUi(
             .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
             .setId("bubbledrawer.lightopen.options")
             .intercept { chain ->
+                // 下拉小窗的 options 由 ROM 自己造，绝不能拿通知点击的 bundle 去覆盖（即便是残留上膛）。
+                if (isRomMiniWindowLaunch()) {
+                    armed.set(null)
+                    module.log(Log.INFO, TAG, "LIGHT_OPEN_OPTIONS_SKIP_MINI_WINDOW")
+                    return@intercept chain.proceed()
+                }
                 val pending = armed.getAndSet(null) ?: return@intercept chain.proceed()
                 val now = SystemClock.uptimeMillis()
                 if (now > pending.expiresAtUptime) {
@@ -852,18 +878,44 @@ class LightOpenSystemUi(
         source: String,
         decision: LightOpenDecision,
         context: Context?,
-    ) {
-        armed.set(
-            Armed(
-                packageName = packageName,
-                pendingIntentLaunch = pendingIntentLaunch,
-                source = source,
-                decision = decision,
-                context = context,
-                expiresAtUptime = SystemClock.uptimeMillis() + ARM_TTL_MS,
-            ),
+    ): Armed {
+        val token = Armed(
+            packageName = packageName,
+            pendingIntentLaunch = pendingIntentLaunch,
+            source = source,
+            decision = decision,
+            context = context,
+            expiresAtUptime = SystemClock.uptimeMillis() + ARM_TTL_MS,
         )
+        armed.set(token)
+        return token
     }
+
+    /**
+     * 这次点击自己用掉上膛；调用返回后如果还没人取走，就立刻作废。
+     *
+     * 为什么（用户 2026-10-23 报「竖屏点击打开小窗有概率破坏下拉打开小窗」）：上膛是全进程单槽，
+     * 原来能活 2 秒。点完通知如果这次启动没走 `createActivityOptions`（或者被别的启动先取走），
+     * 这颗残留的子弹就会被紧接着的「下拉小窗」捡到 —— 我们的通知小窗 bundle（含
+     * NEW_TASK|MULTIPLE_TASK、setFreeformAnimation(false)）会盖掉 ROM 自己下拉小窗的 options，
+     * 表现就是下拉延迟或打不开。点击本身是同步造 options 的（真机日志：ARM 与 OPTIONS_APPLIED
+     * 同一毫秒），所以方法返回就清掉是安全的。
+     */
+    private fun clearArmIfUnused(token: Armed?) {
+        if (token == null) return
+        armClearHandler.postDelayed({ armed.compareAndSet(token, null) }, ARM_CLEAR_DELAY_MS)
+    }
+
+    /**
+     * 这次启动是不是 ROM 自己的「下拉小窗 / 迷你窗」路径。
+     *
+     * 下拉小窗由 MIUI 的通知拖拽控制器 → `AppMiniWindowManagerImpl.launchMiniWindowActivity` 完成，
+     * 它有自己的动画与任务标志；我们的点击规则绝不能碰它（用户 2026-10-23 的反馈）。
+     * 栈里出现这些帧就整条路径放行，连上膛都不做。
+     */
+    private fun isRomMiniWindowLaunch(): Boolean = runCatching {
+        com.repl.bubbledrawer.lightopen.MiniWindowLaunch.isMiniWindowStack(Throwable().stackTrace)
+    }.getOrDefault(false)
 
     private fun isPortrait(context: Context): Boolean =
         context.resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE
@@ -991,6 +1043,14 @@ class LightOpenSystemUi(
          * 重启/锁屏过渡，但代价不值得 —— 回到 2s（真机上从"上膛"到"造 options"只隔几毫秒）。
          */
         const val ARM_TTL_MS = 2000L
+
+        /**
+         * 上膛的"短命"时限：点击方法返回后这么久还没被 `createActivityOptions` 取走就作废。
+         *
+         * 2 秒的 [ARM_TTL_MS] 是兜底上限；真正让残留子弹不跨到下一次启动（例如紧接着的
+         * 「下拉小窗」）的是这个更短的窗口（用户 2026-10-23 报的问题）。
+         */
+        const val ARM_CLEAR_DELAY_MS = 300L
 
         /** 通知栏列表里点通知。 */
         const val NOTIFICATION_INJECTED_CLASS =
