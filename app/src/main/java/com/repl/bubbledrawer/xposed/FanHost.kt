@@ -50,8 +50,10 @@ import com.repl.bubbledrawer.launch.FullscreenLaunchStrategy
 import com.repl.bubbledrawer.launch.ILaunchStrategy
 import com.repl.bubbledrawer.pin.PanelContentFactory
 import com.repl.bubbledrawer.pin.PinManageModel
+import com.repl.bubbledrawer.shortcut.AggregatePayment
 import com.repl.bubbledrawer.shortcut.FunctionPinDetails
 import com.repl.bubbledrawer.shortcut.FunctionPinStore
+import com.repl.bubbledrawer.contactbar.quickPayTrigger
 import com.repl.bubbledrawer.shortcut.ShortcutItem
 import com.repl.bubbledrawer.shortcut.ShortcutRepository
 import kotlinx.coroutines.launch
@@ -200,6 +202,17 @@ class FanHost(
         runCatching { FunctionPinDetails.decode(prefs.getString(FunctionPinDetails.KEY, null)) }
             .getOrDefault(emptyList())
 
+    /**
+     * 已选功能解析用的详情 = App 发布的那份 + 内建的「聚合支付」条目。
+     *
+     * 聚合支付不在任何扫描结果里（内建功能），发布链对它的 placeholder 也带不上图标 ——
+     * 这里把发布版里那条替换成 [AggregatePayment.entryIn]（带模块的 aggregate_payment 图标），
+     * 收藏区/扇形凭 pinKey 就能解析出带真图标的条目。
+     */
+    private fun functionDetailsForRender(): List<ShortcutItem> =
+        readFunctionDetails().filterNot { AggregatePayment.isEntry(it) } +
+            AggregatePayment.entryIn(host)
+
     /** 面板读：[com.repl.bubbledrawer.shortcut.FunctionPinStore] 的键列表。 */
     private fun readFunctionPins(): List<String> {
         functionsOverlay?.let { return FunctionPinStore.decode(it) }
@@ -346,7 +359,7 @@ class FanHost(
 
     /** 扇形里要显示的功能条目（见 [com.repl.bubbledrawer.shortcut.FunctionFanItems]）。 */
     private fun fanFunctionEntries(): List<ShortcutItem> {
-        val details = readFunctionDetails()
+        val details = functionDetailsForRender()
         val showTiles = RemotePrefs.read(prefs).panelShowTiles
         val keys = readFunctionPins().filter { key ->
             if (showTiles) return@filter true
@@ -362,8 +375,9 @@ class FanHost(
         )
         // 有认不出来的（枚举里没有，只能拿宿主应用图标顶）：后台补一次扫描，下一次划出扇形就有
         // 真图标了。就地扫描是绝对不行的 —— 这里在**手势中间的主线程**上（见 peekCached 的注释）。
-        // 扫描自带 3s 最小间隔，所以连着划几次不会叠起来。
-        if (entries.any { it.iconBitmap == null && it.intentUri == null }) {
+        // 扫描自带 3s 最小间隔，所以连着划几次不会叠起来。聚合支付是内建条目，扫描也扫不出来，
+        // 别为它触发。
+        if (entries.any { it.iconBitmap == null && it.intentUri == null && !AggregatePayment.isEntry(it) }) {
             scanShortcuts("FAN_FUNCTIONS")
         }
         return entries
@@ -415,6 +429,7 @@ class FanHost(
     private var syncFromAppReceiver: android.content.BroadcastReceiver? = null
     private var shortcutRequestReceiver: android.content.BroadcastReceiver? = null
     private var tileClickReceiver: android.content.BroadcastReceiver? = null
+    private var quickPayReceiver: android.content.BroadcastReceiver? = null
 
     private val scope = kotlinx.coroutines.CoroutineScope(
         kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob(),
@@ -443,13 +458,18 @@ class FanHost(
         // 「已选功能」也进扇形：排在收藏应用之后，顺序 = 用户点选顺序。数据源见 fanFunctionEntries()。
         dock.functionItems = { fanFunctionEntries() }
         dock.onFunctionSelected = { item ->
-            if (item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) {
-                // 磁贴必须回到 SystemUI 的 TileService 绑定路径；没有 Intent 可发（见 QsTileHost）。
-                QsTileHost.click(host, item)
-            } else {
-                // 快捷方式不是应用：走 ShortcutRepository（LauncherApps/Intent 两条路），小窗开关从远程组读
-                // —— 默认参数会去读 App 进程才有的设置，hook 进程读到的是系统界面自己的 cfg。
-                ShortcutRepository.launchShortcut(host, item, RemotePrefs.read(prefs).freeform)
+            when {
+                // 聚合支付：以小窗打开默认入口并把支付条贴到小窗下方（不启动"自己"）。
+                AggregatePayment.isEntry(item) -> quickPayTrigger?.invoke()
+                item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE -> {
+                    // 磁贴必须回到 SystemUI 的 TileService 绑定路径；没有 Intent 可发（见 QsTileHost）。
+                    QsTileHost.click(host, item)
+                }
+                else -> {
+                    // 快捷方式不是应用：走 ShortcutRepository（LauncherApps/Intent 两条路），小窗开关从远程组读
+                    // —— 默认参数会去读 App 进程才有的设置，hook 进程读到的是系统界面自己的 cfg。
+                    ShortcutRepository.launchShortcut(host, item, RemotePrefs.read(prefs).freeform)
+                }
             }
         }
         scope.launch {
@@ -655,6 +675,27 @@ class FanHost(
             )
         }.onSuccess { tileClickReceiver = tileClick }
             .onFailure { logger(Log.WARN, "QS_TILE_CLICK_REGISTER_FAILED", it) }
+
+        // 管理页（App 进程）点「聚合支付」时联系人条在 SystemUI 这边，发广播让控制器去弹
+        // （AggregatePayment.requestShow）。同样导出 + 只认模块 App。
+        val quickPay = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context?, i: Intent?) {
+                if (i?.action != AggregatePayment.ACTION_SHOW) return
+                if (!isFromModuleApp(this)) {
+                    logger(Log.WARN, "QUICK_PAY_SHOW_REJECTED sender=${runCatching { sentFromUid }.getOrNull()}", null)
+                    return
+                }
+                mainHandler.post { quickPayTrigger?.invoke() }
+            }
+        }
+        runCatching {
+            host.registerReceiver(
+                quickPay,
+                IntentFilter(AggregatePayment.ACTION_SHOW),
+                Context.RECEIVER_EXPORTED,
+            )
+        }.onSuccess { quickPayReceiver = quickPay }
+            .onFailure { logger(Log.WARN, "QUICK_PAY_REGISTER_FAILED", it) }
 
         // SCREEN_OFF → retract (original mo864f :1049-1056 → m9254Z)
         val r = object : android.content.BroadcastReceiver() {
@@ -1374,12 +1415,15 @@ class FanHost(
             is GestureAppLauncher.AdapterItem.AppItem -> icon.setImageDrawable(repo.icon(item.app, snap.cloneBadge))
             is GestureAppLauncher.AdapterItem.FunctionItem -> {
                 // 扇形的 tile 没有文字，所以图标就是全部信息：优先用快捷方式自己的图标
-                // （最近一次枚举结果带回来的那张），没有才退回宿主应用图标。
+                // （最近一次枚举结果带回来的那张），其次内建条目自带的 drawable（聚合支付），
+                // 最后才退回宿主应用图标。
                 val bmp = item.shortcut.iconBitmap
-                if (bmp != null && !bmp.isRecycled) {
-                    icon.setImageDrawable(android.graphics.drawable.BitmapDrawable(res, bmp))
-                } else {
-                    icon.setImageDrawable(
+                val drawable = item.shortcut.iconDrawable
+                when {
+                    bmp != null && !bmp.isRecycled ->
+                        icon.setImageDrawable(android.graphics.drawable.BitmapDrawable(res, bmp))
+                    drawable != null -> icon.setImageDrawable(drawable)
+                    else -> icon.setImageDrawable(
                         repo.icon(
                             com.repl.bubbledrawer.pinyin.BubbleApp(item.shortcut.packageName, item.shortcut.label),
                             snap.cloneBadge,
@@ -1588,7 +1632,7 @@ class FanHost(
             },
             functionPinsOf = { readFunctionPins() },
             // 已选功能的详情（名称/宿主/启动 Intent）：面板据此渲染，不依赖自己那份枚举结果。
-            pinnedFunctionItems = { readFunctionDetails() },
+            pinnedFunctionItems = { functionDetailsForRender() },
             onFunctionOrderChange = { writeFunctionPins(it) },
         )
         // Panel window root FIRST, then the Compose content inside it: the view-tree
@@ -1636,9 +1680,15 @@ class FanHost(
                 runCatching { wm.updateViewLayout(panel, lp) }
             },
             onLaunchShortcut = { item ->
-                // 面板在 SystemUI 里：小窗开关必须从远程组读（见 ShortcutRepository.launchShortcut
-                // 的注释），启动后收起面板（与 PanelContentFactory 的默认行为一致）。
-                ShortcutRepository.launchShortcut(host, item, RemotePrefs.read(prefs).freeform)
+                // 聚合支付不启动任何应用：它把联系人条切到聚合支付模式（Flyme QuickPayWindowHelper
+                // 驱动同一个 C2831I 的行为），面板先收起，条在面板走后出现。
+                if (com.repl.bubbledrawer.shortcut.AggregatePayment.isEntry(item)) {
+                    quickPayTrigger?.invoke()
+                } else {
+                    // 面板在 SystemUI 里：小窗开关必须从远程组读（见 ShortcutRepository.launchShortcut
+                    // 的注释），启动后收起面板（与 PanelContentFactory 的默认行为一致）。
+                    ShortcutRepository.launchShortcut(host, item, RemotePrefs.read(prefs).freeform)
+                }
                 hideMorePanel()
             },
         )
@@ -1842,6 +1892,8 @@ class FanHost(
         shortcutRequestReceiver = null
         tileClickReceiver?.let { runCatching { host.unregisterReceiver(it) } }
         tileClickReceiver = null
+        quickPayReceiver?.let { runCatching { host.unregisterReceiver(it) } }
+        quickPayReceiver = null
         pinsListener?.let { runCatching { prefs.unregisterOnSharedPreferenceChangeListener(it) } }
         pinsListener = null
         mainHandler.removeCallbacks(timeout)

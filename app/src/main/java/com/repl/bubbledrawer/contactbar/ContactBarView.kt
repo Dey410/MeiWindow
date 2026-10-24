@@ -16,6 +16,7 @@ import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.repl.bubbledrawer.shortcut.AggregatePayment
 import de.hdodenhof.circleimageview.CircleImageView
 import kotlin.math.abs
 
@@ -66,6 +67,8 @@ class ContactBarView(context: Context) : FrameLayout(context) {
     /** 36dp avatar, 45dp-wide name, 8dp padding per item — Flyme's `notification_list_item.xml`. */
     private val avatarSize = dp(36)
     private val nameWidth = dp(45)
+    /** 聚合支付条目的名字列：要放下「支付宝付款码」六个字，45dp 只够五个。 */
+    private val payNameWidth = dp(54)
     private val itemPadding = dp(8)
 
     private val backgroundDrawable = GradientDrawable().apply {
@@ -149,6 +152,8 @@ class ContactBarView(context: Context) : FrameLayout(context) {
         // Flyme hides the red dot once the notification behind the row is gone; our memory keeps the
         // row but the dot only shows while a notification is actually posted.
         dot.visibility = if (conversation.live) VISIBLE else GONE
+        // 名字列宽是条目共用的一个 View 槽位（会话/支付两个模式轮流 bind 同一批行），每次都要摆正。
+        (name.layoutParams as LinearLayout.LayoutParams).width = nameWidth
 
         item.translationY = 0f
         item.alpha = 1f
@@ -157,6 +162,39 @@ class ContactBarView(context: Context) : FrameLayout(context) {
             if (conversation.displayLabel == conversation.title) conversation.title
             else "${conversation.displayLabel}（${conversation.title}）"
         item.setOnTouchListener(SwipeTouchListener(item, onClick, onRemove, conversation))
+    }
+
+    /**
+     * 聚合支付模式（Flyme QuickPayWindowHelper 驱动同一个联系人条）：头像位放支付图标、名字列放宽到
+     * [payNameWidth]（「支付宝付款码」六个字），没有红点、**不能滑走** —— 点了就走（启动 + 收条）。
+     */
+    fun bindPay(items: List<AggregatePayment.PayAction>, onClick: (AggregatePayment.PayAction) -> Unit) {
+        while (row.childCount > items.size) row.removeViewAt(row.childCount - 1)
+        items.forEachIndexed { index, entry ->
+            val item = row.getChildAt(index) ?: newItem().also { row.addView(it) }
+            bindPayItem(item, entry, onClick)
+        }
+    }
+
+    private fun bindPayItem(
+        item: View,
+        entry: AggregatePayment.PayAction,
+        onClick: (AggregatePayment.PayAction) -> Unit,
+    ) {
+        val avatar = item.findViewById<CircleImageView>(AVATAR_ID)
+        val name = item.findViewById<TextView>(NAME_ID)
+        val dot = item.findViewById<View>(DOT_ID)
+
+        avatar.setImageDrawable(entry.icon?.takeIf { it.usable() })
+        name.text = entry.label
+        name.setTextColor(nameColor())
+        dot.visibility = GONE
+        (name.layoutParams as LinearLayout.LayoutParams).width = payNameWidth
+
+        item.translationY = 0f
+        item.alpha = 1f
+        item.contentDescription = entry.label
+        item.setOnTouchListener(PayTapListener(item, onClick, entry))
     }
 
     /** Tap opens the conversation, a vertical swipe removes it — one touch stream, both decisions. */
@@ -230,6 +268,48 @@ class ContactBarView(context: Context) : FrameLayout(context) {
                 .setDuration(160)
                 .withEndAction { onRemove(conversation) }
                 .start()
+        }
+    }
+
+    /**
+     * 支付条目只认点击：没有「滑动移除」这个概念（划走一个付款码没有意义，条目也不会真的少），
+     * 所以是 [SwipeTouchListener] 去掉拖拽分支后的形状 —— 按压缩放 + 抬起判tap，手势被
+     * 条的左右滑动抢走（CANCEL）就不算点击。
+     */
+    private inner class PayTapListener(
+        private val item: View,
+        private val onClick: (AggregatePayment.PayAction) -> Unit,
+        private val entry: AggregatePayment.PayAction,
+    ) : OnTouchListener {
+
+        private var downX = 0f
+        private var downY = 0f
+        private var downAt = 0L
+
+        override fun onTouch(view: View, event: MotionEvent): Boolean {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.rawX
+                    downY = event.rawY
+                    downAt = event.eventTime
+                    item.animate().scaleX(0.94f).scaleY(0.94f).setDuration(70).start()
+                    return true
+                }
+
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    item.animate().scaleX(1f).scaleY(1f).setDuration(110).start()
+                    if (event.actionMasked == MotionEvent.ACTION_UP) {
+                        val dx = abs(event.rawX - downX)
+                        val dy = abs(event.rawY - downY)
+                        if (dx <= touchSlop && dy <= touchSlop && event.eventTime - downAt <= TAP_MAX_MS) {
+                            onClick(entry)
+                        }
+                    }
+                    return true
+                }
+            }
+            // MOVE 放行给 HorizontalScrollView：条目多到一屏放不下时条还是要能左右滑。
+            return false
         }
     }
 

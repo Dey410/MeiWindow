@@ -27,12 +27,34 @@ internal const val MINI_ENLARGE_RATIO = 1.5f
 /**
  * 设置里的「放大倍率」滑块（百分数）→ 缩放倍数。
  *
- * 用户 2026-10-18：「再做一个大号迷你小窗的放大倍率滑块，现在默认是 1.5 倍」。
- * 范围就是 `RemotePrefs.FLYME_MINI_ENLARGE_MIN/MAX`（110%–200%），越界一律夹回来 ——
- * 滑块本身已经限制了范围，这里的夹取是给"旧配置/手改的共享组值"兜底。
+ * 用户 2026-10-18：「再做一个大号迷你小窗的放大倍率滑块，现在默认是 1.5 倍」；
+ * 2026-10-24 又要求把范围从 110%–200% 放宽到 **100%–250%**。
+ * 越界一律夹回来 —— 滑块本身已经限制了范围，这里的夹取是给"旧配置/手改的共享组值"兜底。
  */
 internal fun miniEnlargeRatioFromPct(pct: Int): Float =
     pct.coerceIn(RemotePrefs.FLYME_MINI_ENLARGE_MIN, RemotePrefs.FLYME_MINI_ENLARGE_MAX) / 100f
+
+/**
+ * 「放大」后的迷你缩放：正常迷你 scale × 倍率，并夹在 [MINI_SCALE_MIN]/[MINI_SCALE_MAX] 内。
+ *
+ * 手动点「放大」和 ROM 计算迷你尺寸（`getMiniFreeformScale` hook）共用这一条公式，
+ * 保证「保存的放大状态」与现场点出来的尺寸完全一致。
+ */
+internal fun enlargedMiniScale(normalMiniScale: Float, ratio: Float): Float =
+    (normalMiniScale * ratio).coerceIn(MINI_SCALE_MIN, MINI_SCALE_MAX)
+
+/**
+ * 保存的「大迷你」应用集合的增删 —— 纯逻辑，方便单测。
+ * 包名为空时不改变集合（有些 task 在动画早期拿不到包名）。
+ */
+internal fun updateMiniEnlargedPackages(
+    current: Set<String>,
+    packageName: String,
+    enlarged: Boolean,
+): Set<String> {
+    if (packageName.isBlank()) return current
+    return if (enlarged) current + packageName else current - packageName
+}
 
 /** 大于「正常迷你缩放」这个比例就算放大状态（ROM 自己算出来的 scale 会有 ±1px 的取整误差）。 */
 private const val MINI_ENLARGED_THRESHOLD = 1.05f
@@ -88,8 +110,11 @@ internal fun decideMiniScale(
     val nowScale = currentScale.takeIf { it.isFinite() && it > 0f } ?: normalMiniScale
     val enlargedNow = isMiniScaleEnlarged(nowScale, normalMiniScale)
 
-    val target = (if (enlargedNow) normalMiniScale else normalMiniScale * ratio)
-        .coerceIn(MINI_SCALE_MIN, MINI_SCALE_MAX)
+    val target = if (enlargedNow) {
+        normalMiniScale.coerceIn(MINI_SCALE_MIN, MINI_SCALE_MAX)
+    } else {
+        enlargedMiniScale(normalMiniScale, ratio)
+    }
     if (!target.isFinite() || target <= 0f) return null
 
     val nowW = (taskWidth * nowScale).roundToInt()

@@ -1058,16 +1058,23 @@ surface 一起拆掉；`FlymeMiniMenuOverlay.dismiss` 现在先把 host/surface 
 
 ### 放大倍率滑块（2026-10-18 新增）
 
-设置 → 实验性功能 → 迷你小窗（悬浮窗）→「放大倍率」，110%–200%，默认 **150%**（= 原来的 1.5 倍）。
-存的是百分数（`flyme_mini_enlarge_pct`），模块每次点「放大」现读（改完不用重启系统界面），
-倍率仍受 `MINI_SCALE_MAX = 0.95` 与屏幕夹取约束。几何换算见
+设置 → 实验性功能 → 迷你小窗（悬浮窗）→「放大倍率」，**100%–250%**（2026-10-24 从 110%–200% 放宽），
+默认 **150%**（= 原来的 1.5 倍）。存的是百分数（`flyme_mini_enlarge_pct`），模块每次点「放大」现读
+（改完不用重启系统界面），倍率仍受 `MINI_SCALE_MAX = 0.95` 与屏幕夹取约束。几何换算见
 `MiniScaleToggle.miniEnlargeRatioFromPct`。
+
+**保存放大状态（2026-10-24 新增）**：点过「放大」的应用会按包名记进
+`flyme_mini_enlarged_packages`（`updateMiniEnlargedPackages`）；`MiuiMultiWindowUtils.getMiniFreeformScale`
+的 hook 在 ROM 每次计算迷你尺寸时把倍率乘进去，所以拖动、上滑回桌面、从最近任务直接开迷你窗等路径
+都会一进迷你就是大的。点一次「还原」会把这个包名移出集合；聊天记录/应用数据不受影响。
 
 取证（模块日志 / `adb logcat -s BubbleDrawer`）：
 
 ```
 TOGGLE_MINI_SCALE taskId=… enlarged=true scale=… left=… top=…
 TOGGLE_MINI_SCALE_FALLBACK reason=no_geometry|no_animation taskId=…
+MINI_ENLARGE_SAVED pkg=… enlarged=true total=…
+MINI_ENLARGE_SCALE pkg=… normal=… pct=… used=…
 MINI_MUTE taskId=… pkg=… uid=… from=false to=true applied=true
 Mute icon pkg=… muted=true enlarged=false
 pending mute applied key=… uid=… volume=0
@@ -1083,8 +1090,12 @@ release pkg=… restore=1.0 volume=true appOps=true
 - [ ] 放大后**拖动**它：拖动过程中不闪、松手仍是放大尺寸（不再是"一拖就变回迷你"）
 - [ ] 放大后拖动到屏幕边缘 / 上滑悬停进最近任务再回来 / 转屏再转回：尺寸保持
 - [ ] 连点两次「放大」：第二次打断第一次，最终停在正确尺寸（不会两个动画打架）
-- [ ] 把「放大倍率」拖到 110% 与 200% 各试一次：窗口大小明显不同，200% 也不会铺满屏幕
-      （`MINI_SCALE_MAX` 兜底）；改完立刻点「放大」就生效，不用重启系统界面
+- [ ] 把「放大倍率」拖到 100% 与 250% 各试一次：100% 等于正常迷你，250% 明显更大；极高倍率仍受
+      `MINI_SCALE_MAX = 0.95` 与屏幕夹取兜底；改完立刻点「放大」就生效，不用重启系统界面
+- [ ] 点「放大」后把窗口还原成普通小窗，再重新上滑/回桌面收成迷你：**仍然是大的**（不用再点一次放大）；
+      点一次「还原」后再收起：回到正常迷你尺寸
+- [ ] 放大状态下关掉迷你小窗再从桌面重新打开并收成迷你：尺寸按保存的倍率（日志 `MINI_ENLARGE_SCALE`）；
+      换另一个没放大过的应用收迷你：仍是普通迷你（不会串到别的应用）
 - [ ] 点「静音」：应用声音消失、图标变"取消静音"，**面板随即收起**
 - [ ] 应用**暂停/没在出声**时点「静音」：图标立刻变"取消静音"（不再是没反应的死按钮），
       然后让它开始播（点播放）：**一开始就是静音**（日志 `pending mute applied`）

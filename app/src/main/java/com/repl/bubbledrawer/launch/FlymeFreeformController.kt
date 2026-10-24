@@ -152,6 +152,16 @@ class FlymeFreeformController(
         savedContext = context
         // 上个进程（SystemUI 重启前）没来得及还原的静音音量：这次启动补上，见 MiniAppAudioHelper.attach。
         MiniAppAudioHelper.attach(context)
+        // 「保存的大迷你」状态必须写在 SystemUI 自己的持久化存储里：`prefs` 是模块组的只读镜像，
+        // 它的 edit() 在 hook 进程里会抛 UnsupportedOperationException（2026-10-24 真机崩溃）。
+        miniScaleStatePrefs = runCatching {
+            val storage = if (context.isDeviceProtectedStorage) {
+                context
+            } else {
+                context.createDeviceProtectedStorageContext()
+            }
+            storage.getSharedPreferences(MINI_STATE_PREFS_NAME, Context.MODE_PRIVATE)
+        }.getOrNull()
         // Outside tap (the 黑色遮罩 itself is the touch target: a trusted overlay with an input
         // receiver registered for it, see FreeformBackgroundDecoration). Runs on the main thread.
         backgroundDecoration = FreeformBackgroundDecoration(context, classLoader, prefs) {
@@ -995,6 +1005,7 @@ class FlymeFreeformController(
             log("TOGGLE_MINI_SCALE_FAILED reason=no_task_info taskId=$taskId")
             return false
         }
+        val packageName = callNoArg(taskInfo, "getPackageName") as? String
         // 读几何、建动画参数、起动画都放在 WMShell 线程上：taskInfo 是它的状态，跨线程读会读到
         // 动画中间的一帧（scale 可能还是 0），也会和 `updateBaseAnimParam` 打架。
         executeOnShell {
@@ -1018,6 +1029,8 @@ class FlymeFreeformController(
                 "TOGGLE_MINI_SCALE taskId=$taskId enlarged=${decision.enlarged} " +
                     "scale=${decision.scale} left=${decision.left} top=${decision.top}",
             )
+            // 保存「这个应用下次进迷你也要这么大」：失败/回退路径不写，避免把没有真正发生的状态记下来。
+            if (packageName != null) saveMiniEnlargeState(packageName, decision.enlarged)
         }
         return true
     }
@@ -1062,17 +1075,19 @@ class FlymeFreeformController(
     private fun normalMiniScaleOf(taskInfo: Any, originBounds: Rect): Float? {
         val packageName = callNoArg(taskInfo, "getPackageName") as? String ?: return null
         val landscape = (callNoArg(taskInfo, "isLandscapeFreeform") as? Boolean) ?: false
-        return runCatching {
-            val utils = classLoader.loadClass("android.util.MiuiMultiWindowUtils")
-            val method = utils.getMethod(
-                "getMiniFreeformScale",
-                Context::class.java,
-                Boolean::class.javaPrimitiveType,
-                Rect::class.java,
-                String::class.java,
-            )
-            (method.invoke(null, context, landscape, originBounds, packageName) as? Number)?.toFloat()
-        }.getOrNull()?.takeIf { it.isFinite() && it > 0f }
+        return withoutMiniScaleHook {
+            runCatching {
+                val utils = classLoader.loadClass("android.util.MiuiMultiWindowUtils")
+                val method = utils.getMethod(
+                    "getMiniFreeformScale",
+                    Context::class.java,
+                    Boolean::class.javaPrimitiveType,
+                    Rect::class.java,
+                    String::class.java,
+                )
+                (method.invoke(null, context, landscape, originBounds, packageName) as? Number)?.toFloat()
+            }.getOrNull()
+        }?.takeIf { it.isFinite() && it > 0f }
     }
 
     private fun buildMiniScaleAnimTarget(taskInfo: Any, decision: MiniScaleDecision): Any? {
@@ -1609,6 +1624,22 @@ class FlymeFreeformController(
         @Volatile var instance: FlymeFreeformController? = null
         @Volatile var suppressSingleTapTaskId: Int = -1
 
+        /**
+         * 聚合支付换窗的落位窗口：置位后的时限内，ROM 的避让（`avoidAsPossible`）一律跳过、
+         * **不看**「禁止小窗偏移」开关 —— 换支付入口时旧窗正在关、新窗跟着就位，此时 ROM 的
+         * 错开（78dp/44dp）会让支付小窗和它下面的支付条一起挪到偏位上。ContactBarController
+         * 在发射支付启动前 [suppressAvoidOffsetFor]，新窗 adopt 到位（或超时）后清除。
+         */
+        @Volatile var avoidOffsetSuppressedUntil: Long = 0L
+
+        fun suppressAvoidOffsetFor(durationMs: Long) {
+            avoidOffsetSuppressedUntil = android.os.SystemClock.uptimeMillis() + durationMs
+        }
+
+        fun avoidOffsetSuppressionActive(): Boolean =
+            android.os.SystemClock.uptimeMillis() < avoidOffsetSuppressedUntil
+
+
         @JvmStatic
         fun setDisableTouch(disabled: Boolean) {
             runCatching {
@@ -1730,6 +1761,63 @@ class FlymeFreeformController(
             if (miniSwipeConvertedAt != 0L) return
             miniSwipeConvertedAt = SystemClock.uptimeMillis()
             log("MINI_SWIPE_CONVERTED_BY_ROM taskId=$taskId old=$oldMode new=$newMode")
+        }
+
+        /**
+         * 反射问 ROM「正常迷你缩放」时，临时让 [hookMiniFreeformScale] 放行原始值。
+         *
+         * 这个标记必须是线程局部的：hook 和 `normalMiniScaleOf` 的反射调用发生在同一条 WMShell 线程上，
+         * 但别的窗口/别的线程可能正需要按保存的倍率算尺寸。用布尔量会让两个窗口互相看见对方的临时状态。
+         */
+        private val miniScaleHookBypass = ThreadLocal<Boolean>()
+
+        private inline fun <T> withoutMiniScaleHook(block: () -> T): T {
+            val previous = miniScaleHookBypass.get()
+            miniScaleHookBypass.set(true)
+            return try {
+                block()
+            } finally {
+                if (previous == null) miniScaleHookBypass.remove() else miniScaleHookBypass.set(previous)
+            }
+        }
+
+        /** SystemUI-local, device-protected storage for the saved 「大迷你」 packages. */
+        private const val MINI_STATE_PREFS_NAME = "bubbledrawer_mini_state"
+
+        /**
+         * `prefs`（LSPosed 的 remote group 视图）在 hook 进程里是**只读**的（FanHost 同样踩过：
+         * edit() 抛 `UnsupportedOperationException: Read only implementation`）。所以保存状态走
+         * SystemUI 自己的 device-protected SharedPreferences —— 跨 SystemUI 重启、模块热重载、
+         * 手机重启都还在，而且不会因为模块 App 侧 syncLocal 把它顶掉。
+         */
+        @Volatile private var miniScaleStatePrefs: SharedPreferences? = null
+
+        /** 保存的「大迷你」包名集合；SharedPreferences 返回的 Set 不能直接改，先复制。 */
+        private fun miniEnlargedPackages(): Set<String> =
+            miniScaleStatePrefs
+                ?.getStringSet(RemotePrefs.KEY_FLYME_MINI_ENLARGED_PACKAGES, emptySet<String>())
+                ?.toSet()
+                .orEmpty()
+
+        private fun saveMiniEnlargeState(packageName: String, enlarged: Boolean) {
+            if (packageName.isBlank()) return
+            val storage = miniScaleStatePrefs ?: run {
+                log("MINI_ENLARGE_SAVE_SKIPPED reason=no_storage pkg=$packageName")
+                return
+            }
+            val current = miniEnlargedPackages()
+            val next = updateMiniEnlargedPackages(current, packageName, enlarged)
+            if (next == current) return
+            // commit：下一次进迷你可能就在几百毫秒后，必须立刻对 hook 可见；失败也不能影响动画线程。
+            runCatching {
+                storage.edit()
+                    .putStringSet(RemotePrefs.KEY_FLYME_MINI_ENLARGED_PACKAGES, next)
+                    .commit()
+            }.onSuccess {
+                log("MINI_ENLARGE_SAVED pkg=$packageName enlarged=$enlarged total=${next.size}")
+            }.onFailure {
+                log("MINI_ENLARGE_SAVE_FAILED pkg=$packageName", it)
+            }
         }
 
         /**
@@ -1863,6 +1951,7 @@ class FlymeFreeformController(
             hookControllerCapture(module, classLoader)
             hookFreeformLaunchConfig(module, prefs, classLoader)
             hookFreeformScale(module, prefs, classLoader)
+            hookMiniFreeformScale(module, prefs, classLoader)
             hookBoundsCentering(module, prefs, classLoader)
             hookRestoreAvoid(module, prefs, classLoader)
             hookFreeformAvoidOffset(module, prefs, classLoader)
@@ -2349,6 +2438,82 @@ class FlymeFreeformController(
         }
 
         /**
+         * 保存的「大迷你」尺寸：ROM 每次进迷你都会用
+         * `MiuiMultiWindowUtils.getMiniFreeformScale(context, landscape, bounds, pkg)` 重新算一遍缩放
+         * （`MiuiFreeformModeAnimation:3941/4083/4613/5863`）。这里按**包名**把属于用户的放大倍率乘进去，
+         * 于是拖动、回桌面、从最近任务直接开迷你窗等所有路径都会一开始就按大尺寸生成，不用事后再补动画。
+         *
+         * 只在 `flymeMiniMenu` 开启时生效：倍率滑块本来就跟着这个开关灰掉，关掉菜单后不应该还留着
+         * 一个没有入口可改的"大迷你"状态。
+         *
+         * [normalMiniScaleOf] 自己也会反射调用这个方法，所以用 `miniScaleHookBypass` 保证它拿到 ROM 的
+         * 原始值，否则「放大 / 还原」会把已经放大的尺寸当成正常值，越点越大。
+         */
+        private fun hookMiniFreeformScale(
+            module: XposedModule,
+            prefs: SharedPreferences,
+            classLoader: ClassLoader,
+        ) {
+            val utilsClass = runCatching {
+                classLoader.loadClass("android.util.MiuiMultiWindowUtils")
+            }.getOrNull()
+            if (utilsClass == null) {
+                log("HOOK_SKIPPED_MiniFreeformScale cls=false")
+                return
+            }
+            val methods = utilsClass.declaredMethods.filter { it.name == "getMiniFreeformScale" }
+            if (methods.isEmpty()) {
+                log("HOOK_SKIPPED_MiniFreeformScale hooks=0")
+                return
+            }
+
+            var hooked = 0
+            for (method in methods) {
+                runCatching {
+                    module.hook(method)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .setId("bubbledrawer.mini.scale.${method.name}.${method.parameterCount}")
+                        .intercept { chain ->
+                            if (miniScaleHookBypass.get() == true) return@intercept chain.proceed()
+                            val snap = RemotePrefs.read(prefs)
+                            if (!snap.flymeMiniMenu) return@intercept chain.proceed()
+                            val packageName = chain.args.lastOrNull() as? String
+                                ?: return@intercept chain.proceed()
+                            if (packageName !in miniEnlargedPackages()) {
+                                return@intercept chain.proceed()
+                            }
+                            val original = chain.proceed()
+                            val normal = (original as? Number)?.toFloat()
+                            if (normal == null || !normal.isFinite() || normal <= 0f) {
+                                return@intercept original
+                            }
+                            val ratio = miniEnlargeRatioFromPct(snap.flymeMiniEnlargePct)
+                            val used = enlargedMiniScale(normal, ratio)
+                            logMiniEnlargeScale(packageName, normal, snap.flymeMiniEnlargePct, used)
+                            used
+                        }
+                }.onFailure {
+                    log("HOOK_FAILED_MiniFreeformScale params=${method.parameterCount}", it)
+                }.onSuccess {
+                    hooked++
+                }
+            }
+            log("HOOK_INSTALLED_MiuiMultiWindowUtils.getMiniFreeformScale hooks=$hooked")
+        }
+
+        /** One line per distinct (package, normal scale, ratio): this runs on every mini entry. */
+        @Volatile private var miniScaleLogged = false
+        @Volatile private var lastMiniScaleKey = ""
+
+        private fun logMiniEnlargeScale(packageName: String, normal: Float, pct: Int, used: Float) {
+            val key = "$packageName:$normal:$pct:$used"
+            if (miniScaleLogged && key == lastMiniScaleKey) return
+            miniScaleLogged = true
+            lastMiniScaleKey = key
+            log("MINI_ENLARGE_SCALE pkg=$packageName normal=$normal pct=$pct used=$used")
+        }
+
+        /**
          * 禁止小窗偏移 — 已经有小窗时，新开的小窗不再为了避开它而挪位。
          *
          * HyperOS 的「错开」就是在 `avoidIfNeeded`（MiuiMultiWindowUtils:1807，手机走这一支）里做的：
@@ -2398,7 +2563,7 @@ class FlymeFreeformController(
                         // is about HyperOS's own 错开 behaviour, so it must also work while the module
                         // is not taking the 小窗 over at all (user report: 不开 Flyme 小窗时开关不生效).
                         val snap = RemotePrefs.read(prefs)
-                        if (!snap.flymeFreeformNoOffset) return@intercept chain.proceed()
+                        if (!snap.flymeFreeformNoOffset && !avoidOffsetSuppressionActive()) return@intercept chain.proceed()
                         logOffsetSkipped(chain.args)
                         null
                     }

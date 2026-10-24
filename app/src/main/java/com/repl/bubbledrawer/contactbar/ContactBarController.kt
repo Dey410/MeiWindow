@@ -18,8 +18,12 @@ import android.view.SurfaceControlViewHost
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
+import com.repl.bubbledrawer.R
 import com.repl.bubbledrawer.launch.FlymeFreeformController
 import com.repl.bubbledrawer.launch.MiuiFreeform
+import com.repl.bubbledrawer.shortcut.AggregatePayment
+import com.repl.bubbledrawer.shortcut.ShortcutRepository
+import com.repl.bubbledrawer.xposed.ModuleResources
 import com.repl.bubbledrawer.xposed.RemotePrefs
 
 /**
@@ -155,6 +159,32 @@ class ContactBarController(
      */
     private var unfocused = false
 
+    /**
+     * 聚合支付（QuickPay）模式：条脱离会话数据、贴在**聚合支付小窗**下方 —— Flyme 的
+     * `QuickPayWindowHelper` 驱动的就是同一个 `C2831I`（`m9387K` 塞四个支付入口、
+     * `m9058C(true)` 置 QuickPayWindowShowing）。触发时直接以小窗打开默认入口（微信扫一扫），
+     * 小窗出现（Appeared/Focused 事件）后条像会话条一样跟随它；几何/可见性与会话模式共用
+     * 同一条帧循环链，差别只在数据源（[bindPay] vs 会话 bind）。
+     */
+    private var payActive = false
+    private var payEntries: List<AggregatePayment.PayAction> = emptyList()
+
+    /** 当前支付小窗的 taskId（0 = 还没到位）。用于"窗内切换弹成新窗"时关掉旧的那扇。 */
+    private var payTaskId = 0
+
+    /**
+     * 正在等待到位的支付小窗的包名。触发/切换入口时武装；`Appeared/Focused/ToFront` 里包名
+     * 匹配的事件就是"我们打开的那扇窗"（采用它），不匹配的是用户自己开的窗（结束支付会话）。
+     * [PAY_PENDING_TIMEOUT_MS] 内没等到就放弃会话（启动失败/落全屏的兜底）。
+     */
+    private var pendingPayPackage: String? = null
+    private var pendingPayExpiry: Runnable? = null
+
+    /** 换入口流程：旧窗关完（Vanished）后要发射的新条目；null = 没有在等的。 */
+    private var pendingRelaunch: AggregatePayment.PayAction? = null
+    private var pendingRelaunchFired = false
+    private var pendingRelaunchFallback: Runnable? = null
+
     /** taskId → the `MiuiFreeformModeTaskInfo` we have seen for it (bounded, main thread only). */
     private val taskById = HashMap<Int, Any>()
 
@@ -165,7 +195,8 @@ class ContactBarController(
         if (key == RemotePrefs.KEY_CONTACT_BAR) {
             onMain {
                 log(Log.INFO, "CONTACT_BAR_PREF_CHANGED enabled=${enabled()} thread=${Thread.currentThread().name}")
-                if (!enabled()) detach("PREF_OFF")
+                // 聚合支付不受这个开关管（它是被显式点出来的，不是小窗的附属条）。
+                if (!payActive && !enabled()) detach("PREF_OFF")
                 scheduleFrame()
             }
         }
@@ -197,6 +228,48 @@ class ContactBarController(
 
     override fun onFreeformTaskAppeared(taskInfo: Any) = onMain {
         rememberTask(taskInfo)
+        if (payActive) {
+            when {
+                isPendingPay(taskInfo) -> {
+                    // 我们打开的支付小窗到位了：条贴到它下面；旧支付窗口（换入口的场合）关掉。
+                    adoptPayTask(taskInfo)
+                }
+                isSameAsAdoptedPayWindow(taskInfo) -> {
+                    // 同一个支付 App 又冒出一扇窗：支付宝的 ShortcutsLauncherActivity 桥接会
+                    // 先开一扇再让主页面开另一扇。ID 更大的那扇才是后落的真页面，接过来；
+                    // 旧的那扇（ID 更小）忽略，绝不能因此结束支付会话（2026-10-24 用户：
+                    // 「微信跳转到支付宝后下方的聚合支付条消失」）。
+                    if (isNewerPayTask(taskInfo)) {
+                        log(
+                            Log.INFO,
+                            "QUICK_PAY_SECOND_WINDOW pkg=${FreeformTask.packageName(taskInfo)} " +
+                                "taskId=${FreeformTask.taskId(taskInfo)} old=$payTaskId",
+                        )
+                        adoptPayTask(taskInfo)
+                    } else {
+                        log(
+                            Log.INFO,
+                            "QUICK_PAY_IGNORE_OLD_WINDOW taskId=${FreeformTask.taskId(taskInfo)} " +
+                                "current=$payTaskId",
+                        )
+                        return@onMain
+                    }
+                }
+                pendingRelaunch != null || pendingPayPackage != null -> {
+                    // 换窗空档里别的窗口（桌面、旧窗收尾）出现：等我们的新窗，别结束会话。
+                    log(
+                        Log.INFO,
+                        "QUICK_PAY_IGNORE_APPEARED pkg=${FreeformTask.packageName(taskInfo)} " +
+                            "taskId=${FreeformTask.taskId(taskInfo)}",
+                    )
+                    return@onMain
+                }
+                else -> {
+                    // 用户自己开的无关小窗：支付会话让位，会话条按原有链路接管。
+                    dismissQuickPay("WINDOW_APPEARED")
+                }
+            }
+        }
         if (task !== taskInfo) {
             task = taskInfo
             currentPkg = null
@@ -220,6 +293,29 @@ class ContactBarController(
     override fun onFreeformTaskClosing(taskId: Int) = onMain {
         val current = task ?: return@onMain
         if (FreeformTask.taskId(current) != taskId) return@onMain
+        if (payActive) {
+            if (pendingPayPackage != null) {
+                // 换入口流程里关掉的旧支付窗口：预期之内，会话继续等新窗口。
+                log(Log.INFO, "QUICK_PAY_OLD_CLOSING taskId=$taskId")
+                return@onMain
+            }
+            // 支付宝桥接窗先关、真页面后落：把条交给同一 App 里 ID 更大的那扇窗。
+            val handoff = newerPayWindow(taskId, current)
+            if (handoff != null) {
+                log(
+                    Log.INFO,
+                    "QUICK_PAY_HANDOFF closing=$taskId -> ${FreeformTask.taskId(handoff)}",
+                )
+                task = null
+                adoptPayTask(handoff)
+                scheduleFrame()
+                return@onMain
+            }
+            // 支付小窗被用户关掉：会话结束，条收起。
+            log(Log.INFO, "CONTACT_BAR_TASK_CLOSING taskId=$taskId (pay window)")
+            dismissQuickPay("PAY_WINDOW_CLOSING")
+            return@onMain
+        }
         log(Log.INFO, "CONTACT_BAR_TASK_CLOSING taskId=$taskId")
         closingUntil = SystemClock.uptimeMillis() + CLOSE_LATCH_MS
         detach("CLOSING")
@@ -235,6 +331,20 @@ class ContactBarController(
      */
     override fun onFreeformTaskToFront(taskId: Int) = onMain {
         val known = taskById[taskId]
+        if (payActive && known != null && known !== task) {
+            when {
+                isPendingPay(known) -> adoptPayTask(known)
+                isSameAsAdoptedPayWindow(known) -> {
+                    if (!isNewerPayTask(known)) return@onMain
+                    adoptPayTask(known)
+                }
+                pendingRelaunch != null || pendingPayPackage != null -> return@onMain
+                else -> {
+                    dismissQuickPay("WINDOW_TO_FRONT")
+                    return@onMain
+                }
+            }
+        }
         val current = task
         if (known != null && known !== current) {
             log(
@@ -275,6 +385,27 @@ class ContactBarController(
      */
     override fun onFreeformTaskFocused(taskInfo: Any) = onMain {
         rememberTask(taskInfo)
+        if (payActive && task !== taskInfo) {
+            when {
+                isPendingPay(taskInfo) -> adoptPayTask(taskInfo)
+                isSameAsAdoptedPayWindow(taskInfo) -> {
+                    if (!isNewerPayTask(taskInfo)) return@onMain
+                    adoptPayTask(taskInfo)
+                }
+                pendingRelaunch != null || pendingPayPackage != null -> {
+                    log(
+                        Log.INFO,
+                        "QUICK_PAY_IGNORE_FOCUSED pkg=${FreeformTask.packageName(taskInfo)} " +
+                            "taskId=${FreeformTask.taskId(taskInfo)}",
+                    )
+                    return@onMain
+                }
+                else -> {
+                    // 焦点移到无关窗口：结束支付会话，随后的正常流程把条交给那个窗口。
+                    dismissQuickPay("WINDOW_FOCUSED_OTHER")
+                }
+            }
+        }
         if (task !== taskInfo) {
             task = taskInfo
             currentPkg = null
@@ -294,11 +425,42 @@ class ContactBarController(
         taskById.remove(taskId)
         val current = task ?: return@onMain
         if (FreeformTask.taskId(current) == taskId) {
-            log(Log.INFO, "CONTACT_BAR_TASK_VANISHED taskId=$taskId")
+            log(Log.INFO, "CONTACT_BAR_TASK_VANISHED taskId=$taskId pay=$payActive")
+            val switching = payActive && pendingPayPackage != null
+            val reason = when {
+                switching -> "PAY_SWITCH"
+                payActive -> "PAY_CLOSED"
+                else -> "TASK_VANISHED"
+            }
+            if (payActive && !switching) {
+                // 支付 App 的另一扇窗还在（支付宝桥接窗关掉、真页面已落）：交给它，别结束会话。
+                val handoff = newerPayWindow(taskId, current)
+                if (handoff != null) {
+                    log(
+                        Log.INFO,
+                        "QUICK_PAY_HANDOFF vanished=$taskId -> ${FreeformTask.taskId(handoff)}",
+                    )
+                    task = null
+                    adoptPayTask(handoff)
+                    scheduleFrame()
+                    return@onMain
+                }
+                // 支付小窗没了（用户关掉/崩溃）：会话结束。
+                payActive = false
+                payEntries = emptyList()
+                payTaskId = 0
+                clearPendingPay()
+            }
             task = null
             unfocused = false
-            detach("TASK_VANISHED")
+            detach(reason)
             destroySurface()
+            // 换入口：旧窗彻底没了，给 SurfaceFlinger 一拍再发射新窗（太贴着关窗动画发射
+            // 会被 ROM 吞掉——"关了但新窗不来"）。
+            val relaunch = pendingRelaunch
+            if (switching && relaunch != null && !pendingRelaunchFired) {
+                main.postDelayed({ fireRelaunch(relaunch) }, RELAUNCH_DELAY_MS)
+            }
         }
     }
 
@@ -317,6 +479,475 @@ class ContactBarController(
         // 0 = 普通小窗 (bar visible), 1/2/3 = 迷你/贴边 (bar must go away).
         if (newMode != FreeformTask.MODE_NORMAL) detach("MODE_$newMode") else hideReason = null
         scheduleFrame()
+    }
+
+    // ---------------------------------------------------------------- quick pay（聚合支付模式）
+
+    /**
+     * 触发聚合支付（Flyme `m9075w` 的等价物）：解析四个支付入口，**直接以小窗打开默认入口**
+     * （微信扫一扫，用户 2026-10-24：「官方逻辑是打开一个扫一扫小窗，然后下面出现聚合支付条」），
+     * 小窗到位后条贴到它下方。一个应用都没装/一个入口都解析不出来时提示后返回。
+     */
+    fun showAggregateQuickPay() = onMain {
+        if (payActive) {
+            log(Log.INFO, "QUICK_PAY_ALREADY_UP")
+            return@onMain
+        }
+        val entries = AggregatePayment.resolveEntries(host)
+        if (entries.isEmpty()) {
+            log(Log.WARN, "QUICK_PAY_NO_ENTRIES")
+            runCatching {
+                android.widget.Toast.makeText(
+                    ModuleResources.packageContext(host) ?: host,
+                    R.string.aggregate_pay_unavailable,
+                    android.widget.Toast.LENGTH_SHORT,
+                ).show()
+            }
+            return@onMain
+        }
+        payActive = true
+        payEntries = entries
+        payTaskId = 0
+        currentPkg = null
+        hideReason = null
+        closingUntil = 0L
+        unfocused = false
+        val first = entries.first()
+        val firstPkg = first.launch?.packageName
+        if (firstPkg == null) {
+            payActive = false
+            payEntries = emptyList()
+            return@onMain
+        }
+        armPendingPay(firstPkg)
+        FlymeFreeformController.suppressAvoidOffsetFor(PAY_OFFSET_SUPPRESS_MS)
+        launchPayEntryInNewWindow(first, reuseTaskId = reuseTaskIdFor(firstPkg))
+        scheduleNext()
+        log(Log.INFO, "QUICK_PAY_SHOW entries=${entries.size} default=${first.label}")
+    }
+
+    /** 结束支付会话（用户关掉支付小窗 / 焦点移去别的窗口 / 启动迟迟不到位）。 */
+    fun dismissQuickPay(reason: String) = onMain {
+        if (!payActive) return@onMain
+        payActive = false
+        payEntries = emptyList()
+        payTaskId = 0
+        clearPendingPay()
+        pendingRelaunch = null
+        pendingRelaunchFired = false
+        pendingRelaunchFallback?.let { main.removeCallbacks(it) }
+        pendingRelaunchFallback = null
+        FlymeFreeformController.avoidOffsetSuppressedUntil = 0L
+        detach(reason)
+        // 有小窗在的话立刻排一帧，把会话条摆回去，不留"付完款条没了"的空窗。
+        if (task != null) scheduleFrame()
+    }
+
+    private fun onPayEntryClick(entry: AggregatePayment.PayAction) {
+        val item = entry.launch
+        if (item == null) {
+            log(Log.WARN, "QUICK_PAY_CLICK_NO_LAUNCH label=${entry.label}")
+            return
+        }
+        val info = task
+        // 同应用换页：支付宝的深链可以在原任务里跳，**不关窗**；微信不行 —— 它的
+        // ShortCutDispatchActivity 是 singleInstance 且只在 onCreate 分发，只能关掉旧页、
+        // 重新拉一扇（同一位置的一扇窗，不会并排多开）。用户 2026-10-24：「同应用跳转
+        // 不唤起新小窗」对支付宝成立，微信受它自己的分发 Activity 限制。
+        if (info != null &&
+            FreeformTask.packageName(info) == item.packageName &&
+            entry.direct?.action == null
+        ) {
+            FlymeFreeformController.suppressAvoidOffsetFor(PAY_OFFSET_SUPPRESS_MS)
+            val reuse = FreeformTask.taskId(info)
+            val ok = launchPayEntryInNewWindow(entry, reuseTaskId = reuse)
+            log(Log.INFO, "QUICK_PAY_SWITCH_IN_PLACE label=${entry.label} taskId=$reuse ok=$ok")
+            if (ok) {
+                scheduleFrame()
+                return
+            }
+        }
+        // 无论哪条路都先武装 pending：新小窗到位会被事件流采用（条跟着挪过去）；同应用复用
+        // 启动被 ROM 吞掉时，超时后清 pending、会话原地保留。
+        armPendingPay(item.packageName)
+        // 换窗落位期间临时压掉 ROM 的错开（avoidAsPossible）——旧窗在关、新窗就位，错开会让
+        // 支付小窗连同它下面的支付条一起挪到偏位上。
+        FlymeFreeformController.suppressAvoidOffsetFor(PAY_OFFSET_SUPPRESS_MS)
+        if (info == null) {
+            launchPayEntryInNewWindow(entry)
+            return
+        }
+        // 切换 = **关旧窗 → 等它关完 → 再开新窗**（用户 2026-10-24 指定的兜底语义）。不能连发：
+        // close 是异步动画，紧跟着的启动会被 ROM 整个吞掉（"关了但新窗不来"，同轮实测）；
+        // 直接开也会被同应用的既有 freeform 任务静默复用成"点了没反应"。
+        pendingRelaunch = entry
+        pendingRelaunchFired = false
+        closePayTask(info)
+        payTaskId = 0
+        // 兜底：Vanished 迟迟不来（关窗被拒/动画卡住）也要把新窗发出去。
+        pendingRelaunchFallback?.let { main.removeCallbacks(it) }
+        val fallback = Runnable {
+            pendingRelaunchFallback = null
+            if (payActive && !pendingRelaunchFired && pendingRelaunch === entry) {
+                log(Log.WARN, "QUICK_PAY_RELAUNCH_FALLBACK label=${entry.label}")
+                fireRelaunch(entry)
+            }
+        }
+        pendingRelaunchFallback = fallback
+        main.postDelayed(fallback, RELAUNCH_FALLBACK_MS)
+    }
+
+    /** 旧窗关完（或兜底超时）后发射新窗。只发一次。 */
+    private fun fireRelaunch(entry: AggregatePayment.PayAction) {
+        if (pendingRelaunchFired) return
+        pendingRelaunchFired = true
+        pendingRelaunch = null
+        pendingRelaunchFallback?.let { main.removeCallbacks(it) }
+        pendingRelaunchFallback = null
+        // 落位窗口重新计时：从发射到新窗 placement 还有几百毫秒。
+        FlymeFreeformController.suppressAvoidOffsetFor(PAY_OFFSET_SUPPRESS_MS)
+        val reuse = reuseTaskIdFor(entry.launch?.packageName)
+        log(Log.INFO, "QUICK_PAY_RELAUNCH label=${entry.label} reuseTask=$reuse")
+        launchPayEntryInNewWindow(entry, reuseTaskId = reuse)
+    }
+
+    /**
+     * 降级条目（**没有** ShortcutInfo：应用装了但没发布对应快捷方式）的 Intent 显式化。
+     *
+     * 微信主界面那条只有隐式 action（`ShortCutDispatchAction`，无 component），从 SystemUI
+     * 直启隐式 intent 会被系统静默拦掉（start 返回成功但界面毫无反应，adb 实测）。用 PM 解析
+     * 出系统本来会命中的目标，把 component 钉上。**快捷方式条目不要走这里** —— LauncherApps
+     * 拿到的 ShortcutInfo 根本没有 intents（系统按 CLONE_REMOVE_FOR_LAUNCHER 剥掉了），
+     * 只能 `LauncherApps.startShortcut`，见 [launchPayEntryInNewWindow]。
+     */
+    private fun payIntent(item: com.repl.bubbledrawer.shortcut.ShortcutItem): android.content.Intent? {
+        val parsed = item.intentUri
+            ?.let { runCatching { android.content.Intent.parseUri(it, 0) }.getOrNull() }
+            ?: return null
+        if (parsed.component == null) {
+            val resolved = runCatching {
+                host.packageManager.queryIntentActivities(parsed, 0)
+            }.getOrNull()?.firstOrNull() ?: return null
+            parsed.component = android.content.ComponentName(
+                resolved.activityInfo.packageName,
+                resolved.activityInfo.name,
+            )
+        }
+        return parsed
+    }
+
+    /**
+     * 支付入口的 freeform options。[reuseTaskId] > 0 时把 `setLaunchTaskId` 一起带上：
+     * 同应用换页时这是"在原窗里跳"而不是"再开一扇"的关键（MIUI 的
+     * `MiuiCaptionClickListener.handleNewWindowClicked` 也是这么复用任务）。
+     */
+    private fun payLaunchOptions(
+        item: com.repl.bubbledrawer.shortcut.ShortcutItem,
+        reuseTaskId: Int,
+    ): android.os.Bundle? {
+        val opts = MiuiFreeform.makeActivityOptions(host, item.packageName)
+            ?: MiuiFreeform.activityOptions(host, item.packageName, noCheck = true)
+            ?: runCatching {
+                ActivityOptions.makeBasic().also {
+                    runCatching {
+                        ActivityOptions::class.java
+                            .getMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType)
+                            .invoke(it, 5) // WINDOWING_MODE_FREEFORM
+                    }
+                }
+            }.getOrNull()
+            ?: return null
+        if (reuseTaskId > 0) setLaunchTaskId(opts, reuseTaskId)
+        return MiuiFreeform.withoutFreeformAnimation(opts).toBundle()
+    }
+
+    private fun setLaunchTaskId(options: ActivityOptions, taskId: Int) {
+        runCatching {
+            ActivityOptions::class.java
+                .getMethod("setLaunchTaskId", Int::class.javaPrimitiveType)
+                .invoke(options, taskId)
+        }
+    }
+
+    /**
+     * 应用专属直达 Intent：支付宝走 `alipays://`，微信用它自己的
+     * `ShortCutDispatchAction` + `LauncherUI.Shortcut.LaunchType`。
+     *
+     * 必须自己拼、自己 `startActivityAsUser`，不能把微信交给 `LauncherApps.startShortcut`：
+     * 后者只管把 Intent 送进 LauncherUI，微信内部再起 `BaseScanUI` / `WalletOfflineEntranceUI`
+     * 时如果 LauncherUI 任务不是小窗，页面就全屏；而系统快捷方式通道也不会把我们的
+     * freeform options 传给微信内部的第二次启动。自己拼才能让这次启动带上
+     * `setLaunchTaskId` + freeform options，微信内部的页面按 MIUI 的“源是小窗”链式继承
+     * 继续落在小窗里（2026-10-24 用户实测：支付宝正常，微信收付款全屏且之后扫一扫也全屏）。
+     */
+    private fun payDirectIntent(entry: AggregatePayment.PayAction): android.content.Intent? {
+        val direct = entry.direct ?: return null
+        val intent = when {
+            direct.scheme != null -> android.content.Intent(
+                android.content.Intent.ACTION_VIEW,
+                android.net.Uri.parse(direct.scheme),
+            )
+            direct.action != null -> android.content.Intent(direct.action)
+            else -> return null
+        }
+        val pkg = entry.launch?.packageName
+        if (pkg != null) {
+            intent.setPackage(pkg)
+            direct.component?.let { intent.component = android.content.ComponentName(pkg, it) }
+        }
+        direct.extraKey?.let { intent.putExtra(it, direct.extraValue) }
+        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        return intent
+    }
+
+    /** 当前所有微信任务（taskId → top activity 类名），用 REAL_GET_TASKS 读。 */
+    private fun wechatTasks(): List<Pair<Int, String>> {
+        val out = ArrayList<Pair<Int, String>>()
+        runCatching {
+            val atm = Class.forName("android.app.ActivityTaskManager")
+                .getMethod("getService").invoke(null)
+            val tasks = atm.javaClass
+                .getMethod("getTasks", Int::class.javaPrimitiveType)
+                .invoke(atm, 40) as? List<*> ?: return@runCatching
+            for (t in tasks) {
+                val component = runCatching {
+                    t?.javaClass?.getField("topActivity")?.get(t) as? android.content.ComponentName
+                }.getOrNull() ?: runCatching {
+                    t?.javaClass?.getField("realActivity")?.get(t) as? android.content.ComponentName
+                }.getOrNull() ?: runCatching {
+                    t?.javaClass?.getField("baseActivity")?.get(t) as? android.content.ComponentName
+                }.getOrNull() ?: continue
+                if (component.packageName != "com.tencent.mm") continue
+                val id = runCatching {
+                    t?.javaClass?.getField("taskId")?.getInt(t) ?: -1
+                }.getOrDefault(-1)
+                if (id > 0) out += id to component.className
+            }
+        }.onFailure { logger(Log.WARN, "QUICK_PAY_WECHAT_TASKS_FAILED", it) }
+        return out
+    }
+
+    private fun removeTask(taskId: Int) {
+        runCatching {
+            val atm = Class.forName("android.app.ActivityTaskManager")
+                .getMethod("getService").invoke(null)
+            atm.javaClass.getMethod("removeTask", Int::class.javaPrimitiveType).invoke(atm, taskId)
+            log(Log.INFO, "QUICK_PAY_REMOVE_TASK taskId=$taskId")
+        }.onFailure { logger(Log.WARN, "QUICK_PAY_REMOVE_TASK_FAILED taskId=$taskId", it) }
+    }
+
+    /**
+     * 微信的 `ShortCutDispatchActivity` 是 `singleInstance`，而且只在 `onCreate` 里读
+     * `LauncherUI.Shortcut.LaunchType` 分发（反编译确认没有 `onNewIntent`）。上一次点击的
+     * 实例只要还活着（登录检查/页面启动中），下一次 startActivity 只会走 `onNewIntent`
+     * —— 它不处理 —— 于是 `startActivity` 返回成功、页面不动（2026-10-24「微信两个页面
+     * 切换经常失败」）。每次发射前把它的任务删掉，保证拿到一个新实例。
+     */
+    private fun clearWechatDispatchTask() {
+        for ((id, cls) in wechatTasks()) {
+            if (cls == "com.tencent.mm.ui.ShortCutDispatchActivity") removeTask(id)
+        }
+    }
+
+    /**
+     * 清掉所有微信任务后再启动支付页。
+     *
+     * 微信的支付页和聊天页共用 `UIPageFragmentActivity` / `LauncherUI`，从 `RunningTaskInfo`
+     * 里无法可靠区分“支付页”还是聊天页；而只要旧任务还在，`ShortCutDispatchActivity` 启动
+     * 页面时带的 `FLAG_ACTIVITY_CLEAR_TOP` 就会把那个任务（可能已经是全屏）整个提到前面，
+     * 新页面也跟着全屏（用户 2026-10-24：「微信打开收付款是全屏，退出去下次扫一扫也变全屏」）。
+     *
+     * 所以每次微信支付启动前把微信任务全部移除，保证从干净的小窗任务长出来。聊天记录是
+     * 持久化的，移除任务只关窗口、不丢消息。
+     */
+    private fun clearWechatTasks() {
+        for ((id, _) in wechatTasks()) removeTask(id)
+    }
+
+    /**
+     * 跨应用换窗时，复用目标应用已有的任务（可能是全屏任务）让 MIUI 按小窗参数重新落位 ——
+     * 不这么做，应用从后台任务被拉起时会保留全屏配置，就是"偶尔还是全屏"。
+     *
+     * 但**不能**复用我们自己正在管理的支付小窗：那扇正在关（taskId 马上失效），复用它只会把
+     * 新页面塞进一个正在消失的任务里。
+     */
+    private fun reuseTaskIdFor(pkg: String?): Int {
+        if (pkg.isNullOrEmpty()) return -1
+        val id = MiuiFreeform.reusableTaskId(pkg, 0)
+        if (id <= 0) return -1
+        return if (taskById.containsKey(id)) -1 else id
+    }
+
+    /**
+     * 以新小窗打开支付入口。
+     *
+     * 顺序：**应用专属直达 Intent → `LauncherApps.startShortcut` → intentUri 兜底**。
+     *
+     * 为什么直达排在 startShortcut 前面（2026-10-24 真机）：
+     *
+     *  - `LauncherApps` 拿到的 `ShortcutInfo.getIntents()` 恒为 null（系统按
+     *    CLONE_REMOVE_FOR_LAUNCHER 剥掉），所以只能靠 `startShortcut` 或自己拼；
+     *  - 但 `startShortcut` 只是把 Intent 交给微信的 `LauncherUI`，**我们的 freeform
+     *    options 传不进微信内部第二次启动**（`BaseScanUI` / `WalletOfflineEntranceUI`
+     *    自己带 `FLAG_ACTIVITY_NEW_TASK`）。LauncherUI 一旦落在全屏任务，收付款就是全屏；
+     *    而且这个全屏任务会被后续快捷方式复用，扫一扫也跟着全屏（用户实测）。
+     *  - 自己拼出微信的 `ShortCutDispatchAction` + `LaunchType`，用
+     *    `startActivityAsUser` + freeform options + `setLaunchTaskId` 发出去，MIUI 才能
+     *    把 LauncherUI 任务按小窗重排，微信内部的页面再按“源是小窗”链式继承 freeform。
+     */
+    private fun launchPayEntryInNewWindow(
+        entry: AggregatePayment.PayAction,
+        reuseTaskId: Int = 0,
+    ): Boolean {
+        val item = entry.launch ?: return false
+        val wechatDirect = entry.direct?.action != null
+        // 微信：每次发射前清掉旧的 ShortCutDispatchActivity 实例 + 旧支付页面任务。
+        // 分发 Activity 只在 onCreate 分发，旧实例还活着时新点击只会走 onNewIntent（它不处理）；
+        // 旧 BaseScanUI/Wallet 任务还在时，CLEAR_TOP 会把它整个（可能全屏）提到前面。
+        if (wechatDirect) {
+            clearWechatDispatchTask()
+            clearWechatTasks()
+        }
+        val reuse = if (wechatDirect) 0 else reuseTaskId
+        val bundle = payLaunchOptions(item, reuse)
+        // 1) 应用专属直达 Intent（微信的 ShortCutDispatchAction / 支付宝的 alipays://）。
+        val direct = payDirectIntent(entry)
+        if (direct != null && startIntentAsUser(direct, bundle, 0)) {
+            log(
+                Log.INFO,
+                "QUICK_PAY_LAUNCH_NEW_WINDOW label=${entry.label} via=direct " +
+                    "reuseTask=$reuse ok=true",
+            )
+            return true
+        }
+        // 2) 官方快捷方式通道。
+        if (item.shortcutInfo != null &&
+            ShortcutRepository.launchShortcut(host, item, useFreeform = true, optionsBundle = bundle)
+        ) {
+            log(
+                Log.INFO,
+                "QUICK_PAY_LAUNCH_NEW_WINDOW label=${entry.label} via=shortcut " +
+                    "reuseTask=$reuseTaskId ok=true",
+            )
+            return true
+        }
+        // 3) 没有 ShortcutInfo（应用装了但没发布对应快捷方式，退到主界面 Intent）才直启。
+        val intent = payIntent(item)
+        if (intent != null && startIntentAsUser(intent, bundle, 0)) {
+            log(
+                Log.INFO,
+                "QUICK_PAY_LAUNCH_NEW_WINDOW label=${entry.label} via=intent " +
+                    "reuseTask=$reuseTaskId ok=true",
+            )
+            return true
+        }
+        val ok = ShortcutRepository.launchShortcut(
+            host,
+            item,
+            useFreeform = true,
+            optionsBundle = bundle,
+        )
+        log(Log.INFO, "QUICK_PAY_LAUNCH_NEW_WINDOW label=${entry.label} via=startShortcut ok=$ok")
+        return ok
+    }
+
+    private fun closePayTask(info: Any) {
+        val taskId = FreeformTask.taskId(info)
+        if (taskId <= 0) return
+        // 先走 ROM 自己的关窗（带动画）。但它的前两级（closeFullOrFreeform / exitFreeformTask）
+        // 可能只是把窗口**退出 freeform** —— 任务带着旧页面回到全屏后台，紧接着的新窗启动复用
+        // 这个任务，页面自然还是旧的（"新小窗不跳到相应页面"，2026-10-24 实测：关掉收付款小窗
+        // 后 dumpsys 里躺着全屏的 WalletOfflineEntranceUI 任务）。补一刀 removeTask 把任务从
+        // 系统里彻底拿掉，新窗启动才会带着新 Intent 全新落页。
+        val closed = runCatching {
+            FlymeFreeformController.instance?.closeTask(info, taskId)
+            true
+        }.getOrDefault(false)
+        val removed = runCatching {
+            val atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null)
+            atm.javaClass.getMethod("removeTask", Int::class.javaPrimitiveType).invoke(atm, taskId)
+            true
+        }.getOrDefault(false)
+        log(Log.INFO, "QUICK_PAY_CLOSE_OLD taskId=$taskId closed=$closed removed=$removed")
+    }
+
+    /** 我们打开的支付小窗到位了：接管它作为条的宿主；旧的支付窗口还在就关掉。 */
+    private fun adoptPayTask(taskInfo: Any) {
+        clearPendingPay()
+        val oldId = payTaskId
+        val newId = FreeformTask.taskId(taskInfo)
+        payTaskId = newId
+        task = taskInfo
+        currentPkg = FreeformTask.packageName(taskInfo)
+        hideReason = null
+        closingUntil = 0L
+        unfocused = false
+        fastUntil = SystemClock.uptimeMillis() + FAST_WINDOW_MS
+        log(Log.INFO, "QUICK_PAY_WINDOW_ADOPTED new=$newId old=$oldId")
+        // 新窗已经落位：临时压错开的窗口使命结束，恢复 ROM 原行为。
+        FlymeFreeformController.avoidOffsetSuppressedUntil = 0L
+        // 条可能正以会话条目（或上一个窗口的支付条目）显示着：藏掉让下一帧重新 attach ——
+        // attachBar 才会执行 bindPay，直接 update 是不会换内容的。
+        if (added) detach("PAY_REBIND")
+        if (oldId > 0 && newId > 0 && oldId != newId) {
+            taskById[oldId]?.let { closePayTask(it) }
+        }
+    }
+
+    /** 支付会话是否该把 [taskInfo]（或它的包名）当成"自己打开的那扇窗"。 */
+    private fun isPendingPay(taskInfo: Any): Boolean {
+        val pending = pendingPayPackage ?: return false
+        return FreeformTask.packageName(taskInfo) == pending
+    }
+
+    private fun armPendingPay(pkg: String) {
+        pendingPayPackage = pkg
+        pendingPayExpiry?.let { main.removeCallbacks(it) }
+        val expiry = Runnable {
+            pendingPayExpiry = null
+            val pending = pendingPayPackage ?: return@Runnable
+            pendingPayPackage = null
+            // 小窗一直没到位：还没adopt过任何窗口（task == null）就放弃整个会话；
+            // 窗内切换的场合（task 还在）会话照常活着，只是不再等事件。
+            if (task == null) {
+                log(Log.WARN, "QUICK_PAY_PENDING_TIMEOUT pkg=$pending")
+                dismissQuickPay("PAY_PENDING_TIMEOUT")
+            }
+        }
+        pendingPayExpiry = expiry
+        main.postDelayed(expiry, PAY_PENDING_TIMEOUT_MS)
+    }
+
+    private fun clearPendingPay() {
+        pendingPayPackage = null
+        pendingPayExpiry?.let { main.removeCallbacks(it) }
+        pendingPayExpiry = null
+    }
+
+    /** 当前已 adopt 的支付窗是不是同一个 App（支付宝桥接窗会短暂出现两扇同包任务）。 */
+    private fun isSameAsAdoptedPayWindow(taskInfo: Any): Boolean {
+        val adopted = task ?: return false
+        val pkg = FreeformTask.packageName(adopted) ?: return false
+        return FreeformTask.packageName(taskInfo) == pkg
+    }
+
+    /** 任务 ID 比当前支付窗更大 = 后落的那扇（MIUI 的任务号单调递增）。 */
+    private fun isNewerPayTask(taskInfo: Any): Boolean =
+        FreeformTask.taskId(taskInfo) > payTaskId
+
+    /**
+     * 同一个 App 里比 [closingId] 更新的那扇普通可见窗。支付宝的
+     * `ShortcutsLauncherActivity` 桥接和它拉起的真页面会各占一个任务：桥接先出现、ID 更小，
+     * 真页面后出现、ID 更大。桥接关掉/消失时把支付条交给真页面，而不是直接收条。
+     */
+    private fun newerPayWindow(closingId: Int, current: Any): Any? {
+        val pkg = FreeformTask.packageName(current) ?: return null
+        return taskById.values.firstOrNull {
+            FreeformTask.taskId(it) > closingId &&
+                FreeformTask.packageName(it) == pkg &&
+                FreeformTask.isNormal(it) &&
+                FreeformTask.isVisible(it)
+        }
     }
 
     // ---------------------------------------------------------------- frame loop
@@ -350,7 +981,9 @@ class ContactBarController(
      * 而这些工作在没有移动的窗口上得到的是同一个答案。现在静止时 4 次/秒，动起来仍然逐帧。
      */
     private fun scheduleNext() {
-        if (task == null || !enabled()) return
+        // 支付小窗还没到位的空档：靠 Appeared/Focused 事件推进 + pending 超时兜底，无需空转。
+        if (task == null) return
+        if (!payActive && !enabled()) return
         if (SystemClock.uptimeMillis() < fastUntil) {
             scheduleFrame()
         } else {
@@ -380,7 +1013,7 @@ class ContactBarController(
      * 事件比定时器快：拖动一开始就跟上，不必等下一次 tick。
      */
     private fun kick() {
-        if (task == null || !enabled()) return
+        if (task == null || (!payActive && !enabled())) return
         if (idleMode) {
             idleMode = false
             log(Log.INFO, "CONTACT_BAR_LOOP per-frame (window moving)")
@@ -391,11 +1024,17 @@ class ContactBarController(
     }
 
     private fun onFrame() {
-        if (!enabled()) {
+        // 聚合支付不受 contactBar 开关管（它是被显式点出来的）；窗口几何与会话模式共用同一条链，
+        // 差别只在数据源：支付模式不读通知会话，条上画的是支付入口。
+        if (!payActive && !enabled()) {
             if (added) detach("DISABLED")
             return
         }
-        val info = task ?: return
+        val info = task ?: run {
+            // 支付小窗还没到位（刚触发，等 Appeared/Focused 事件）—— 空档里不画任何东西。
+            if (payActive && added) detach("PAY_WAIT_WINDOW")
+            return
+        }
         frames++
 
         // A resize/move drag registers an animation (MiuiFreeformModeResizeHandler pushes every
@@ -454,18 +1093,23 @@ class ContactBarController(
 
         // The window's package can change inside the same task (小窗切换到另一个会话/应用).
         val pkg = FreeformTask.packageName(info)
-        if (pkg != null && pkg != currentPkg) {
+        if (payActive) {
+            // 支付模式：不读会话数据（条上是支付入口，refreshData 会用会话把它顶掉）。
             currentPkg = pkg
-            refreshData(force = true)
-        } else if (frames % DATA_EVERY_FRAMES == 0) {
-            refreshData(force = false)
-        }
+        } else {
+            if (pkg != null && pkg != currentPkg) {
+                currentPkg = pkg
+                refreshData(force = true)
+            } else if (frames % DATA_EVERY_FRAMES == 0) {
+                refreshData(force = false)
+            }
 
-        if (items.isEmpty()) {
-            // [refreshData] 已经知道原因（不是聊天应用 / 没有会话）时不重复报一个笼统的 NO_CONTACTS：
-            // 以前这两行在同一个 pass 里一前一后地打，看上去就是"每帧都在隐藏又隐藏"。
-            detach(lastDataReason ?: "NO_CONTACTS")
-            return
+            if (items.isEmpty()) {
+                // [refreshData] 已经知道原因（不是聊天应用 / 没有会话）时不重复报一个笼统的 NO_CONTACTS：
+                // 以前这两行在同一个 pass 里一前一后地打，看上去就是"每帧都在隐藏又隐藏"。
+                detach(lastDataReason ?: "NO_CONTACTS")
+                return
+            }
         }
 
         val rect = layoutFor(bounds)
@@ -787,18 +1431,33 @@ class ContactBarController(
     private fun resolveLeash(info: Any): SurfaceControl? =
         FreeformTask.leash(info) ?: FlymeFreeformController.instance?.getTaskLeash(info)
 
-    /**
-     * 把条摆到 [rect] 并让它可见。失败时**拆掉整块 surface** 并记下 [attachFailedAt]
-     * （下一轮 [ATTACH_RETRY_MS] 后再试），绝不留下"看起来加了、其实什么都没显示"的状态 ——
-     * 那会让条永远不再出现（以前 `added` 就是这么被置上的）。
-     */
     private fun attach(info: Any, rect: Rect) {
-        val taskId = FreeformTask.taskId(info)
+        attachBar(rect, FreeformTask.taskId(info), info) { v ->
+            if (payActive) v.bindPay(payEntries, ::onPayEntryClick)
+            else v.bind(items, fallbackIcon(), ::openConversation, ::onRemoveConversation)
+        }
+    }
+
+    /**
+     * 把条摆到 [rect] 并让它可见（会话/聚合支付共用的那套 surface 三步台阶）。[info] 为 null
+     * 即聚合支付模式：没有小窗 → 没有 leash（Z 走绝对层 [LAYER_WITHOUT_LEASH]）、圆角用默认值。
+     *
+     * 失败时**拆掉整块 surface** 并记下 [attachFailedAt]（下一轮 [ATTACH_RETRY_MS] 后再试），
+     * 绝不留下"看起来加了、其实什么都没显示"的状态 —— 那会让条永远不再出现（以前 `added` 就是
+     * 这么被置上的）。
+     */
+    private fun attachBar(rect: Rect, taskId: Int, info: Any?, bind: (ContactBarView) -> Unit) {
         val sc = ensureSurface(taskId) ?: return failed("SURFACE_UNAVAILABLE")
         val display = displayOrNull() ?: return failed("NO_DISPLAY")
         val v = ensureView()
-        applyCorner(v, info)
-        v.bind(items, fallbackIcon(), ::openConversation, ::onRemoveConversation)
+        if (info != null) {
+            applyCorner(v, info)
+        } else {
+            // 聚合支付没有小窗可取圆角：回默认 13dp（[applyCorner] 的缓存按模式切换重置）。
+            cornerShown = Float.NaN
+            v.setCornerRadius(null)
+        }
+        bind(v)
 
         if (viewHost == null) {
             val created = runCatching {
@@ -817,7 +1476,7 @@ class ContactBarController(
             return failed("RELAYOUT_FAILED")
         }
 
-        val leash = resolveLeash(info)
+        val leash = info?.let { resolveLeash(it) }
         val applied = runCatching {
             currentLeash = leash
             runCatching { txCall(txSetTrustedOverlay, sc, true) }
@@ -843,7 +1502,8 @@ class ContactBarController(
         v.fadeIn()
         log(
             Log.INFO,
-            "CONTACT_BAR_SHOW rect=$rect items=${items.size} pkg=$currentPkg taskId=$taskId " +
+            "CONTACT_BAR_SHOW pay=$payActive rect=$rect taskId=$taskId " +
+                "items=${if (payActive) payEntries.size else items.size} pkg=$currentPkg " +
                 "leash=${leash != null} relative=${currentLeash != null}",
         )
     }
@@ -857,7 +1517,9 @@ class ContactBarController(
         hideReason = reason
     }
 
-    private fun update(info: Any, rect: Rect) {
+    private fun update(info: Any, rect: Rect) = updateBar(rect, info)
+
+    private fun updateBar(rect: Rect, info: Any?) {
         val sc = rootSurface
         if (sc == null || !sc.isValid) {
             // surface 没了：这不是"位置不对"，只能是整块重建（见 [ensureSurface]）。
@@ -874,7 +1536,7 @@ class ContactBarController(
             return
         }
 
-        val leash = resolveLeash(info)
+        val leash = info?.let { resolveLeash(it) }
         val applied = runCatching {
             if (leash != null && leash.isValid && leash !== currentLeash &&
                 txCall(txSetRelativeLayer, sc, leash, 1)
@@ -894,7 +1556,7 @@ class ContactBarController(
             destroySurface()
             return
         }
-        applyCorner(v, info)
+        if (info != null) applyCorner(v, info)
     }
 
     /**
@@ -971,6 +1633,8 @@ class ContactBarController(
 
     /** Rebuilds the avatar row for the app that currently owns the small window (main thread only). */
     fun refreshData(force: Boolean) = onMain {
+        // 支付模式不消费会话数据：通知回调照常来，但不能把支付条目顶掉。
+        if (payActive) return@onMain
         val info = task ?: return@onMain
         val pkg = FreeformTask.packageName(info)
         if (pkg == null || pkg !in RecentConversations.IM_WHITELIST) {
@@ -1178,6 +1842,11 @@ class ContactBarController(
         if (RecentConversations.onChanged != null) RecentConversations.onChanged = null
         main.removeCallbacks(idleTick)
         idleScheduled = false
+        clearPendingPay()
+        pendingRelaunch = null
+        pendingRelaunchFired = false
+        pendingRelaunchFallback?.let { main.removeCallbacks(it) }
+        pendingRelaunchFallback = null
         onFreeformWindowMotion = null
         detach("DISPOSE")
         destroySurface()
@@ -1228,6 +1897,21 @@ class ContactBarController(
 
         /** At most this many freeform tasks are remembered for focus lookups (two is the ROM's cap). */
         const val MAX_TRACKED_TASKS = 4
+
+        /**
+         * 触发/换入口后等支付小窗到位的时限。超时即放弃：还没有任何窗口被adopt过（task == null）
+         * 就结束会话，否则只是不再等待事件（窗内切换成功的场合）。
+         */
+        const val PAY_PENDING_TIMEOUT_MS = 4000L
+
+        /** 换窗落位期间临时压掉 ROM 错开（avoidAsPossible）的时限。 */
+        const val PAY_OFFSET_SUPPRESS_MS = 5000L
+
+        /** 换入口：旧窗 Vanished 后等多久再发射新窗（贴着关窗动画发射会被 ROM 吞掉）。 */
+        const val RELAUNCH_DELAY_MS = 450L
+
+        /** 换入口：Vanished 兜底——迟迟不来也照发（关窗被拒/动画卡住的场合）。 */
+        const val RELAUNCH_FALLBACK_MS = 1500L
     }
 }
 
@@ -1241,3 +1925,11 @@ class ContactBarController(
  */
 @Volatile
 var onFreeformWindowMotion: (() -> Unit)? = null
+
+/**
+ * 聚合支付的执行入口（面板点击 / App 端广播都会走到它）。`SystemUiHookInstaller` 建好控制器时
+ * 赋值 —— 与 [onFreeformWindowMotion] 同一套跨对象接线：控制器归 installer 所有，触发方
+ * （FanHost 的面板点击、广播接收器）不该知道它内部怎么建。
+ */
+@Volatile
+var quickPayTrigger: (() -> Unit)? = null

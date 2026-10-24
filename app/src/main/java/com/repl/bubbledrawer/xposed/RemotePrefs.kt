@@ -328,12 +328,27 @@ object RemotePrefs {
      * 用户 2026-10-18：「再做一个大号迷你小窗的放大倍率滑块，现在默认是 1.5 倍」。
      * 正常迷你的缩放由 ROM 自己算（`MiuiMultiWindowUtils.getMiniFreeformScale`），这里只存倍数：
      * 放大后的 scale = 正常迷你 scale × 这个比例（`MiniScaleToggle.decideMiniScale`）。
-     * 上限 200% 是因为再大就会撞上 `MINI_SCALE_MAX`（0.95，再大就不是迷你小窗了）。
+     * 几何上限仍是 `MINI_SCALE_MAX`（0.95，再大就不是迷你小窗了）—— 250% 在部分机型上会先撞到
+     * 这个上限再夹回来，滑块本身不隐藏该值。
      */
     const val KEY_FLYME_MINI_ENLARGE_PCT = "flyme_mini_enlarge_pct"
     const val DEFAULT_FLYME_MINI_ENLARGE_PCT = 150
-    const val FLYME_MINI_ENLARGE_MIN = 110
-    const val FLYME_MINI_ENLARGE_MAX = 200
+    const val FLYME_MINI_ENLARGE_MIN = 100
+    const val FLYME_MINI_ENLARGE_MAX = 250
+
+    /**
+     * 哪些应用进入迷你小窗时保持「放大」尺寸 —— 用户 2026-10-24：
+     * 「保存放大的状态，如果已经是大迷你小窗了下次收为迷你小窗时还是大的」。
+     *
+     * 用户在长按菜单点「放大 / 还原」时写这个集合（`FlymeFreeformController.toggleMiniWindowScale`）；
+     * `MiuiMultiWindowUtils.getMiniFreeformScale` 的 hook 在 ROM 每次计算迷你尺寸时按 [KEY_FLYME_MINI_ENLARGE_PCT]
+     * 放大，所以拖动、回桌面、从最近任务开迷你窗等所有 ROM 路径都会直接按保存的尺寸生成，不需要事后再补动画。
+     * 按包名保存（taskId 会变，包名才是「下次打开」还能命中的键）。
+     *
+     * 实际存储不在共享组里：hook 进程的 remote prefs 是只读镜像，`FlymeFreeformController` 把它写在
+     * SystemUI 自己的 device-protected `bubbledrawer_mini_state` 中，这里保留键名作为唯一标识。
+     */
+    const val KEY_FLYME_MINI_ENLARGED_PACKAGES = "flyme_mini_enlarged_packages"
 
     /**
      * 「回桌面不收迷你」：全面屏手势上滑回桌面时，ROM 会把**所有**小窗一次性收成迷你小窗。

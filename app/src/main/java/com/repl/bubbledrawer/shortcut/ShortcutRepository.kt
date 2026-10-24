@@ -1205,6 +1205,7 @@ object ShortcutRepository {
         item: ShortcutItem,
         useFreeform: Boolean = SettingsStore.snapshot(context).freeform,
         viaGate: Boolean = false,
+        optionsBundle: android.os.Bundle? = null,
     ): Boolean {
         // 磁贴没有 Intent/ShortcutInfo，走不了这里；调用方必须先分流到 QsTileHost（见 FanHost /
         // PanelContentFactory / PinManageActivity）。真漏到这里就明确失败，别去 start 一个空 Intent。
@@ -1212,10 +1213,18 @@ object ShortcutRepository {
             Log.w(TAG, "LAUNCH_SHORTCUT_REJECTED_QS_TILE pkg=${item.packageName} id=${item.id}")
             return false
         }
+        // 聚合支付同理：它自己不启动任何应用，点击应该走 quickPayTrigger 把联系人条切到聚合支付
+        // 模式（条目层面才是可启动的 APP_SHORTCUT）。漏到这里说明有调用点没分流。
+        if (item.type == ShortcutType.AGGREGATE_PAYMENT) {
+            Log.w(TAG, "LAUNCH_SHORTCUT_REJECTED_AGGREGATE pkg=${item.packageName} id=${item.id}")
+            return false
+        }
         val requestFreeform = useFreeform && item.packageName.isNotEmpty()
         // 走闸门时不带 options：留给 system_server 的闸门（ROM 自己那条路）生成。
         val gate = requestFreeform && viaGate
-        val bundle = if (requestFreeform && !gate) {
+        // [optionsBundle] 由调用方自带（聚合支付的窗内切换要塞 setLaunchTaskId，见
+        // ContactBarController.onPayEntryClick），非空时优先于内部拼的那份。
+        val bundle = optionsBundle ?: if (requestFreeform && !gate) {
             (MiuiFreeform.makeActivityOptions(context, item.packageName)
                 ?: ActivityOptions.makeBasic().also {
                     runCatching {

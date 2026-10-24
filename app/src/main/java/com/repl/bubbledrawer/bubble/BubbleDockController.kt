@@ -315,12 +315,15 @@ class BubbleDockController(
             when (item) {
                 is GestureAppLauncher.AdapterItem.AppItem -> icon.setImageDrawable(repo.icon(item.app, snap.cloneBadge))
                 is GestureAppLauncher.AdapterItem.FunctionItem -> {
-                    // 快捷方式的图标；没有就退回宿主应用图标（扇形的 tile 没有文字，全靠图）。
+                    // 快捷方式的图标；内建条目（聚合支付）自带 drawable；没有就退回宿主应用图标
+                    // （扇形的 tile 没有文字，全靠图）。
                     val bmp = item.shortcut.iconBitmap
-                    if (bmp != null && !bmp.isRecycled) {
-                        icon.setImageDrawable(android.graphics.drawable.BitmapDrawable(context.resources, bmp))
-                    } else {
-                        icon.setImageDrawable(
+                    val drawable = item.shortcut.iconDrawable
+                    when {
+                        bmp != null && !bmp.isRecycled ->
+                            icon.setImageDrawable(android.graphics.drawable.BitmapDrawable(context.resources, bmp))
+                        drawable != null -> icon.setImageDrawable(drawable)
+                        else -> icon.setImageDrawable(
                             repo.icon(
                                 com.repl.bubbledrawer.pinyin.BubbleApp(item.shortcut.packageName, item.shortcut.label),
                                 snap.cloneBadge,

@@ -710,7 +710,13 @@ object SettingsStore {
             val pins = FunctionPinStore.decode(FunctionPinStore.backend(fallbackMirror(context)).read())
             val catalogue = ShortcutCacheStore.load(context).orEmpty().associateBy { it.pinKey }
             val details = pins.map { key ->
-                catalogue[key] ?: FunctionPinDetails.placeholder(key, appLabelOf(context, key.substringBefore('#')))
+                when {
+                    // 聚合支付不在扫描缓存里（内建功能）：用内建条目当详情，别落成 placeholder
+                    // （placeholder 的 label 是宿主应用名，面板上会显示成「魅窗」）。
+                    key == com.repl.bubbledrawer.shortcut.AggregatePayment.PIN_KEY ->
+                        com.repl.bubbledrawer.shortcut.AggregatePayment.entryIn(context)
+                    else -> catalogue[key] ?: FunctionPinDetails.placeholder(key, appLabelOf(context, key.substringBefore('#')))
+                }
             }
             val encoded = FunctionPinDetails.encode(details)
             fallbackMirror(context).edit().putString(FunctionPinDetails.KEY, encoded).apply()

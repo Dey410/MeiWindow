@@ -173,6 +173,9 @@ class PinManageModel(
             val groups = mutableMapOf<String, MutableList<com.repl.bubbledrawer.shortcut.ShortcutItem>>()
             for (item in allShortcuts) {
                 if (!showTiles && item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) continue
+                // 聚合支付是内建功能，**不进**字母分组目录（用户 2026-10-24：不与快捷方式/磁贴混排，
+                // 它在功能页有自己的独立格位）；但它可以被收藏，收藏区的解析（pinnedFunctions）照样用。
+                if (com.repl.bubbledrawer.shortcut.AggregatePayment.isEntry(item)) continue
                 val appName = item.subLabel?.ifBlank { null } ?: item.label
                 if (query.isNotEmpty() && !item.label.contains(query, ignoreCase = true) && !appName.contains(query, ignoreCase = true)) {
                     continue

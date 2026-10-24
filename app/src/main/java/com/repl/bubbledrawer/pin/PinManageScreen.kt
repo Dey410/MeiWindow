@@ -87,6 +87,7 @@ import top.yukonga.miuix.kmp.blur.LayerBackdrop
 import top.yukonga.miuix.kmp.blur.textureBlur
 import com.repl.bubbledrawer.R
 import com.repl.bubbledrawer.pinyin.BubbleApp
+import com.repl.bubbledrawer.shortcut.AggregatePayment
 import com.repl.bubbledrawer.shortcut.ShortcutBridge
 import com.repl.bubbledrawer.shortcut.ShortcutItem
 import com.repl.bubbledrawer.shortcut.ShortcutRepository
@@ -541,6 +542,31 @@ fun PinManageScreen(
                                 bottom = topContentPadding + 16.dp,
                             ),
                         ) {
+                            // 聚合支付：内建功能，独立于扫描出的分组之外（用户 2026-10-24：
+                            // 「单独拎出来不要和 shortcut/磁贴等摆在一起，放在收藏和字母排序中间」）。
+                            // 收藏行为与其他功能一致：管理模式下点击勾选/取消，浏览模式点击执行。
+                            // 它占网格第 0 位，字母条跳转的偏移在 [jumpToFunction] 里同步。
+                            item(key = "aggregate_payment", span = { GridItemSpan(1) }) {
+                                val aggregateContext = LocalContext.current
+                                val aggregate = remember(aggregateContext) {
+                                    AggregatePayment.entryIn(aggregateContext)
+                                }
+                                ShortcutCell(
+                                    item = aggregate,
+                                    iconDp = iconDp,
+                                    textSp = textSp,
+                                    onTap = {
+                                        if (model.manageMode) {
+                                            model.toggleFunctionPin(aggregate)
+                                        } else {
+                                            onLaunchShortcut?.invoke(aggregate)
+                                        }
+                                    },
+                                    showAppBadge = false,
+                                    showBadge = model.manageMode,
+                                    isPinned = model.isFunctionPinned(aggregate),
+                                )
+                            }
                             // 功能页加载中：进度条 + 第 x 个 / 共 y 个。加载完才把空态显示出来，
                             // 否则会先闪一下「还没有读取到功能」再被列表顶掉。
                             if (model.functionLoading) {
@@ -1639,7 +1665,9 @@ private fun jumpToFunction(
     letter: String,
     headerOffsetPx: Int = 0,
 ) {
-    var targetIndex = 0
+    // 网格第 0 位是内建的「聚合支付」格（见 PinManageScreen 功能页），加载中还有一条进度行
+    // —— 字母分组都排在这两者后面，跳转下标必须把它们算进去，否则永远差一两个格子。
+    var targetIndex = 1 + if (model.functionLoading) 1 else 0
     for (group in model.groupedFunctions) {
         val ch = group.sortKey.firstOrNull()?.uppercaseChar() ?: '#'
         val groupLetter = if (ch in 'A'..'Z') ch.toString() else "#"

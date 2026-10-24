@@ -211,11 +211,34 @@ class MiniScaleToggleTest {
     fun theEnlargeRatioComesFromTheSettingsSlider() {
         // 设置里存的是百分数（默认 150 = 1.5 倍），到几何计算这里变成倍数。
         assertEquals(1.5f, miniEnlargeRatioFromPct(150), 1e-4f)
-        assertEquals(1.1f, miniEnlargeRatioFromPct(110), 1e-4f)
-        assertEquals(2.0f, miniEnlargeRatioFromPct(200), 1e-4f)
+        assertEquals(1.0f, miniEnlargeRatioFromPct(100), 1e-4f)
+        assertEquals(2.5f, miniEnlargeRatioFromPct(250), 1e-4f)
         // 越界（旧配置 / 手改的共享组值）夹回滑块范围。
-        assertEquals(1.1f, miniEnlargeRatioFromPct(50), 1e-4f)
-        assertEquals(2.0f, miniEnlargeRatioFromPct(400), 1e-4f)
+        assertEquals(1.0f, miniEnlargeRatioFromPct(50), 1e-4f)
+        assertEquals(2.5f, miniEnlargeRatioFromPct(400), 1e-4f)
+    }
+
+    @Test
+    fun theSavedEnlargeStateIsPerPackageAndCanBeCleared() {
+        val empty = emptySet<String>()
+        val one = updateMiniEnlargedPackages(empty, "com.tencent.mm", enlarged = true)
+        assertEquals(setOf("com.tencent.mm"), one)
+        val two = updateMiniEnlargedPackages(one, "com.alipay.android.phone.msp", enlarged = true)
+        assertEquals(setOf("com.tencent.mm", "com.alipay.android.phone.msp"), two)
+        // 「还原」只去掉自己，不影响另一个应用保存的状态。
+        val restored = updateMiniEnlargedPackages(two, "com.tencent.mm", enlarged = false)
+        assertEquals(setOf("com.alipay.android.phone.msp"), restored)
+        // 空包名（动画早期拿不到）不改集合。
+        assertEquals(two, updateMiniEnlargedPackages(two, "", enlarged = true))
+    }
+
+    @Test
+    fun theSavedScaleUsesTheSameClampAsTheManualToggle() {
+        assertEquals(1.5f * MINI_SCALE, enlargedMiniScale(MINI_SCALE, 1.5f), 1e-4f)
+        // 250% 在正常迷你的基础上有可能会撞到 MINI_SCALE_MAX，和手动点「放大」一致地夹住。
+        assertEquals(0.95f, enlargedMiniScale(0.8f, 2.5f), 1e-4f)
+        // 100% 就是 ROM 自己算出来的正常迷你尺寸。
+        assertEquals(MINI_SCALE, enlargedMiniScale(MINI_SCALE, 1.0f), 1e-4f)
     }
 
     @Test

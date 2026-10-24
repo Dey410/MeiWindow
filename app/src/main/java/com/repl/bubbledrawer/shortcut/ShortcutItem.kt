@@ -17,6 +17,12 @@ enum class ShortcutType {
      * 不能在 App 进程绑服务（`BIND_QUICK_SETTINGS_TILE` 是 signature|privileged）。
      */
     QS_TILE,
+
+    /**
+     * 内建的「聚合支付」功能页条目（不来自任何应用，扫描/收藏/搜索都不参与）：点击把联系人条切到
+     * 聚合支付模式，条里才放真正的微信/支付宝支付入口（见 [AggregatePayment.resolveEntries]）。
+     */
+    AGGREGATE_PAYMENT,
 }
 
 data class ShortcutItem(

@@ -202,6 +202,14 @@
     <string name="functions_catalog_empty">还没有读取到功能\n应用提供的快捷方式与磁贴会显示在这里</string>
     <string name="functions_loading">正在加载功能…</string>
     <string name="functions_loading_progress">第 %1$d 个 / 共 %2$d 个</string>
+
+    <!-- 聚合支付（Flyme QuickPayWindowHelper 复刻）：功能页独立条目 + 联系人条上的四个支付入口 -->
+    <string name="aggregate_payment">聚合支付</string>
+    <string name="pay_wechat_scan">微信扫一扫</string>
+    <string name="pay_wechat_money">微信收付款</string>
+    <string name="pay_alipay_scan">支付宝扫一扫</string>
+    <string name="pay_alipay_code">支付宝付款码</string>
+    <string name="aggregate_pay_unavailable">未找到微信或支付宝的支付入口</string>
     <string name="add">添加</string>
 
     <!-- 轻量打开（六开关） -->

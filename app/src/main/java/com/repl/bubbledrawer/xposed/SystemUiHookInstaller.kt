@@ -183,6 +183,8 @@ class SystemUiHookInstaller(
             }
             contactBar = bar
             com.repl.bubbledrawer.launch.FlymeFreeformController.freeformObserver = bar
+            // 聚合支付（QuickPay）的执行入口：面板点击 / App 端广播都经这个触发器进控制器。
+            com.repl.bubbledrawer.contactbar.quickPayTrigger = { bar.showAggregateQuickPay() }
 
             monitor.start()
             module.log(

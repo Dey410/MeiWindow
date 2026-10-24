@@ -145,11 +145,15 @@ object PanelContentFactory {
         onFocusChange: ((Boolean) -> Unit)? = null,
         onLaunchShortcut: ((com.repl.bubbledrawer.shortcut.ShortcutItem) -> Unit)? = { item ->
             // 磁贴不是快捷方式：它必须在 SystemUI 里 createTile(...).click()，没有 Intent 可发。
+            // 聚合支付不启动任何应用：把联系人条切到聚合支付模式（quickPayTrigger，见 ContactBarController）。
             // 面板本来就跑在 SystemUI 进程，直接执行即可。
-            if (item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) {
-                com.repl.bubbledrawer.xposed.QsTileHost.click(context, item)
-            } else {
-                com.repl.bubbledrawer.shortcut.ShortcutRepository.launchShortcut(context, item)
+            when {
+                com.repl.bubbledrawer.shortcut.AggregatePayment.isEntry(item) ->
+                    com.repl.bubbledrawer.contactbar.quickPayTrigger?.invoke()
+                item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE ->
+                    com.repl.bubbledrawer.xposed.QsTileHost.click(context, item)
+                else ->
+                    com.repl.bubbledrawer.shortcut.ShortcutRepository.launchShortcut(context, item)
             }
             onClose()
         },
