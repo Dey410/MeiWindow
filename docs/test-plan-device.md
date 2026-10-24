@@ -1319,62 +1319,13 @@ firstVisibleItemScrollOffset == 0`）时展开收藏区，否则原样吞掉并�
 - [ ] 搜到**已收藏**的应用：徽标是 `−`，点一下取消收藏（徽标变 `+`）
 - [ ] 退出搜索回到列表：★ 区与徽标一致（不会出现"点了但没进 ★ 区"）
 
-## A34 功能页「应用磁贴」与图标取色（2026-10-22）
-
-**需求**：功能页除了快捷方式，还显示控制中心那批「应用磁贴」；磁贴底色用应用图标取色
-（对齐 AppMarket `ui/util/ImageColors.kt` 的 `dominantImageColor`）。
-
-**数据**：`ShortcutRepository.loadQsTiles()` 在 SystemUI 里用
-`Intent("android.service.quicksettings.action.QS_TILE")` + `queryIntentServices` 枚举**所有**
-`TileService`；图标优先合并 `MiuiQSHost.getTiles()` 里 live `QSTile` 的
-`state.iconSupplier`（反编译 `CustomTile.handleUpdateState` 的真实磁贴前景），没有 live 的退回
-`TILE_SERVICE_INFO` / `ServiceInfo` / 应用图标。每条是一个 `ShortcutItem(type = QS_TILE)`，
-`id` = 服务类名，键仍是 `pkg#class`。App 进程不枚举（没有 QSTile），只读
-`ShortcutBridge`/`ShortcutCacheStore` 的缓存。是否显示由更多应用面板的
-**「显示磁贴」**开关（`panel_show_tiles`，默认开）控制。
-
-**取色**：`ui/util/IconColors.kt` 移植 AppMarket 的 `dominantImageColor`：24×24 采样、
-跳过透明/近黑/近白、RGB 高 4 位分桶取最大桶均值、HSL 明度固定 0.45。底色在 SystemUI 扫描时
-用**宿主应用图标**算好，存 `ShortcutItem.tintColor`，随 JSON / `FunctionPinDetails` 过桥。
-
-**展示**：磁贴按**宿主应用**并入快捷方式分组（`PinManageModel.groupedFunctions`），组内排第一，
-和该应用的快捷方式挨着。样式与快捷方式同为圆形（`PinManageScreen.QsTileCell`）：圆底填
-`tintColor`，前景取 `QSTile.State.iconSupplier` 的真实磁贴图标（`CustomTile.handleUpdateState`），
-先按透明包围盒归一化，再 `ColorFilter.tint(Color.White)` 全部漂白。
-归一化比例按用户 2026-10-23 的实际效果要求用 **0.62**（与快捷方式一致；
-反编译 `MiuiQSIconViewImpl` 的 `qs_tile_icon_size / qs_tile_icon_bg_size = 21.33 / 50.18 ≈ 0.425` 仅作参考）。
-取不到色回退 `MiuixTheme.colorScheme.primary`；拿到的不是透明前景（应用图标兜底）则原样画、不漂白。
-
-**点击**：磁贴没有 Intent，必须回 SystemUI 走
-`MiuiQSHost.createTile("custom(pkg/cls)").click()`（`QsTileHost`，句柄从
-`SystemUIAppComponentFactoryBase.systemUIInitializer → getSysUIComponent() →
-miuiQSHostAdapterProvider` 反射取，和联系人条的 Dagger 取法同一套路）。面板/扇形直接执行；
-管理页（App 进程，没有 `BIND_QUICK_SETTINGS_TILE`）发 `ACTION_CLICK_QS_TILE` 广播交给 SystemUI，
-`FanHost` 校验发送方后执行。失败回退「启动宿主应用」，日志 `QS_TILE_CLICK_FALLBACK_APP`。
-
-**日志判据**：
-- `QS_TILE_SCAN count=… resolved=…`：扫到几枚 / PM 返回几个候选；
-- `QS_TILE_HOST_READY class=…`：Dagger 句柄拿到了；
-- `QS_TILE_HOST_UNAVAILABLE` / `QS_TILE_HOST_REJECTED`：句柄没拿到，磁贴点击会回退；
-- `QS_TILE_CLICK spec=… ok=…`、`QS_TILE_CREATE_NULL`、`QS_TILE_CLICK_FAILED`：逐次点击结果。
-
-- [ ] 同一应用分组里，磁贴排在快捷方式**前面**；不同应用圆底颜色不同、都是中等明度
-- [ ] 圆底是取色、前景是**白色**归一化磁贴图标（不是整格卡片、不是原彩色图标）
-- [ ] 白色单色磁贴图标在深色圆底上看得清；浅色圆底也不会和图标糊在一起
-- [ ] 点「管理」→ 磁贴右上角 ± → 点一下加入「已选功能」，页面当场生效
-- [ ] 划出扇形：已选磁贴作为 tile 出现在收藏应用/功能之后；点它执行对应磁贴动作
-- [ ] 面板里点磁贴直接执行；管理页（主页）点磁贴也能执行（经广播回到 SystemUI）
-- [ ] 功能页列出**所有**声明了 TileService 的应用磁贴（包括没加进控制中心的）；整机没有时只显示快捷方式
-- [ ] 更多应用面板 → 关闭「显示磁贴」：功能页里的磁贴全部消失、收藏区也不显示；再打开 → 磁贴回来
-- [ ] 取不到色的磁贴（纯白/纯透明图标）：圆底回退主题主色，不是透明或黑色
-- [ ] 磁贴动作失败时回退打开宿主应用（`QS_TILE_CLICK_FALLBACK_APP`），不是点了没反应
 
 ## A35 功能页加载进度（2026-10-23）
 
-功能页的快捷方式/磁贴是异步扫描的；加载期间在网格顶部显示一行：
+功能页的快捷方式是异步扫描的；加载期间在网格顶部显示一行：
 `正在加载功能…` + `第 x 个 / 共 y 个` + 细进度条。进度来自
 `ShortcutRepository.loadShortcuts(context, onProgress)`：扫描前用
-`countCandidates()` 估算总数（LauncherApps 快捷方式 + QS_TILE 服务 + 桌面捷径 + 2 条兜底），
+`countCandidates()` 估算总数（LauncherApps 快捷方式 + 桌面捷径 + 2 条兜底），
 每加入一条调用一次 `ShortcutProgress.step()`；总数小于已加载时自动抬高，进度条不会超过 100%。
 
 - [ ] 冷启动/切到功能页：列表加载期间能看到进度条和「第 x 个 / 共 y 个」

@@ -84,4 +84,45 @@ class PinManageModelPinTest {
         assertFalse("图标也要同时变回加号", model.isPinned(wechat))
         assertTrue("但这一项仍在（写下去的确实是空列表）", stored.isEmpty())
     }
+
+    @Test
+    fun pinThenExitManageModeWhileRecommendationsPendingDoesNotClobberNewPin() {
+        val qq = BubbleApp("com.tencent.mobileqq", "QQ", sortKey = "QQ", initials = "QQ")
+        var stored: List<PinnedRef> = listOf(PinnedRef(qq.packageName, 0))
+        val model = PinManageModel(
+            loadApps = { persistentListOf(qq, wechat) },
+            pinsOf = { stored },
+            onOrderChange = { order -> stored = order },
+            recommendConfig = { true to 8 },
+            // 模拟异步算推荐还没返回（挂起在 IO 线程）：旧实现要等它跑完才更新 cells，
+            // 此时用户点「完成」触发 toggleManageMode -> persistOrder，就会拿旧 cells 把刚加的微信盖掉。
+            loadRecommendations = { _, _, _ ->
+                kotlinx.coroutines.delay(5_000L)
+                emptyList()
+            },
+            mainDispatcher = kotlinx.coroutines.Dispatchers.Unconfined,
+        )
+        injectApps(model, listOf(qq, wechat))
+        model.refreshPins()
+
+        model.toggleManageMode() // 进入管理模式
+        model.togglePin(wechat)  // 添加微信
+
+        assertTrue(
+            "开启推荐时，点击收藏也必须同步落入 ★ 区，不能等 IO 推荐算完",
+            model.cells.any { it is Cell.Pin && it.app.packageName == wechat.packageName },
+        )
+
+        model.toggleManageMode() // 立即点「完成」退出管理模式
+
+        assertTrue(
+            "点「完成」退出管理模式不能把刚添加的收藏用旧 cells 覆盖掉",
+            stored.any { it.packageName == wechat.packageName },
+        )
+        assertTrue(
+            "原有的收藏也保持完整",
+            stored.any { it.packageName == qq.packageName },
+        )
+        model.release()
+    }
 }

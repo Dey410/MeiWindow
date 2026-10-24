@@ -129,4 +129,34 @@ class PinsSyncTest {
         // rev 缺失 = 更老模块版本的投递，只能收下。
         assertTrue(PinsSync.shouldApplyPush(rev = 0, localRev = 100))
     }
+
+    @Test
+    fun aStampedEmptyRemoteIsARealClear() {
+        // 远端先清空（rev 200）本地还是旧列表（rev 100）：必须采纳空值，不能把旧列表推回去。
+        val d = PinsSync.decide(b, 100, "", 200)
+        assertEquals(PinsSync.Source.REMOTE, d.source)
+        assertEquals("", d.value)
+        assertEquals(200, d.rev)
+        assertTrue(d.pushBack)
+    }
+
+    @Test
+    fun aStampedEmptyLocalBeatsAnUnstampedRemote() {
+        // 本地清空过（rev>0）而远端还是旧版无戳数据：本地空值代表一次真实编辑。
+        val d = PinsSync.decide("", 500, b, 0)
+        assertEquals(PinsSync.Source.LOCAL, d.source)
+        assertEquals("", d.value)
+        assertEquals(500, d.rev)
+        assertTrue(d.pushBack)
+    }
+
+    @Test
+    fun equalStampedValuesUseRemoteAsTieBreaker() {
+        // 同毫秒两笔值不同：共享组是第三个进程会看到的那一份，平戳以远端为准。
+        val d = PinsSync.decide(a, 300, b, 300)
+        assertEquals(PinsSync.Source.REMOTE, d.source)
+        assertEquals(b, d.value)
+        assertEquals(300, d.rev)
+        assertTrue(d.pushBack)
+    }
 }

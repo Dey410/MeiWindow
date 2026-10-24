@@ -111,10 +111,6 @@ object ShortcutBridge {
         put("type", item.type.name)
         put("intentUri", item.intentUri ?: "")
         put("isEnabled", item.isEnabled)
-        // 磁贴底色：0 = 没有（快捷方式/桌面捷径），非 0 = ARGB。App 侧缓存与面板都靠它。
-        put("tint", item.tintColor ?: 0)
-        // 磁贴前景标记：只有它是 true 才归一化+漂白，false 说明 icon 是应用图标兜底。
-        put("tileFg", item.tileForeground)
 
         val bmp = item.iconBitmap
         if (bmp != null && !bmp.isRecycled) {
@@ -147,11 +143,11 @@ object ShortcutBridge {
                 val label = obj.optString("label")
                 val subLabel = obj.optString("subLabel").ifBlank { null }
                 val typeName = obj.optString("type", ShortcutType.APP_SHORTCUT.name)
+                // 旧版缓存里可能还有已删除的磁贴条目：直接跳过，不能把它们当快捷方式画出来。
+                if (typeName == "QS_TILE") continue
                 val type = runCatching { ShortcutType.valueOf(typeName) }.getOrDefault(ShortcutType.APP_SHORTCUT)
                 val intentUri = obj.optString("intentUri").ifBlank { null }
                 val isEnabled = obj.optBoolean("isEnabled", true)
-                val tint = obj.optInt("tint", 0).takeIf { it != 0 }
-                val tileForeground = obj.optBoolean("tileFg", false)
 
                 val iconBase64 = obj.optString("iconBmp").ifBlank { null }
                 val iconBmp = iconBase64?.let {
@@ -170,8 +166,6 @@ object ShortcutBridge {
                         iconBitmap = iconBmp,
                         appIconBitmap = null,
                         isEnabled = isEnabled,
-                        tintColor = tint,
-                        tileForeground = tileForeground,
                     )
                 )
             }
@@ -254,7 +248,7 @@ object ShortcutBridge {
         val intent = Intent(ACTION_REQUEST_REFRESH).apply {
             setPackage("com.android.systemui")
         }
-        runCatching { context.sendBroadcast(intent) }
+        runCatching { com.repl.bubbledrawer.xposed.PinSyncReceiver.sendBroadcastWithIdentity(context, intent) }
     }
 
     fun isTrustedUid(uid: Int, packages: List<String>?): Boolean {

@@ -675,14 +675,6 @@ fun MorePanelSettingsScreen(
                             onCommit = actions::setPanelTextSp,
                         )
                     })
-                    add(CardItem("show_tiles") {
-                        SwitchRow(
-                            title = stringResource(R.string.panel_show_tiles),
-                            summary = stringResource(R.string.panel_show_tiles_summary),
-                            checked = snap.panelShowTiles,
-                            onCheckedChange = actions::setPanelShowTiles,
-                        )
-                    })
                     add(CardItem("dismiss_outside") {
                         DropdownRow(
                             title = stringResource(R.string.panel_dismiss_outside),

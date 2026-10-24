@@ -67,18 +67,28 @@ class PinManageActivity : ComponentActivity() {
         ).also { AppGraph.pinStore = it }
     }
 
+    private var pinManageModel: PinManageModel? = null
     private var pinsPrefsListener: android.content.SharedPreferences.OnSharedPreferenceChangeListener? = null
     private var shortcutCacheListener: (() -> Unit)? = null
+
+    override fun onResume() {
+        super.onResume()
+        // 从后台或扇形「更多」面板返回时主动刷新一次，确保与面板内的编辑即时同步。
+        pinManageModel?.refreshPins()
+    }
 
     override fun onDestroy() {
         pinsPrefsListener?.let { listener ->
             runCatching { RemoteBridge.local(this).unregisterOnSharedPreferenceChangeListener(listener) }
+            runCatching { RemoteBridge.remote?.unregisterOnSharedPreferenceChangeListener(listener) }
         }
         pinsPrefsListener = null
         shortcutCacheListener?.let { listener ->
             com.repl.bubbledrawer.shortcut.ShortcutCacheStore.removeListener(listener)
         }
         shortcutCacheListener = null
+        pinManageModel?.release()
+        pinManageModel = null
         super.onDestroy()
     }
 
@@ -103,7 +113,6 @@ class PinManageActivity : ComponentActivity() {
             },
             // 分身角标：图标本身取主空间那张，这一项只决定要不要叠角标（与面板同源设置）。
             cloneBadge = SettingsStore.snapshot(this@PinManageActivity).cloneBadge,
-            showTiles = SettingsStore.snapshot(this@PinManageActivity).panelShowTiles,
             loadShortcuts = { onProgress ->
                 ShortcutRepository.loadShortcuts(this@PinManageActivity, onProgress)
             },
@@ -115,18 +124,22 @@ class PinManageActivity : ComponentActivity() {
             },
             onFunctionOrderChange = { com.repl.bubbledrawer.shortcut.FunctionPinStore.setPins(this@PinManageActivity, it) },
         )
+        pinManageModel = model
         model.reload()
-        // Pins can also be edited in the fan's 更多 panel (SystemUI), which hands them over as a
-        // broadcast into this process. Watch the mirror file so this page follows live instead
-        // of showing the list as it was when the Activity opened.
+        // Pins can also be edited in the fan's 更多 panel (SystemUI), which hands them over via
+        // ContentProvider / broadcast into this process. Watch both value and rev keys so even
+        // same-content re-stamps or remote mirror updates refresh this page live.
         pinsPrefsListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
             if (key == com.repl.bubbledrawer.data.PrefsPinBackend.KEY ||
-                key == com.repl.bubbledrawer.shortcut.FunctionPinStore.KEY_PINNED_FUNCTIONS
+                key == com.repl.bubbledrawer.data.PrefsPinBackend.KEY_REV ||
+                key == com.repl.bubbledrawer.shortcut.FunctionPinStore.KEY_PINNED_FUNCTIONS ||
+                key == com.repl.bubbledrawer.shortcut.FunctionPinStore.PREFS_KEY_REV
             ) {
                 runOnUiThread { model.refreshPins() }
             }
         }.also { listener ->
             runCatching { RemoteBridge.local(this).registerOnSharedPreferenceChangeListener(listener) }
+            runCatching { RemoteBridge.remote?.registerOnSharedPreferenceChangeListener(listener) }
         }
 
         // 监听来自 SystemUI 上报的完整快捷方式更新
@@ -236,18 +249,10 @@ class PinManageActivity : ComponentActivity() {
                         onLaunchShortcut = { item ->
                             when {
                                 // 聚合支付：App 进程没有联系人条，发广播让 SystemUI 把条切到支付模式
-                                // （FanHost 里有对应的导出广播，带发送方校验；磁贴点击同一条路）。
+                                // （FanHost 里有对应的导出广播，带发送方校验）。
                                 com.repl.bubbledrawer.shortcut.AggregatePayment.isEntry(item) -> {
                                     com.repl.bubbledrawer.shortcut.AggregatePayment.requestShow(
                                         this@PinManageActivity,
-                                    )
-                                }
-                                item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE -> {
-                                    // 管理页在 App 进程，没有 BIND_QUICK_SETTINGS_TILE，绑不了 TileService；
-                                    // 交给 SystemUI 执行（FanHost 里有对应的导出广播，带发送方校验）。
-                                    com.repl.bubbledrawer.xposed.QsTileHost.requestClick(
-                                        this@PinManageActivity,
-                                        item,
                                     )
                                 }
                                 else -> {

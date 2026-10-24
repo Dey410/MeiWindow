@@ -33,46 +33,14 @@ class PinSyncReceiver : BroadcastReceiver() {
             return
         }
         val appContext = context.applicationContext
-
-        val raw = intent.getStringExtra(EXTRA_PINS)
-        if (raw != null) {
-            if (!isPlausiblePinsValue(raw)) {
-                Log.w(TAG, "PIN_SYNC_BROADCAST_REJECTED bad payload len=${raw.length}")
-            } else {
-                val rev = intent.getLongExtra(EXTRA_REV, 0L)
-                if (rev > 0L) {
-                    // Keep the SENDER's stamp: this is the panel's edit, not a new one (see
-                    // SettingsStore.applyPushedPins).
-                    SettingsStore.applyPushedPins(appContext, raw, rev)
-                } else {
-                    SettingsStore.pinBackend(appContext).write(raw)
-                }
-                Log.i(
-                    TAG,
-                    "PIN_SYNC_BROADCAST_APPLIED pins=${PinCodec.decode(raw).size} len=${raw.length} rev=$rev",
-                )
-            }
-        }
-
-        // 同一个交接通道也送「已选功能」（快捷方式收藏）：两个列表都由面板编辑，没必要开第二条路。
-        val functions = intent.getStringExtra(EXTRA_FUNCTIONS)
-        if (functions != null) {
-            if (!isPlausibleFunctionsValue(functions)) {
-                Log.w(TAG, "FUNCTION_SYNC_BROADCAST_REJECTED bad payload len=${functions.length}")
-            } else {
-                val rev = intent.getLongExtra(EXTRA_FUNCTIONS_REV, 0L)
-                if (rev > 0L) {
-                    SettingsStore.applyPushedFunctions(appContext, functions, rev)
-                } else {
-                    SettingsStore.functionBackend(appContext).write(functions)
-                }
-                Log.i(
-                    TAG,
-                    "FUNCTION_SYNC_BROADCAST_APPLIED functions=${FunctionPinStore.decode(functions).size} " +
-                        "len=${functions.length} rev=$rev",
-                )
-            }
-        }
+        applyPayload(
+            appContext = appContext,
+            pins = intent.getStringExtra(EXTRA_PINS),
+            pinsRev = intent.getLongExtra(EXTRA_REV, 0L),
+            functions = intent.getStringExtra(EXTRA_FUNCTIONS),
+            functionsRev = intent.getLongExtra(EXTRA_FUNCTIONS_REV, 0L),
+            via = "broadcast",
+        )
     }
 
     private fun sentFromUidOrNull(): Int? = runCatching { sentFromUid }.getOrNull()
@@ -98,6 +66,8 @@ class PinSyncReceiver : BroadcastReceiver() {
         const val TAG = "BubbleDrawer"
         const val ACTION = "com.repl.bubbledrawer.action.SYNC_PINS"
         const val ACTION_TO_SYSTEMUI = "com.repl.bubbledrawer.action.SYNC_PINS_TO_SYSTEMUI"
+        /** ContentProvider 同步通道的方法名（借用 [com.repl.bubbledrawer.shortcut.ShortcutProvider]）。 */
+        const val METHOD_SYNC = "sync_pins"
         const val EXTRA_PINS = "pins"
 
         /** 「已选功能」（快捷方式收藏）走同一条交接通道，只是换了一组 extra。 */
@@ -117,6 +87,90 @@ class PinSyncReceiver : BroadcastReceiver() {
 
         /** "pkg#user;…" for ~100 pins is < 5 KB; 10 KB is a generous cap. */
         private const val MAX_VALUE_LEN = 10_000
+
+        /**
+         * 发送带调用方身份的广播。
+         *
+         * Android 14+（minSdk = 36）默认不在跨进程广播里暴露发送方身份：接收端的
+         * `BroadcastReceiver.sentFromUid` 恒为 `-1`、`sentFromPackage` 恒为 `null`，导致
+         * [isFromSystemUi] / `FanHost.isFromModuleApp` 的发送方校验把合法交接全部拒掉
+         * （`PIN_SYNC_BROADCAST_REJECTED sender=-1 pkg=null`）。显式开启 `shareIdentity`
+         * 后系统才会把真实 uid/package 传给接收端。
+         */
+        fun sendBroadcastWithIdentity(context: Context, intent: Intent) {
+            val options = android.app.BroadcastOptions.makeBasic()
+                .setShareIdentityEnabled(true)
+                .toBundle()
+            context.sendBroadcast(intent, null, options)
+        }
+
+        /**
+         * 统一落盘入口（ContentProvider 同步调用与 Broadcast 兜底共用）。
+         * 返回是否至少有一项合法载荷被受理。
+         */
+        fun applyPayload(
+            appContext: Context,
+            pins: String?,
+            pinsRev: Long,
+            functions: String?,
+            functionsRev: Long,
+            via: String = "broadcast",
+        ): Boolean {
+            var applied = false
+            if (pins != null) {
+                if (!isPlausiblePinsValue(pins)) {
+                    Log.w(TAG, "PIN_SYNC_REJECTED via=$via bad payload len=${pins.length}")
+                } else {
+                    val pinApplied = if (pinsRev > 0L) {
+                        // Keep the SENDER's stamp: this is the panel's edit, not a new one (see
+                        // SettingsStore.applyPushedPins). An older rev is a no-op: the app-side
+                        // value already won, so the provider must not acknowledge it as applied.
+                        SettingsStore.applyPushedPins(appContext, pins, pinsRev)
+                    } else {
+                        SettingsStore.pinBackend(appContext).write(pins)
+                        true
+                    }
+                    if (pinApplied) {
+                        applied = true
+                        Log.i(
+                            TAG,
+                            "PIN_SYNC_APPLIED via=$via pins=${PinCodec.decode(pins).size} " +
+                                "len=${pins.length} rev=$pinsRev",
+                        )
+                    } else {
+                        Log.i(TAG, "PIN_SYNC_STALE_DROPPED via=$via rev=$pinsRev len=${pins.length}")
+                    }
+                }
+            }
+
+            // 同一个交接通道也送「已选功能」（快捷方式收藏）：两个列表都由面板编辑，没必要开第二条路。
+            if (functions != null) {
+                if (!isPlausibleFunctionsValue(functions)) {
+                    Log.w(TAG, "FUNCTION_SYNC_REJECTED via=$via bad payload len=${functions.length}")
+                } else {
+                    val functionApplied = if (functionsRev > 0L) {
+                        SettingsStore.applyPushedFunctions(appContext, functions, functionsRev)
+                    } else {
+                        SettingsStore.functionBackend(appContext).write(functions)
+                        true
+                    }
+                    if (functionApplied) {
+                        applied = true
+                        Log.i(
+                            TAG,
+                            "FUNCTION_SYNC_APPLIED via=$via functions=${FunctionPinStore.decode(functions).size} " +
+                                "len=${functions.length} rev=$functionsRev",
+                        )
+                    } else {
+                        Log.i(
+                            TAG,
+                            "FUNCTION_SYNC_STALE_DROPPED via=$via rev=$functionsRev len=${functions.length}",
+                        )
+                    }
+                }
+            }
+            return applied
+        }
 
         /**
          * Grammar check for the encoded pin string: `pkg#user;pkg#user;…` (PinCodec

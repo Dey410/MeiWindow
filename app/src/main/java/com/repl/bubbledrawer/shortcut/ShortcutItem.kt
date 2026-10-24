@@ -11,14 +11,6 @@ enum class ShortcutType {
     DESKTOP_PINNED,
 
     /**
-     * 控制中心的「应用磁贴」：应用声明的 `TileService`（`android.service.quicksettings.action.QS_TILE`）。
-     *
-     * 它和快捷方式不是一回事：启动要回到 SystemUI 里 `createTile("custom(pkg/cls)").click()`，
-     * 不能在 App 进程绑服务（`BIND_QUICK_SETTINGS_TILE` 是 signature|privileged）。
-     */
-    QS_TILE,
-
-    /**
      * 内建的「聚合支付」功能页条目（不来自任何应用，扫描/收藏/搜索都不参与）：点击把联系人条切到
      * 聚合支付模式，条里才放真正的微信/支付宝支付入口（见 [AggregatePayment.resolveEntries]）。
      */
@@ -37,19 +29,6 @@ data class ShortcutItem(
     val iconDrawable: Drawable? = null,
     val appIconBitmap: Bitmap? = null,
     val isEnabled: Boolean = true,
-    /**
-     * 磁贴底色（ARGB）。只对 [ShortcutType.QS_TILE] 有值：SystemUI 扫描时用**宿主应用图标**算好，
-     * 随 [com.repl.bubbledrawer.shortcut.ShortcutBridge] / [FunctionPinDetails] 一起过桥 ——
-     * 面板（SystemUI）和管理页（App）都能直接画，不用各自再读一遍图标。
-     */
-    val tintColor: Int? = null,
-    /**
-     * 这个 [ShortcutType.QS_TILE] 的 icon 是否真的是**磁贴前景**（透明底图形）。
-     *
-     * `true` → UI 归一化后漂白成白色前景；`false` → 服务没声明 icon，`iconBitmap` 其实是
-     * 应用图标兜底，原样画（把彩色应用图标漂成白块比不漂更糟）。跨进程一起传。
-     */
-    val tileForeground: Boolean = false,
 ) {
     /**
      * 收藏用的稳定标识 `pkg#id`。

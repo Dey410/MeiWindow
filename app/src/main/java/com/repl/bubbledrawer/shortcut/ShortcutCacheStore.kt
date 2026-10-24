@@ -54,9 +54,7 @@ object ShortcutCacheStore {
             Log.w(TAG, "SHORTCUT_CACHE_IGNORED unparseable/empty jsonLen=${json.length}")
             return
         }
-        // 键里带底色：磁贴取色跟着应用图标走，只比 pinKey 会让「换了图标但名字没变」的磁贴
-        // 一直用旧底色，直到用户手动清缓存。
-        val keys = items.map { "${it.pinKey}@${it.tintColor ?: 0}@${it.tileForeground}" }
+        val keys = items.map { it.pinKey }
         synchronized(lock) {
             if (keys == lastKeys) {
                 // 内容一样：只把「新鲜度」往前推，不写文件、不通知 —— 通知一次就是一轮重扫。
@@ -97,7 +95,7 @@ object ShortcutCacheStore {
                     synchronized(lock) {
                         memoryCache = items
                         if (lastKeys == null) {
-                            lastKeys = items.map { "${it.pinKey}@${it.tintColor ?: 0}@${it.tileForeground}" }
+                            lastKeys = items.map { it.pinKey }
                         }
                         if (savedAtMillis == 0L) savedAtMillis = file.lastModified()
                     }

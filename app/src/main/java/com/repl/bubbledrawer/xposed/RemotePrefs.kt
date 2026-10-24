@@ -76,10 +76,6 @@ object RemotePrefs {
     const val PANEL_TEXT_MIN = 8
     const val PANEL_TEXT_MAX = 18
 
-    /** 更多应用面板：是否在功能页显示「应用磁贴」（默认开，用户 2026-10-22 新增）。 */
-    const val KEY_PANEL_SHOW_TILES = "panel_show_tiles"
-    const val DEFAULT_PANEL_SHOW_TILES = true
-
     /** 更多面板点击外部收起方式：0 = 单击，1 = 双击 */
     const val KEY_PANEL_DISMISS_OUTSIDE = "panel_dismiss_outside"
     const val DISMISS_OUTSIDE_SINGLE = 0
@@ -467,8 +463,6 @@ object RemotePrefs {
         val panelHeightPct: Int = DEFAULT_PANEL_H_PCT,
         val panelIconDp: Int = DEFAULT_PANEL_ICON_DP,
         val panelTextSp: Int = DEFAULT_PANEL_TEXT_SP,
-        /** 功能页是否显示应用磁贴（用户 2026-10-22 的开关）。 */
-        val panelShowTiles: Boolean = DEFAULT_PANEL_SHOW_TILES,
         /** 更多面板点击外部收起方式：0 = 单击，1 = 双击 */
         val panelDismissOutside: Int = DEFAULT_PANEL_DISMISS_OUTSIDE,
         /** 扇形面板应用图标数量（5 或 6） */
@@ -619,7 +613,6 @@ object RemotePrefs {
             panelHeightPct = sp.getInt(KEY_PANEL_H_PCT, DEFAULT_PANEL_H_PCT).let { if (it <= 0) DEFAULT_PANEL_H_PCT else it.coerceIn(PANEL_H_PCT_MIN, PANEL_H_PCT_MAX) },
             panelIconDp = sp.getInt(KEY_PANEL_ICON_DP, DEFAULT_PANEL_ICON_DP).let { if (it <= 0) DEFAULT_PANEL_ICON_DP else it.coerceIn(PANEL_ICON_MIN, PANEL_ICON_MAX) },
             panelTextSp = sp.getInt(KEY_PANEL_TEXT_SP, DEFAULT_PANEL_TEXT_SP).let { if (it <= 0) DEFAULT_PANEL_TEXT_SP else it.coerceIn(PANEL_TEXT_MIN, PANEL_TEXT_MAX) },
-            panelShowTiles = sp.getBoolean(KEY_PANEL_SHOW_TILES, DEFAULT_PANEL_SHOW_TILES),
             panelDismissOutside = sp.getInt(KEY_PANEL_DISMISS_OUTSIDE, DEFAULT_PANEL_DISMISS_OUTSIDE).coerceIn(0, 1),
             fanIconCount = sp.getInt(KEY_FAN_ICON_COUNT, DEFAULT_FAN_ICON_COUNT).coerceIn(5, 6),
             fanLayers = sp.getInt(KEY_FAN_LAYERS, DEFAULT_FAN_LAYERS).coerceIn(FAN_LAYERS_SINGLE, FAN_LAYERS_DOUBLE),

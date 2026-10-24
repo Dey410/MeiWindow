@@ -226,6 +226,29 @@ object ShortcutRepository {
         context: Context,
         onProgress: ((loaded: Int, total: Int) -> Unit)? = null,
     ): Pair<List<ShortcutItem>, List<ShortcutItem>> {
+        // App 进程管理页的快速路径：SystemUI 已经上报过一份完整缓存时，直接显示缓存，
+        // 绝不再跑一遍 loadXmlShortcuts（那要遍历所有 launcher activity 并解析每个 APK 的
+        // shortcuts.xml，是首次打开功能页最大的耗时）。缓存旧了只发一次后台刷新请求，
+        // 新数据到了会通过 ShortcutCacheStore 的 listener 通知页面。
+        if (context.packageName != "com.android.systemui") {
+            val cached = ShortcutCacheStore.load(context)
+            if (!cached.isNullOrEmpty()) {
+                val startedAt = SystemClock.uptimeMillis()
+                val progress = onProgress?.let { ShortcutProgress(it, cached.size.coerceAtLeast(1)) }
+                val result = cached.toMutableList()
+                val seen = result.mapTo(HashSet()) { it.pinKey }
+                injectEssentialShortcuts(context, result, seen)
+                maybeRequestRefresh(context, cacheEmpty = false)
+                progress?.setDone(result.size)
+                Log.i(
+                    TAG,
+                    "SHORTCUT_CACHE_FAST items=${result.size} ageMs=${ShortcutCacheStore.ageMillis(context)} " +
+                        "ms=${SystemClock.uptimeMillis() - startedAt}",
+                )
+                return Pair(result, emptyList())
+            }
+        }
+
         val progress = onProgress?.let { ShortcutProgress(it, countCandidates(context)) }
         val appShortcuts = loadAppShortcuts(context, progress)
         // 扫描里已经注入过桌面捷径并计过数；这里再读一次只为返回给调用方（去重由调用方做），
@@ -235,7 +258,7 @@ object ShortcutRepository {
         return Pair(appShortcuts, desktopShortcuts)
     }
 
-    /** 粗略的总数：LauncherApps 快捷方式 + 应用磁贴 + 桌面捷径 + 微信/支付宝兜底 2 条。 */
+    /** 粗略的总数：LauncherApps 快捷方式 + 桌面捷径 + 微信/支付宝兜底 2 条。 */
     private fun countCandidates(context: Context): Int {
         var total = 2
         runCatching {
@@ -248,13 +271,6 @@ object ShortcutRepository {
                     total += launcherApps.getShortcuts(q, profile)?.size ?: 0
                 }
             }
-        }
-        runCatching {
-            @Suppress("DEPRECATION")
-            total += context.packageManager.queryIntentServices(
-                Intent("android.service.quicksettings.action.QS_TILE"),
-                0,
-            ).size
         }
         runCatching {
             val cursor = context.contentResolver.query(
@@ -320,11 +336,8 @@ object ShortcutRepository {
             lastReportedFingerprint = if (ok) EMPTY_FINGERPRINT else 0
             return ScanReport(0, if (ok) ShortcutBridge.ReportResult.SENT else ShortcutBridge.ReportResult.FAILED)
         }
-        // 指纹含标题与磁贴底色：只按 pinKey 比对会让「快捷方式改名/换图标/磁贴换色」永远同步不到
-        // App（那边显示的是缓存）。
-        val fingerprint = list.joinToString("|") {
-            "${it.pinKey}=${it.label}=${it.tintColor ?: 0}=${it.tileForeground}"
-        }.hashCode()
+        // 指纹含标题：只按 pinKey 比对会让「快捷方式改名」永远同步不到 App（那边显示的是缓存）。
+        val fingerprint = list.joinToString("|") { "${it.pinKey}=${it.label}" }.hashCode()
         if (!force && fingerprint == lastReportedFingerprint) {
             // 内容一字不差：不重复上报。这一条是「App 请求刷新 → SystemUI 上报 → App 存盘 →
             // 通知监听者 → 又请求刷新」那个环的最后一道闸 —— 只要数据没变，环就断了。
@@ -487,16 +500,6 @@ object ShortcutRepository {
             Log.w(TAG, "LauncherApps scan failed in SystemUI", it)
         }
 
-        // 注入控制中心的应用磁贴（TileService）。扫描要在 LauncherApps 之后：万一快捷方式枚举
-        // 失败，磁贴仍然应该出现在功能页里；两者的键空间不同（磁贴 id 是服务类名），不会撞。
-        runCatching {
-            for (tile in loadQsTiles(context, seenKeys, progress)) {
-                result.add(tile)
-            }
-        }.onFailure {
-            Log.w(TAG, "QS_TILE_SCAN_FAILED", it)
-        }
-
         // 注入桌面固定快捷方式
         runCatching {
             val desktopShortcuts = loadDesktopShortcuts(context, progress)
@@ -532,11 +535,7 @@ object ShortcutRepository {
         // 1. 优先尝试直接从 LauncherApps 扫描（在 SystemUI 进程内直接成功）
         var launcherAppsSuccess = false
         val scanned = runCatching { scanSystemUiShortcutsInternal(context, progress = progress) }.getOrNull()
-        // 磁贴条目没有 shortcutInfo（那是 LauncherApps 专有的）；只看 shortcutInfo 会让「机器上
-        // 没有快捷方式、但有一堆应用磁贴」的清单被误判成「枚举失败」。
-        if (!scanned.isNullOrEmpty() &&
-            (scanned.any { it.shortcutInfo != null } || scanned.any { it.type == ShortcutType.QS_TILE })
-        ) {
+        if (!scanned.isNullOrEmpty() && scanned.any { it.shortcutInfo != null }) {
             launcherAppsSuccess = true
             for (item in scanned) {
                 if (seenKeys.add(item.pinKey)) {
@@ -854,160 +853,10 @@ object ShortcutRepository {
         }.getOrDefault(false)
     }
 
-    /**
-     * 所有应用磁贴（`TileService`）。返回 [ShortcutType.QS_TILE] 条目，键仍是 `pkg#id`，
-     * `id` 是服务类名，与快捷方式天然不会撞。
-     *
-     * 枚举用 `queryIntentServices(QS_TILE)`，保证**没加进控制中心的磁贴也列出来**；图标优先合并
-     * [com.repl.bubbledrawer.xposed.QsTileHost.currentTileItems] 的 live `QSTile.State.iconSupplier`
-     * （反编译 `CustomTile.handleUpdateState` 的真实磁贴前景），没有 live 的退回
-     * `TILE_SERVICE_INFO` / `ServiceInfo` / 应用图标。
-     *
-     * 是否显示由更多应用面板的「显示磁贴」开关控制（`panel_show_tiles`，默认开）。
-     */
-    private fun loadQsTiles(
-        context: Context,
-        seenKeys: MutableSet<String>,
-        progress: ShortcutProgress? = null,
-    ): List<ShortcutItem> {
-        // 只在 SystemUI 里做：App 进程看不到 QSTile，也没有 SystemUI 的 classloader。
-        if (context.packageName != "com.android.systemui") return emptyList()
-        if (!SettingsStore.snapshot(context).panelShowTiles) {
-            Log.i(TAG, "QS_TILE_SCAN_SKIPPED show_tiles=false")
-            return emptyList()
-        }
-        val pm = context.packageManager
-        val live = com.repl.bubbledrawer.xposed.QsTileHost.currentTileItems(context)
-            .associateBy { it.pinKey }
-
-        @Suppress("DEPRECATION")
-        val resolved = runCatching {
-            pm.queryIntentServices(
-                Intent("android.service.quicksettings.action.QS_TILE"),
-                PackageManager.GET_META_DATA,
-            )
-        }.getOrNull().orEmpty()
-
-        val out = mutableListOf<ShortcutItem>()
-        for (resolveInfo in resolved) {
-            val si = resolveInfo.serviceInfo ?: continue
-            if (!si.enabled || si.applicationInfo?.enabled != true) continue
-            if (si.packageName == context.packageName) continue
-            val component = android.content.ComponentName(si.packageName, si.name)
-            val key = "${component.packageName}#${component.className}"
-            if (!seenKeys.add(key)) continue
-
-            val liveItem = live[key]
-            if (liveItem != null) {
-                out.add(
-                    liveItem.copy(
-                        subLabel = liveItem.subLabel ?: appLabelOf(pm, si.packageName),
-                    ),
-                )
-                continue
-            }
-
-            val appLabel = appLabelOf(pm, si.packageName)
-            val tileInfo = loadTileServiceInfo(pm, si)
-            val serviceLabel = tileInfo.first?.toString()
-                ?: runCatching { si.loadLabel(pm).toString() }.getOrNull()
-                    ?.takeIf { it.isNotBlank() && it != si.name && !it.contains('.') }
-            val label = serviceLabel ?: appLabel ?: component.className.substringAfterLast('.')
-            val icon = tileInfo.second
-                ?: runCatching { si.loadIcon(pm) }.getOrNull()
-                ?: runCatching { pm.getApplicationIcon(si.packageName) }.getOrNull()
-            val rawBitmap = icon?.let {
-                runCatching { drawableToBitmap(it, ShortcutBridge.ICON_MAX_PX) }.getOrNull()
-            }
-            // ServiceInfo/应用图标经常是启动图标（白色圆角矩形），不是磁贴前景。它是实底/不透明时，
-            // 去 `createTile` 取一次真正的 state.iconSupplier；拿不到才用原图兜底。
-            val rawIsForeground = rawBitmap != null &&
-                runCatching { isTransparentBitmap(rawBitmap) }.getOrDefault(false)
-            val realIcon = if (!rawIsForeground) {
-                runCatching {
-                    com.repl.bubbledrawer.xposed.QsTileHost.tileIconFor(context, component)
-                }.getOrNull()
-            } else null
-            val iconBitmap = realIcon?.let {
-                runCatching { drawableToBitmap(it, ShortcutBridge.ICON_MAX_PX) }.getOrNull()
-            } ?: rawBitmap
-            // 只有透明前景才漂白；应用图标兜底原样画（避免白色圆角方块）。
-            val tileForeground = iconBitmap != null &&
-                runCatching { isTransparentBitmap(iconBitmap) }.getOrDefault(false)
-            val tint = applicationIcon(context, si.packageName)?.let { appIcon ->
-                runCatching { com.repl.bubbledrawer.ui.util.IconColors.dominant(appIcon) }.getOrNull()
-            }
-            out.add(
-                ShortcutItem(
-                    id = component.className,
-                    packageName = component.packageName,
-                    label = label,
-                    subLabel = appLabel,
-                    type = ShortcutType.QS_TILE,
-                    iconBitmap = iconBitmap,
-                    tintColor = tint,
-                    tileForeground = tileForeground,
-                ),
-            )
-            progress?.step()
-        }
-
-        // 反方向兜底：live 里有、query 没返回的（包可见性/服务被禁用的边缘情况）也保留。
-        for (item in live.values) {
-            if (seenKeys.add(item.pinKey)) {
-                out.add(item)
-                progress?.step()
-            }
-        }
-        Log.i(TAG, "QS_TILE_SCAN count=${out.size} live=${live.size} resolved=${resolved.size}")
-        return out.sortedWith(compareBy({ it.subLabel.orEmpty() }, { it.label }))
-    }
-
     private fun appLabelOf(pm: PackageManager, packageName: String): String? = runCatching {
         pm.getApplicationLabel(pm.getApplicationInfo(packageName, 0)).toString()
     }.getOrNull()?.ifBlank { null }
 
-    /**
-     * 读 `android.service.quicksettings.TILE_SERVICE_INFO` 指向的 XML（`<tile-service-info>`）。
-     * 不少应用只把磁贴的 label/icon 写在这里，service 本身没有 `android:label/icon`。
-     */
-    private fun loadTileServiceInfo(
-        pm: PackageManager,
-        si: android.content.pm.ServiceInfo,
-    ): Pair<CharSequence?, Drawable?> {
-        val metaRes = runCatching {
-            si.metaData?.getInt("android.service.quicksettings.TILE_SERVICE_INFO", 0)
-        }.getOrNull() ?: 0
-        if (metaRes == 0) return null to null
-        val parser = runCatching {
-            si.loadXmlMetaData(pm, "android.service.quicksettings.TILE_SERVICE_INFO")
-        }.getOrNull() ?: return null to null
-        return try {
-            var event = parser.eventType
-            while (event != XmlPullParser.END_DOCUMENT) {
-                if (event == XmlPullParser.START_TAG && parser.name == "tile-service-info") {
-                    val resources = runCatching {
-                        pm.getResourcesForApplication(si.packageName)
-                    }.getOrNull()
-                    val labelRes = parser.getAttributeResourceValue(ANDROID_NS, "label", 0)
-                    val iconRes = parser.getAttributeResourceValue(ANDROID_NS, "icon", 0)
-                    val label = if (labelRes != 0) {
-                        runCatching { resources?.getString(labelRes) }.getOrNull()
-                    } else null
-                    val icon = if (iconRes != 0) {
-                        runCatching { resources?.getDrawable(iconRes, null) }.getOrNull()
-                    } else null
-                    return label to icon
-                }
-                event = parser.next()
-            }
-            null to null
-        } catch (_: Exception) {
-            null to null
-        } finally {
-            runCatching { parser.close() }
-        }
-    }
 
     /**
      * 读取小米桌面固定在桌面的快捷方式：
@@ -1110,46 +959,6 @@ object ShortcutRepository {
         return normalized
     }
 
-    /**
-     * 磁贴前景的归一化比例：用户 2026-10-23 看过实际效果后要求「归一化还是用 0.62」，
-     * 所以与快捷方式统一用 0.62（反编译的 21.33/50.18≈0.425 只作参考，不再采用）。
-     */
-    const val TILE_ICON_FRACTION = 0.62f
-
-    /** 磁贴前景专用缓存：与快捷方式的 0.62 归一化分开，避免同一个 pinKey 互相顶掉。 */
-    private val normalizedTileIcons = android.util.LruCache<String, Bitmap>(24)
-
-    fun normalizedTileForeground(item: ShortcutItem, bitmap: Bitmap): Bitmap {
-        normalizedTileIcons.get(item.pinKey)?.let { return it }
-        val normalized = runCatching {
-            normalizeTransparentForeground(bitmap, 192, TILE_ICON_FRACTION)
-        }.getOrDefault(bitmap)
-        normalizedTileIcons.put(item.pinKey, normalized)
-        return normalized
-    }
-
-    /**
-     * 位图里有没有可见像素（alpha > 8）。用于兜底：某些 TileService 的 icon 是全透明占位，
-     * 归一化/漂白之后就是一张空图，界面上看起来“所有图标都不显示”。此时 UI 退回应用图标
-     * 或首字。
-     */
-    fun hasVisiblePixels(bitmap: Bitmap): Boolean {
-        if (bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0) return false
-        if (bitmap.config == Bitmap.Config.HARDWARE) return true
-        if (!bitmap.hasAlpha()) return true
-        val stepX = (bitmap.width / 16).coerceAtLeast(1)
-        val stepY = (bitmap.height / 16).coerceAtLeast(1)
-        var y = 0
-        while (y < bitmap.height) {
-            var x = 0
-            while (x < bitmap.width) {
-                if (android.graphics.Color.alpha(bitmap.getPixel(x, y)) > 8) return true
-                x += stepX
-            }
-            y += stepY
-        }
-        return false
-    }
 
     /**
      * 把任意来源的位图缩到 [ShortcutBridge.ICON_MAX_PX] 以内（桌面 Provider 的 BLOB 直接解码出来
@@ -1207,12 +1016,6 @@ object ShortcutRepository {
         viaGate: Boolean = false,
         optionsBundle: android.os.Bundle? = null,
     ): Boolean {
-        // 磁贴没有 Intent/ShortcutInfo，走不了这里；调用方必须先分流到 QsTileHost（见 FanHost /
-        // PanelContentFactory / PinManageActivity）。真漏到这里就明确失败，别去 start 一个空 Intent。
-        if (item.type == ShortcutType.QS_TILE) {
-            Log.w(TAG, "LAUNCH_SHORTCUT_REJECTED_QS_TILE pkg=${item.packageName} id=${item.id}")
-            return false
-        }
         // 聚合支付同理：它自己不启动任何应用，点击应该走 quickPayTrigger 把联系人条切到聚合支付
         // 模式（条目层面才是可启动的 APP_SHORTCUT）。漏到这里说明有调用点没分流。
         if (item.type == ShortcutType.AGGREGATE_PAYMENT) {

@@ -106,10 +106,6 @@ object SettingsStore {
     fun setPanelIconDp(context: Context, dp: Int) = putInt(context, RemotePrefs.KEY_PANEL_ICON_DP, dp)
     fun setPanelTextSp(context: Context, sp: Int) = putInt(context, RemotePrefs.KEY_PANEL_TEXT_SP, sp)
 
-    /** 更多应用面板：功能页是否显示应用磁贴。 */
-    fun setPanelShowTiles(context: Context, enabled: Boolean) =
-        putBoolean(context, RemotePrefs.KEY_PANEL_SHOW_TILES, enabled)
-
     /** 更多面板点击外部收起方式（0 = 单击，1 = 双击）。 */
     fun setPanelDismissOutside(context: Context, mode: Int) = putInt(context, RemotePrefs.KEY_PANEL_DISMISS_OUTSIDE, mode.coerceIn(0, 1))
 
@@ -583,7 +579,7 @@ object SettingsStore {
      * half of the "收藏自动反复添加/移除" oscillation (the panel side, `FanHost`, is guarded by
      * the same [PinsSync.shouldApplyPush]).
      */
-    fun applyPushedPins(context: Context, value: String, rev: Long) {
+    fun applyPushedPins(context: Context, value: String, rev: Long): Boolean {
         val local = PrefsPinBackend(fallbackMirror(context))
         val localRev = local.readRev()
         if (!PinsSync.shouldApplyPush(rev, localRev)) {
@@ -591,12 +587,16 @@ object SettingsStore {
                 "BubbleDrawer",
                 "PIN_PUSH_DROPPED rev=$rev localRev=$localRev len=${value.length}",
             )
-            return
+            return false
         }
         local.writeWithRev(value, rev)
-        RemoteBridge.remote?.let { r ->
+        val r = RemoteBridge.remote
+        if (r != null) {
             runCatching { PrefsPinBackend(r).writeWithRev(value, rev) }
+        } else {
+            RemoteBridge.start(context)
         }
+        return true
     }
 
     /** Hand the pin order to the SystemUI side (its FanHost receiver applies it). */
@@ -608,7 +608,7 @@ object SettingsStore {
                 .setPackage(PinSyncReceiver.SYSTEMUI_PACKAGE)
                 .putExtra(PinSyncReceiver.EXTRA_PINS, value)
                 .putExtra(PinSyncReceiver.EXTRA_REV, rev)
-            context.sendBroadcast(intent)
+            PinSyncReceiver.sendBroadcastWithIdentity(context, intent)
         }
     }
 
@@ -691,7 +691,7 @@ object SettingsStore {
                 .setPackage(PinSyncReceiver.SYSTEMUI_PACKAGE)
                 .putExtra(PinSyncReceiver.EXTRA_FUNCTIONS, value)
                 .putExtra(PinSyncReceiver.EXTRA_FUNCTIONS_REV, rev)
-            context.sendBroadcast(intent)
+            PinSyncReceiver.sendBroadcastWithIdentity(context, intent)
         }
     }
 
@@ -737,7 +737,7 @@ object SettingsStore {
      * 功能收藏由 SystemUI 面板推过来时落盘：保留发送方的戳、比本地旧就丢（不回推）—— 规则与
      * [applyPushedPins] 完全相同，理由见那里的注释。
      */
-    fun applyPushedFunctions(context: Context, value: String, rev: Long) {
+    fun applyPushedFunctions(context: Context, value: String, rev: Long): Boolean {
         val local = FunctionPinStore.backend(fallbackMirror(context))
         val localRev = local.readRev()
         if (!PinsSync.shouldApplyPush(rev, localRev)) {
@@ -745,14 +745,18 @@ object SettingsStore {
                 TAG,
                 "FUNCTION_PUSH_DROPPED rev=$rev localRev=$localRev len=${value.length}",
             )
-            return
+            return false
         }
         local.writeWithRev(value, rev)
-        RemoteBridge.remote?.let { r ->
+        val r = RemoteBridge.remote
+        if (r != null) {
             runCatching { FunctionPinStore.backend(r).writeWithRev(value, rev) }
+        } else {
+            RemoteBridge.start(context)
         }
         // 面板推过来的这一笔也可能带着「面板并不认识」的键（它自己的枚举里没有），详情重新发布一次。
         publishFunctionDetails(context)
+        return true
     }
 
     /** Encode/decode passthroughs keep the call sites honest about the format. */

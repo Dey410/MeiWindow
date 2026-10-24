@@ -123,7 +123,7 @@
     <string name="category_fan">扇形面板外观</string>
     <string name="category_fan_summary">图标数量与大小 · 展开半径 · 振动与自动收起</string>
     <string name="category_panel">更多应用面板</string>
-    <string name="category_panel_summary">面板尺寸 · 图标与文字大小 · 磁贴显示 · 外部收起方式</string>
+    <string name="category_panel_summary">面板尺寸 · 图标与文字大小 · 外部收起方式</string>
     <string name="category_manage">收藏应用管理</string>
     <string name="category_manage_summary">排序与增删快捷启动应用</string>
     <string name="category_experimental">实验性功能</string>
@@ -199,7 +199,7 @@
     <string name="pinned_functions_title">已选功能</string>
     <string name="pinned_functions_empty">点击下方功能添加到已选</string>
     <string name="panel_functions_empty">暂未添加功能\n点击右上角加号前往添加</string>
-    <string name="functions_catalog_empty">还没有读取到功能\n应用提供的快捷方式与磁贴会显示在这里</string>
+    <string name="functions_catalog_empty">还没有读取到功能\n应用提供的快捷方式会显示在这里</string>
     <string name="functions_loading">正在加载功能…</string>
     <string name="functions_loading_progress">第 %1$d 个 / 共 %2$d 个</string>
 

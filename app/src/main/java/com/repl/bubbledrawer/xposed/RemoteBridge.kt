@@ -97,15 +97,8 @@ object RemoteBridge {
             boundService = service
             remote = prefs
             frameworkLabel = runCatching { "${service.frameworkName} ${service.frameworkVersion}" }.getOrNull()
-            val localPrefs = local(context)
-            val key = com.repl.bubbledrawer.data.PrefsPinBackend.KEY
-            val localPins = localPrefs.getString(key, null)
-            val remotePins = prefs.getString(key, null)
-            if (localPins.isNullOrEmpty() && !remotePins.isNullOrEmpty()) {
-                localPrefs.edit().putString(key, remotePins).commit()
-            }
             migrateLegacyPins(context, prefs)
-            syncLocal(context) // always re-push local truth; keeps remote consistent after reboot
+            syncLocal(context) // reconcile pins/functions by rev and push local settings truth
             // 绑上之后立刻把「已选功能」的详情重算一次：上一次可能是在缓存还空的时候算的占位项。
             runCatching { SettingsStore.publishFunctionDetails(context) }
             notifyConnection(true)
@@ -117,9 +110,10 @@ object RemoteBridge {
     /** One-time move of the old app-private "pins" or local "cfg" into the shared group. */
     private fun migrateLegacyPins(context: Context, prefs: SharedPreferences) {
         val key = com.repl.bubbledrawer.data.PrefsPinBackend.KEY
-        val localCfg = local(context).getString(key, null)
-        if (!localCfg.isNullOrEmpty()) {
-            if (!prefs.contains(key) || prefs.getString(key, null).isNullOrEmpty()) {
+        val localPrefs = local(context)
+        val localCfg = localPrefs.getString(key, null)
+        if (!localCfg.isNullOrEmpty() || localPrefs.contains(com.repl.bubbledrawer.data.PrefsPinBackend.KEY_REV)) {
+            if (!prefs.contains(key) && !localCfg.isNullOrEmpty()) {
                 prefs.edit().putString(key, localCfg).commit()
             }
             return
@@ -127,7 +121,7 @@ object RemoteBridge {
         val legacy = context.getSharedPreferences("pins", Context.MODE_PRIVATE)
             .getString(key, null)
         if (!legacy.isNullOrEmpty()) {
-            local(context).edit().putString(key, legacy).commit()
+            localPrefs.edit().putString(key, legacy).commit()
             prefs.edit().putString(key, legacy).commit()
         }
     }
@@ -138,15 +132,33 @@ object RemoteBridge {
         val target = remote ?: return
         val localPrefs = local(context)
         val snap = RemotePrefs.read(localPrefs)
-        val localPins = localPrefs.getString(com.repl.bubbledrawer.data.PrefsPinBackend.KEY, null)
-        // 「已选功能」与它的详情也必须一起推。
-        //
-        // 这里是本地文件把真相推给共享组的唯一时机（onBind），而写功能收藏会先落本地：LSPosed 还没绑上
-        // 的那一小段窗口里写下的收藏只存在于本地文件，漏掉这一步就**永远不会**进共享组 ——
-        // 面板（SystemUI）读的正是共享组，于是「设置页里明明选好了，扇形面板里没有」，而且不自愈。
-        // 收藏应用的 pins 一直有这一步（下面那段），功能收藏是后加的，所以先漏了它。
-        val localFunctions = localPrefs.getString(com.repl.bubbledrawer.shortcut.FunctionPinStore.KEY_PINNED_FUNCTIONS, null)
-        val localFunctionsRev = localPrefs.getLong(com.repl.bubbledrawer.shortcut.FunctionPinStore.PREFS_KEY_REV, 0L)
+        // 收藏应用与已选功能在绑定时按戳和解（PinsSync.decide）：
+        //  - 若远程组里的戳更新，先把赢家写回本地 cfg，避免把远程新值用本地旧值盖掉；
+        //  - 写回远程组时必须同时写值与戳（之前漏了 KEY_REV，导致远程组只有值没有戳）。
+        val localPinBackend = com.repl.bubbledrawer.data.PrefsPinBackend(localPrefs)
+        val remotePinBackend = com.repl.bubbledrawer.data.PrefsPinBackend(target)
+        val pinDecision = com.repl.bubbledrawer.data.PinsSync.decide(
+            localValue = localPinBackend.read(),
+            localRev = localPinBackend.readRev(),
+            remoteValue = remotePinBackend.read(),
+            remoteRev = remotePinBackend.readRev(),
+        )
+        if (pinDecision.source == com.repl.bubbledrawer.data.PinsSync.Source.REMOTE) {
+            localPinBackend.writeWithRev(pinDecision.value, pinDecision.rev)
+        }
+
+        val localFnBackend = com.repl.bubbledrawer.shortcut.FunctionPinStore.backend(localPrefs)
+        val remoteFnBackend = com.repl.bubbledrawer.shortcut.FunctionPinStore.backend(target)
+        val fnDecision = com.repl.bubbledrawer.data.PinsSync.decide(
+            localValue = localFnBackend.read(),
+            localRev = localFnBackend.readRev(),
+            remoteValue = remoteFnBackend.read(),
+            remoteRev = remoteFnBackend.readRev(),
+        )
+        if (fnDecision.source == com.repl.bubbledrawer.data.PinsSync.Source.REMOTE) {
+            localFnBackend.writeWithRev(fnDecision.value, fnDecision.rev)
+        }
+
         val localFunctionDetails = localPrefs.getString(com.repl.bubbledrawer.shortcut.FunctionPinDetails.KEY, null)
         val editor = target.edit()
             .putBoolean(RemotePrefs.KEY_ENABLED, snap.enabled)
@@ -160,7 +172,6 @@ object RemoteBridge {
             .putInt(RemotePrefs.KEY_PANEL_H_PCT, snap.panelHeightPct)
             .putInt(RemotePrefs.KEY_PANEL_ICON_DP, snap.panelIconDp)
             .putInt(RemotePrefs.KEY_PANEL_TEXT_SP, snap.panelTextSp)
-            .putBoolean(RemotePrefs.KEY_PANEL_SHOW_TILES, snap.panelShowTiles)
             .putInt(RemotePrefs.KEY_FAN_ICON_COUNT, snap.fanIconCount)
             .putInt(RemotePrefs.KEY_FAN_LAYERS, snap.fanLayers)
             .putInt(RemotePrefs.KEY_FAN_RADIUS_DP, snap.fanRadiusDp)
@@ -207,12 +218,13 @@ object RemoteBridge {
             .putBoolean(RemotePrefs.KEY_HOME_KEEP_FREEFORM, snap.homeKeepFreeform)
             .putBoolean(RemotePrefs.KEY_CONTACT_BAR, snap.contactBar)
             .putInt(RemotePrefs.KEY_CONTACT_BAR_MIN_WIDTH_PCT, snap.contactBarMinWidthPct)
-        if (localPins != null) {
-            editor.putString(com.repl.bubbledrawer.data.PrefsPinBackend.KEY, localPins)
+        if (pinDecision.source != com.repl.bubbledrawer.data.PinsSync.Source.NONE) {
+            editor.putString(com.repl.bubbledrawer.data.PrefsPinBackend.KEY, pinDecision.value)
+            editor.putLong(com.repl.bubbledrawer.data.PrefsPinBackend.KEY_REV, pinDecision.rev)
         }
-        if (localFunctions != null) {
-            editor.putString(com.repl.bubbledrawer.shortcut.FunctionPinStore.KEY_PINNED_FUNCTIONS, localFunctions)
-            editor.putLong(com.repl.bubbledrawer.shortcut.FunctionPinStore.PREFS_KEY_REV, localFunctionsRev)
+        if (fnDecision.source != com.repl.bubbledrawer.data.PinsSync.Source.NONE) {
+            editor.putString(com.repl.bubbledrawer.shortcut.FunctionPinStore.KEY_PINNED_FUNCTIONS, fnDecision.value)
+            editor.putLong(com.repl.bubbledrawer.shortcut.FunctionPinStore.PREFS_KEY_REV, fnDecision.rev)
         }
         if (localFunctionDetails != null) {
             editor.putString(com.repl.bubbledrawer.shortcut.FunctionPinDetails.KEY, localFunctionDetails)
@@ -221,7 +233,7 @@ object RemoteBridge {
         Log.i(
             "BubbleDrawer",
             "BRIDGE_PUSHED enabled=" + snap.enabled + " left=" + snap.left +
-                " right=" + snap.right + " range=" + snap.rangeDp + " pinsLen=" + (localPins?.length ?: 0),
+                " right=" + snap.right + " range=" + snap.rangeDp + " pinsLen=" + pinDecision.value.length,
         )
         if (!target.contains(com.repl.bubbledrawer.data.PrefsPinBackend.KEY)) {
             migrateLegacyPins(context, target)

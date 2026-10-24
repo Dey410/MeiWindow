@@ -20,7 +20,7 @@ import com.repl.bubbledrawer.R
  *  - [entry]：功能页那枚独立条目（图标取自 Flyme SystemUITools 的 `drawable/aggregate_payment`）；
  *  - [resolveEntries]：SystemUI 侧把四个支付入口解析成可启动的 [ShortcutItem]
  *    （id 映射自 Flyme `m9063g`：`launch_type_scan_qrcode`/`launch_type_offline_wallet`/`1001`/`1002`）；
- *  - [requestShow]：App 进程（管理页）没有联系人条，发广播让 SystemUI 弹（磁贴点击同一条路）。
+ *  - [requestShow]：App 进程（管理页）没有联系人条，发广播让 SystemUI 弹。
  */
 object AggregatePayment {
 
@@ -134,10 +134,13 @@ object AggregatePayment {
     fun isEntry(item: ShortcutItem): Boolean =
         item.type == ShortcutType.AGGREGATE_PAYMENT || item.pinKey == PIN_KEY
 
-    /** App 进程用：自己没有联系人条，交给 SystemUI 弹（与 [QsTileHost.requestClick] 同一条广播模式）。 */
+    /** App 进程用：自己没有联系人条，交给 SystemUI 弹（导出广播，发送方带身份校验）。 */
     fun requestShow(context: Context) {
         runCatching {
-            context.sendBroadcast(Intent(ACTION_SHOW).setPackage("com.android.systemui"))
+            com.repl.bubbledrawer.xposed.PinSyncReceiver.sendBroadcastWithIdentity(
+                context,
+                Intent(ACTION_SHOW).setPackage("com.android.systemui"),
+            )
             Log.i(TAG, "SHOW_REQUESTED")
         }
     }

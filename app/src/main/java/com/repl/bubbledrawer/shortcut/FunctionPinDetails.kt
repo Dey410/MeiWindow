@@ -34,11 +34,8 @@ object FunctionPinDetails {
                 item.label,
                 item.subLabel.orEmpty(),
                 item.intentUri.orEmpty(),
-                // 第 5/6 段是后来加的：老版本只有前 4 段，decode 里按「缺省 = APP_SHORTCUT / 无底色」
-                // 处理。磁贴与快捷方式都存 `pkg#id`，没有 type 的话扇形会把磁贴当快捷方式启动。
+                // 第 5 段是后来加的：老版本只有前 4 段，decode 里按「缺省 = APP_SHORTCUT」处理。
                 item.type.name,
-                (item.tintColor ?: 0).toString(),
-                item.tileForeground.toString(),
             ).joinToString(FIELD.toString()) { escape(it) }
             if (out.length + record.length + 1 > MAX_CHARS) break
             if (out.isNotEmpty()) out.append(RECORD)
@@ -57,11 +54,11 @@ object FunctionPinDetails {
             if (key.isEmpty()) return@mapNotNull null
             val pkg = key.substringBefore('#')
             val id = key.substringAfter('#', "")
+            // 已删除的磁贴旧记录：不再用 APP_SHORTCUT 兜底画出来。
+            if (parts.getOrNull(4) == "QS_TILE") return@mapNotNull null
             val type = parts.getOrNull(4)?.let {
                 runCatching { ShortcutType.valueOf(it) }.getOrDefault(ShortcutType.APP_SHORTCUT)
             } ?: ShortcutType.APP_SHORTCUT
-            val tint = parts.getOrNull(5)?.toIntOrNull()?.takeIf { it != 0 }
-            val tileForeground = parts.getOrNull(6)?.toBooleanStrictOrNull() ?: false
             ShortcutItem(
                 id = id.ifEmpty { key },
                 packageName = pkg,
@@ -69,8 +66,6 @@ object FunctionPinDetails {
                 subLabel = parts.getOrNull(2)?.ifBlank { null },
                 type = type,
                 intentUri = parts.getOrNull(3)?.ifBlank { null },
-                tintColor = tint,
-                tileForeground = tileForeground,
             )
         }
     }

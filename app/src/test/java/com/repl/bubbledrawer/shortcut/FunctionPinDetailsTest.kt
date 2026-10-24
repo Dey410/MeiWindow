@@ -1,7 +1,6 @@
 package com.repl.bubbledrawer.shortcut
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -48,28 +47,19 @@ class FunctionPinDetailsTest {
     }
 
     @Test
-    fun tileTypeAndTintSurviveTheOldFourFieldFormat() {
-        // 磁贴不能退化回 APP_SHORTCUT：扇形会拿它去 launchShortcut，而磁贴没有 Intent。
-        val tile = ShortcutItem(
-            id = "com.example/.TileService",
-            packageName = "com.example",
-            label = "示例磁贴",
-            subLabel = "示例",
-            type = ShortcutType.QS_TILE,
-            tintColor = 0xFF3366CC.toInt(),
-            tileForeground = true,
-        )
-        val decoded = FunctionPinDetails.decode(FunctionPinDetails.encode(listOf(tile)))[0]
-        assertEquals(ShortcutType.QS_TILE, decoded.type)
-        assertEquals(0xFF3366CC.toInt(), decoded.tintColor)
-        assertTrue(decoded.tileForeground)
-
+    fun legacyFourFieldFormatStillDecodesAsAShortcut() {
         // 上一代只有四段：key、label、subLabel、intentUri —— 仍要能读，并按快捷方式处理。
         val legacy = FunctionPinDetails.decode("com.x#foo\t旧功能\t宿主\tintent:#Intent;end")
         assertEquals(1, legacy.size)
         assertEquals(ShortcutType.APP_SHORTCUT, legacy[0].type)
-        assertNull(legacy[0].tintColor)
-        assertFalse(legacy[0].tileForeground)
+        assertEquals("intent:#Intent;end", legacy[0].intentUri)
+    }
+
+    @Test
+    fun oldTileRecordsAreDroppedInsteadOfBecomingShortcuts() {
+        // 磁贴功能已删除：旧共享组里可能还留着 `QS_TILE` 记录，不能当快捷方式画出来。
+        val old = "com.example#tile\t旧磁贴\t示例\t\tQS_TILE\t-1\ttrue"
+        assertEquals(emptyList<ShortcutItem>(), FunctionPinDetails.decode(old))
     }
 
     @Test

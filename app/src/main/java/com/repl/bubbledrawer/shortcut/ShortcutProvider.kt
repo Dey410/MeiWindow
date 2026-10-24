@@ -30,14 +30,30 @@ class ShortcutProvider : ContentProvider() {
     override fun onCreate(): Boolean = true
 
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
-        if (method != ShortcutBridge.METHOD_REPORT) return null
+        if (method != ShortcutBridge.METHOD_REPORT &&
+            method != com.repl.bubbledrawer.xposed.PinSyncReceiver.METHOD_SYNC
+        ) {
+            return null
+        }
         val app = context?.applicationContext ?: return null
 
         val uid = Binder.getCallingUid()
         val packages = runCatching { app.packageManager.getPackagesForUid(uid)?.toList() }.getOrNull()
         if (!ShortcutBridge.isTrustedUid(uid, packages)) {
-            Log.w(TAG, "SHORTCUT_REPORT_REJECTED uid=$uid packages=$packages")
+            Log.w(TAG, "SHORTCUT_REPORT_REJECTED method=$method uid=$uid packages=$packages")
             return null
+        }
+
+        if (method == com.repl.bubbledrawer.xposed.PinSyncReceiver.METHOD_SYNC) {
+            val applied = com.repl.bubbledrawer.xposed.PinSyncReceiver.applyPayload(
+                appContext = app,
+                pins = extras?.getString(com.repl.bubbledrawer.xposed.PinSyncReceiver.EXTRA_PINS),
+                pinsRev = extras?.getLong(com.repl.bubbledrawer.xposed.PinSyncReceiver.EXTRA_REV, 0L) ?: 0L,
+                functions = extras?.getString(com.repl.bubbledrawer.xposed.PinSyncReceiver.EXTRA_FUNCTIONS),
+                functionsRev = extras?.getLong(com.repl.bubbledrawer.xposed.PinSyncReceiver.EXTRA_FUNCTIONS_REV, 0L) ?: 0L,
+                via = "provider",
+            )
+            return Bundle().apply { putBoolean(ShortcutBridge.EXTRA_APPLIED, applied) }
         }
 
         val json = extras?.getString(ShortcutBridge.EXTRA_JSON)

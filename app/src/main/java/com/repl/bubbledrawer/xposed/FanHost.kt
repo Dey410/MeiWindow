@@ -251,22 +251,44 @@ class FanHost(
     }
 
     private fun pushFunctionsToApp(value: String, rev: Long) {
-        val deliveredBroadcast = runCatching {
-            val intent = Intent(PinSyncReceiver.ACTION)
-                .setClassName(ModuleResources.MODULE_PACKAGE, "com.repl.bubbledrawer.xposed.PinSyncReceiver")
-                .putExtra(PinSyncReceiver.EXTRA_FUNCTIONS, value)
-                .putExtra(PinSyncReceiver.EXTRA_FUNCTIONS_REV, rev)
-            host.sendBroadcast(intent)
-            true
-        }.getOrDefault(false)
+        // 这里原本是同步 ContentResolver.call：面板编辑回调在 SystemUI 主线程，App 冷启动/
+        // provider 初始化会把主线程卡住。交接只需要最终送达，不阻塞本地面板，所以放到 IO scope；
+        // rev 会保证后发起的编辑不被旧请求覆盖。
+        scope.launch {
+            val deliveredProvider = runCatching {
+                val extras = android.os.Bundle().apply {
+                    putString(PinSyncReceiver.EXTRA_FUNCTIONS, value)
+                    putLong(PinSyncReceiver.EXTRA_FUNCTIONS_REV, rev)
+                }
+                host.contentResolver.call(
+                    com.repl.bubbledrawer.shortcut.ShortcutBridge.CONTENT_URI,
+                    PinSyncReceiver.METHOD_SYNC,
+                    null,
+                    extras,
+                )?.getBoolean(com.repl.bubbledrawer.shortcut.ShortcutBridge.EXTRA_APPLIED) == true
+            }.getOrDefault(false)
 
-        // 与 pushPinsToApp 同一条通道、同样的理由（那条 service 兜底腿因为身份校验形同虚设已删除）。
-        logger(
-            if (deliveredBroadcast) Log.INFO else Log.WARN,
-            "FUNCTION_WRITE_HANDOFF broadcast=$deliveredBroadcast " +
-                "rev=$rev valueLen=${value.length}",
-            null,
-        )
+            val deliveredBroadcast = if (deliveredProvider) {
+                false
+            } else {
+                runCatching {
+                    val intent = Intent(PinSyncReceiver.ACTION)
+                        .setClassName(ModuleResources.MODULE_PACKAGE, "com.repl.bubbledrawer.xposed.PinSyncReceiver")
+                        .putExtra(PinSyncReceiver.EXTRA_FUNCTIONS, value)
+                        .putExtra(PinSyncReceiver.EXTRA_FUNCTIONS_REV, rev)
+                    PinSyncReceiver.sendBroadcastWithIdentity(host, intent)
+                    true
+                }.getOrDefault(false)
+            }
+
+            // 与 pushPinsToApp 同一条通道、同样的理由（provider 同步回执优先，带身份广播兜底）。
+            logger(
+                if (deliveredProvider || deliveredBroadcast) Log.INFO else Log.WARN,
+                "FUNCTION_WRITE_HANDOFF provider=$deliveredProvider broadcast=$deliveredBroadcast " +
+                    "rev=$rev valueLen=${value.length}",
+                null,
+            )
+        }
     }
 
     /**
@@ -310,25 +332,42 @@ class FanHost(
      * only allowed uid 1000, while this ROM's SystemUI is an ordinary app uid).
      */
     private fun pushPinsToApp(value: String, rev: Long) {
-        val deliveredBroadcast = runCatching {
-            val intent = Intent(PinSyncReceiver.ACTION)
-                .setClassName(ModuleResources.MODULE_PACKAGE, "com.repl.bubbledrawer.xposed.PinSyncReceiver")
-                .putExtra(PinSyncReceiver.EXTRA_PINS, value)
-                .putExtra(PinSyncReceiver.EXTRA_REV, rev)
-            host.sendBroadcast(intent)
-            true
-        }.getOrDefault(false)
+        // 同 pushFunctionsToApp：不要在 SystemUI 主线程等 provider。面板本地副本已经先更新，
+        // 这里只负责异步把同一份值和 rev 交给 App。
+        scope.launch {
+            val deliveredProvider = runCatching {
+                val extras = android.os.Bundle().apply {
+                    putString(PinSyncReceiver.EXTRA_PINS, value)
+                    putLong(PinSyncReceiver.EXTRA_REV, rev)
+                }
+                host.contentResolver.call(
+                    com.repl.bubbledrawer.shortcut.ShortcutBridge.CONTENT_URI,
+                    PinSyncReceiver.METHOD_SYNC,
+                    null,
+                    extras,
+                )?.getBoolean(com.repl.bubbledrawer.shortcut.ShortcutBridge.EXTRA_APPLIED) == true
+            }.getOrDefault(false)
 
-        // 曾经还有一条 startService 的兜底腿，已删除。它**不是**安全边界：onStartCommand 跑在主线程的
-        // Handler 消息里，`Binder.getCallingUid()` 在没有「正在处理的 IPC 事务」时返回的是**本进程自己**
-        // 的 uid，于是那个 `callerUid == Process.myUid()` 分支对任何调用者都成立 —— 任何应用都能用它把
-        // 两份收藏写成空。而它作为兜底也不成立：跨应用后台 startService 在 Android 8+ 本就会被拦。
-        // 现在只剩广播这条腿（清单接收者会被系统拉起进程，设备上一直就是这样工作的）。
-        logger(
-            if (deliveredBroadcast) Log.INFO else Log.WARN,
-            "PIN_WRITE_HANDOFF broadcast=$deliveredBroadcast rev=$rev valueLen=${value.length}",
-            null,
-        )
+            val deliveredBroadcast = if (deliveredProvider) {
+                false
+            } else {
+                runCatching {
+                    val intent = Intent(PinSyncReceiver.ACTION)
+                        .setClassName(ModuleResources.MODULE_PACKAGE, "com.repl.bubbledrawer.xposed.PinSyncReceiver")
+                        .putExtra(PinSyncReceiver.EXTRA_PINS, value)
+                        .putExtra(PinSyncReceiver.EXTRA_REV, rev)
+                    PinSyncReceiver.sendBroadcastWithIdentity(host, intent)
+                    true
+                }.getOrDefault(false)
+            }
+
+            // ContentResolver.call 主通道（Binder.getCallingUid 校验 + 同步回执）优先，显式带身份广播兜底。
+            logger(
+                if (deliveredProvider || deliveredBroadcast) Log.INFO else Log.WARN,
+                "PIN_WRITE_HANDOFF provider=$deliveredProvider broadcast=$deliveredBroadcast rev=$rev valueLen=${value.length}",
+                null,
+            )
+        }
     }
 
     private val strategy = ILaunchStrategy { ctx, app ->
@@ -360,13 +399,7 @@ class FanHost(
     /** 扇形里要显示的功能条目（见 [com.repl.bubbledrawer.shortcut.FunctionFanItems]）。 */
     private fun fanFunctionEntries(): List<ShortcutItem> {
         val details = functionDetailsForRender()
-        val showTiles = RemotePrefs.read(prefs).panelShowTiles
-        val keys = readFunctionPins().filter { key ->
-            if (showTiles) return@filter true
-            val item = details.firstOrNull { it.pinKey == key }
-                ?: ShortcutRepository.peekCached(key)
-            item?.type != com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE
-        }
+        val keys = readFunctionPins()
         if (keys.isEmpty()) return emptyList()
         val entries = com.repl.bubbledrawer.shortcut.FunctionFanItems.resolve(
             keys = keys,
@@ -427,8 +460,6 @@ class FanHost(
     private var screenOffReceiver: android.content.BroadcastReceiver? = null
     private var pinsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
     private var syncFromAppReceiver: android.content.BroadcastReceiver? = null
-    private var shortcutRequestReceiver: android.content.BroadcastReceiver? = null
-    private var tileClickReceiver: android.content.BroadcastReceiver? = null
     private var quickPayReceiver: android.content.BroadcastReceiver? = null
 
     private val scope = kotlinx.coroutines.CoroutineScope(
@@ -461,10 +492,6 @@ class FanHost(
             when {
                 // 聚合支付：以小窗打开默认入口并把支付条贴到小窗下方（不启动"自己"）。
                 AggregatePayment.isEntry(item) -> quickPayTrigger?.invoke()
-                item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE -> {
-                    // 磁贴必须回到 SystemUI 的 TileService 绑定路径；没有 Intent 可发（见 QsTileHost）。
-                    QsTileHost.click(host, item)
-                }
                 else -> {
                     // 快捷方式不是应用：走 ShortcutRepository（LauncherApps/Intent 两条路），小窗开关从远程组读
                     // —— 默认参数会去读 App 进程才有的设置，hook 进程读到的是系统界面自己的 cfg。
@@ -488,12 +515,7 @@ class FanHost(
         registerUnlockReceiver()
         // pins edits while the fan is open → live rebind (reference :85-96 watch pattern)
         pinsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-            if (key == RemotePrefs.KEY_PANEL_SHOW_TILES) {
-                // 开关变了：强制重扫一次，否则 30s 扫描缓存会让 App 侧继续拿着旧清单（关了还在、
-                // 开了没有）。tile 列表本身在 ShortcutRepository 里按这个开关裁剪。
-                logger(Log.INFO, "PANEL_SHOW_TILES_CHANGED on=${RemotePrefs.read(prefs).panelShowTiles}", null)
-                scanShortcuts("SHOW_TILES", force = true)
-            } else if (key == PrefsPinBackend.KEY || key == PrefsPinBackend.KEY_REV) {
+            if (key == PrefsPinBackend.KEY || key == PrefsPinBackend.KEY_REV) {
                 // The shared group moved. Adopt it only when its stamp is not older than ours —
                 // and NEVER answer a difference by pushing our own copy back: the value and its
                 // rev are two keys that LSPosed mirrors one at a time, so this callback can
@@ -651,31 +673,6 @@ class FanHost(
             )
         }.onSuccess { syncFromAppReceiver = syncFromApp }
 
-        // 管理页（App 进程）点「应用磁贴」时没有绑定权限，发广播让 SystemUI 代跑。
-        // 这个接收者必须导出，所以同样校验发送方；磁贴点击本身不写任何数据，仍只认模块 App。
-        val tileClick = object : android.content.BroadcastReceiver() {
-            override fun onReceive(c: Context?, i: Intent?) {
-                if (i?.action != QsTileHost.ACTION_CLICK_TILE) return
-                if (!isFromModuleApp(this)) {
-                    logger(Log.WARN, "QS_TILE_CLICK_REJECTED sender=${runCatching { sentFromUid }.getOrNull()}", null)
-                    return
-                }
-                val pkg = i.getStringExtra(QsTileHost.EXTRA_PACKAGE).orEmpty()
-                val cls = i.getStringExtra(QsTileHost.EXTRA_CLASS).orEmpty()
-                val label = i.getStringExtra("tile_label").orEmpty()
-                if (pkg.isBlank() || cls.isBlank()) return
-                mainHandler.post { QsTileHost.click(host, pkg, cls, label) }
-            }
-        }
-        runCatching {
-            host.registerReceiver(
-                tileClick,
-                IntentFilter(QsTileHost.ACTION_CLICK_TILE),
-                Context.RECEIVER_EXPORTED,
-            )
-        }.onSuccess { tileClickReceiver = tileClick }
-            .onFailure { logger(Log.WARN, "QS_TILE_CLICK_REGISTER_FAILED", it) }
-
         // 管理页（App 进程）点「聚合支付」时联系人条在 SystemUI 这边，发广播让控制器去弹
         // （AggregatePayment.requestShow）。同样导出 + 只认模块 App。
         val quickPay = object : android.content.BroadcastReceiver() {
@@ -710,32 +707,8 @@ class FanHost(
             host.registerReceiver(r, IntentFilter(Intent.ACTION_SCREEN_OFF), Context.RECEIVER_NOT_EXPORTED)
         }.onSuccess { screenOffReceiver = r }
 
-        // 监听来自 App 端的快捷方式刷新请求广播
-        val shortcutReq = object : android.content.BroadcastReceiver() {
-            override fun onReceive(c: Context?, i: Intent?) {
-                // 这个接收者必须导出（发起方是模块自己的 App 进程），但一次全量扫描 + 几百张
-                // 图标的分片上报是实打实的开销 —— 不能谁发个广播都能按这个按钮。只认模块 App。
-                if (!isFromModuleApp(this)) {
-                    logger(
-                        Log.WARN,
-                        "SHORTCUT_REFRESH_REJECTED sender=${runCatching { sentFromUid }.getOrNull()}",
-                        null,
-                    )
-                    return
-                }
-                scanShortcuts("REQUEST", force = true)
-            }
-        }
-        runCatching {
-            host.registerReceiver(
-                shortcutReq,
-                IntentFilter(com.repl.bubbledrawer.shortcut.ShortcutBridge.ACTION_REQUEST_REFRESH),
-                Context.RECEIVER_EXPORTED,
-            )
-        }.onSuccess { shortcutRequestReceiver = shortcutReq }
-
-        // SystemUI 启动后延迟 2 秒在后台扫描全量快捷方式并上报给 App
-        scanShortcuts("INIT", force = true, delayMs = 2_000L)
+        // 扇形第一次打开时补一次扫描；force=false 让 30s 扫描缓存挡掉重复的全量扫描。
+        scanShortcuts("INIT", force = false, delayMs = 2_000L)
     }
 
     /**
@@ -1189,7 +1162,8 @@ class FanHost(
         if (applied) return "provider"
 
         val sent = runCatching {
-            host.sendBroadcast(
+            PinSyncReceiver.sendBroadcastWithIdentity(
+                host,
                 event.toIntent().setClassName(
                     ModuleResources.MODULE_PACKAGE,
                     "com.repl.bubbledrawer.xposed.PressureCalibrationReceiver",
@@ -1626,7 +1600,6 @@ class FanHost(
             },
             // 分身角标：面板里的图标与扇子同源（都按这次快照决定要不要叠角标）。
             cloneBadge = RemotePrefs.read(prefs).cloneBadge,
-            showTiles = RemotePrefs.read(prefs).panelShowTiles,
             loadShortcuts = { onProgress ->
                 com.repl.bubbledrawer.shortcut.ShortcutRepository.loadShortcuts(host, onProgress)
             },
@@ -1888,10 +1861,6 @@ class FanHost(
         unlockReceiver = null
         syncFromAppReceiver?.let { runCatching { host.unregisterReceiver(it) } }
         syncFromAppReceiver = null
-        shortcutRequestReceiver?.let { runCatching { host.unregisterReceiver(it) } }
-        shortcutRequestReceiver = null
-        tileClickReceiver?.let { runCatching { host.unregisterReceiver(it) } }
-        tileClickReceiver = null
         quickPayReceiver?.let { runCatching { host.unregisterReceiver(it) } }
         quickPayReceiver = null
         pinsListener?.let { runCatching { prefs.unregisterOnSharedPreferenceChangeListener(it) } }

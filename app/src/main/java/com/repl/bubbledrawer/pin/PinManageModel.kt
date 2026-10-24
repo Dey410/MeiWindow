@@ -38,11 +38,6 @@ class PinManageModel(
      * 那张，这一项只管要不要叠角标。
      */
     val cloneBadge: Boolean = com.repl.bubbledrawer.xposed.RemotePrefs.DEFAULT_CLONE_BADGE,
-    /**
-     * 「显示磁贴」开关（更多应用面板设置）。false 时功能页与「已选功能」都不出现
-     * [com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE]，但收藏键仍保留在存储里。
-     */
-    val showTiles: Boolean = com.repl.bubbledrawer.xposed.RemotePrefs.DEFAULT_PANEL_SHOW_TILES,
     private val loadShortcuts: (suspend (onProgress: (Int, Int) -> Unit) -> Pair<List<com.repl.bubbledrawer.shortcut.ShortcutItem>, List<com.repl.bubbledrawer.shortcut.ShortcutItem>>)? = null,
     initialTab: Int = 0,
     private val functionPinsOf: () -> List<String> = { emptyList() },
@@ -53,6 +48,7 @@ class PinManageModel(
      */
     private val pinnedFunctionItems: () -> List<com.repl.bubbledrawer.shortcut.ShortcutItem> = { emptyList() },
     private val onFunctionOrderChange: (List<String>) -> Unit = {},
+    mainDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.Main,
 ) {
     /** 0 = 应用 (Apps), 1 = 功能 (Shortcuts / Features) */
     var selectedTab: Int by mutableStateOf(initialTab)
@@ -103,7 +99,7 @@ class PinManageModel(
 
     /**
      * 功能页加载进度：`ShortcutRepository` 每扫到一条就回调一次，面板顶部据此画进度条 +
-     * 「第 x 个 / 共 y 个」。total 是扫描前的估算值（LauncherApps + 磁贴 + 桌面捷径 + 兜底），
+     * 「第 x 个 / 共 y 个」。total 是扫描前的估算值（LauncherApps + 桌面捷径 + 兜底），
      * done 只增不减；total 小于 done 时自动抬高，不会出现 3/2。
      */
     var functionLoading: Boolean by mutableStateOf(false)
@@ -139,8 +135,7 @@ class PinManageModel(
             // 两边都没有才退回占位项 —— 绝不让一条已选功能凭空消失（用户 2026-10-13 的报障）。
             val allMap = allShortcuts.associateBy { it.pinKey }
             val list = functionPins.mapNotNull { key ->
-                val item = allMap[key] ?: com.repl.bubbledrawer.shortcut.FunctionPinDetails.placeholder(key)
-                if (!showTiles && item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) null else item
+                allMap[key] ?: com.repl.bubbledrawer.shortcut.FunctionPinDetails.placeholder(key)
             }
             if (!isSearching || searchQuery.isBlank()) return list
             val q = searchQuery.trim()
@@ -163,17 +158,14 @@ class PinManageModel(
     /**
      * 需求 5：以应用名称为小标题作为分类，应用名称使用拼音排序。
      *
-     * 应用磁贴（[com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE]）**按宿主应用分进同一组**，
-     * 和该应用的快捷方式一起排：磁贴是应用级入口，排在组内第一条；后面是它的快捷方式。
-     * 用户 2026-10-22：「磁贴按应用分到快捷方式里一起排列」。
+     * 同一应用的快捷方式按原有顺序排在一起。
      */
     val groupedFunctions: List<AppFunctionGroup>
         get() {
             val query = if (isSearching) searchQuery.trim() else ""
             val groups = mutableMapOf<String, MutableList<com.repl.bubbledrawer.shortcut.ShortcutItem>>()
             for (item in allShortcuts) {
-                if (!showTiles && item.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) continue
-                // 聚合支付是内建功能，**不进**字母分组目录（用户 2026-10-24：不与快捷方式/磁贴混排，
+                // 聚合支付是内建功能，**不进**字母分组目录（用户 2026-10-24：不与快捷方式混排，
                 // 它在功能页有自己的独立格位）；但它可以被收藏，收藏区的解析（pinnedFunctions）照样用。
                 if (com.repl.bubbledrawer.shortcut.AggregatePayment.isEntry(item)) continue
                 val appName = item.subLabel?.ifBlank { null } ?: item.label
@@ -186,10 +178,7 @@ class PinManageModel(
                 AppFunctionGroup(
                     appName = appName,
                     sortKey = functionSortKey(appName),
-                    // 稳定排序：只把磁贴提到组内第一，快捷方式之间的原有顺序不变。
-                    items = items.sortedWith(
-                        compareBy { if (it.type == com.repl.bubbledrawer.shortcut.ShortcutType.QS_TILE) 0 else 1 },
-                    ),
+                    items = items,
                 )
             }.sortedBy { it.sortKey }
         }
@@ -299,7 +288,7 @@ class PinManageModel(
     fun searchRank(app: BubbleApp, query: String): Int =
         com.repl.bubbledrawer.pinyin.AppSearch.rank(app, query)
 
-    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val scope = CoroutineScope(mainDispatcher + SupervisorJob())
 
     /**
      * Fired once [cells]/[letters] have actually been (re)built.
@@ -314,11 +303,15 @@ class PinManageModel(
 
     @MainThread
     fun reload() {
+        // 应用列表与功能快捷方式互不依赖：并行加载。功能页首屏不必等 AppRepository 枚举完
+        // 几百个应用图标才开始解析 shortcuts.xml/缓存。
         scope.launch {
             apps = loadApps()
             rebuild()
             // 键与详情一起刷新（详情决定「面板能不能把已选功能画出来」，见 allShortcuts）。
             refreshFunctionPins()
+        }
+        scope.launch {
             loadShortcuts?.let { loader -> loadFunctionShortcuts(loader) }
         }
     }
@@ -377,11 +370,14 @@ class PinManageModel(
     @MainThread
     fun toggleManageMode() {
         manageMode = !manageMode
-        if (!manageMode) persistOrder()
+        if (!manageMode && orderDirty) persistOrder()
         rebuild()
     }
 
     fun managerLabel(complete: String, manage: String): String = if (manageMode) complete else manage
+
+    /** 标记是否发生过拖拽换位：只有真拖过才需要在退出管理模式时补写顺序，避免把刚点的收藏覆盖掉。 */
+    private var orderDirty = false
 
     /** ★ drag reorder: move the Pin at [from] to [to] (both Pin positions, cells-indexed). */
     fun movePin(from: Int, to: Int) {
@@ -392,10 +388,12 @@ class PinManageModel(
         val mutable = c.toMutableList()
         mutable.add(to, mutable.removeAt(from))
         cells = mutable
+        orderDirty = true
         // Persisting per move would spam the bridge; the drag end calls [persistOrder].
     }
 
     fun persistOrder() {
+        orderDirty = false
         val order = cells.filterIsInstance<Cell.Pin>().map { PinnedRef(it.app.packageName, it.app.userId) }
         if (order.isNotEmpty()) onOrderChange(order)
     }
@@ -404,6 +402,7 @@ class PinManageModel(
         val current = pinsOf().toMutableList()
         val ref = PinnedRef(app.packageName, app.userId)
         if (!current.remove(ref)) current.add(ref)
+        orderDirty = false
         onOrderChange(current)
         // 刚写下的这一份就是权威，**不要立刻再和解读一次**：写入值与戳分两个 key，同一毫秒的平票
         // 可能把旧值读回来，表现就是「点了没动，再点别的才刷新」（用户 2026-10-12 报告）。
@@ -417,6 +416,9 @@ class PinManageModel(
      */
     fun describe(tabText: String, headText: String): String =
         "texts=[$tabText,$headText] items=${cells.size} letters=${letters.size} manage=$manageMode"
+
+    /** 上一次异步算出的推荐列表缓存：让 [rebuild] 能先同步落盘最新收藏，再异步刷新推荐。 */
+    private var lastRecommendations: List<BubbleApp> = emptyList()
 
     /**
      * Rebuild the cell list.
@@ -436,16 +438,28 @@ class PinManageModel(
         val currentPins = pins ?: pinsOf()
         // 一次重建只读一次（缓存给 isPinned 用）：见上面的 `pinnedKeys`。
         val pinned = currentPins.map { "${it.packageName}#${it.userId}" }.toSet()
+        // 先用缓存的推荐列表同步落地 `pinnedKeys` 与 `cells`：避免异步算推荐的窗口期内 `cells`
+        // 仍停留在旧收藏（例如点完收藏立刻点「完成」触发二次 rebuild 时把刚点的收藏吞掉）。
+        // 缓存必须按**当前** apps 过滤：应用卸载/列表刷新后，旧推荐不能短暂画出一个不存在的应用。
+        val availableKeys = apps.mapTo(HashSet()) { "${it.packageName}#${it.userId}" }
+        val cachedRecs = if (enabled) {
+            lastRecommendations.filter {
+                "${it.packageName}#${it.userId}" in availableKeys &&
+                    "${it.packageName}#${it.userId}" !in pinned
+            }
+        } else {
+            emptyList()
+        }
+        applyCells(currentPins, pinned, enabled, count, cachedRecs)
         if (enabled && loadRecommendations != null && apps.isNotEmpty()) {
             scope.launch {
                 val recs = kotlinx.coroutines.withContext(Dispatchers.IO) {
                     runCatching { loadRecommendations.invoke(apps, pinned, count) }.getOrDefault(emptyList())
                 }
                 if (generation != rebuildGeneration) return@launch
+                lastRecommendations = recs
                 applyCells(currentPins, pinned, enabled, count, recs)
             }
-        } else {
-            applyCells(currentPins, pinned, enabled, count, emptyList())
         }
     }
 
