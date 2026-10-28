@@ -4,6 +4,7 @@ import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.util.Log
 import com.repl.bubbledrawer.data.LaunchCountStore
@@ -40,6 +41,18 @@ object AppPredictor {
     @Volatile
     private var weeklyUsageTimes: Map<String, Long> = emptyMap()
 
+    /**
+     * 当前默认网络的类型，由 [watchNetworkType] 注册的默认网络回调维护。
+     *
+     * 推荐跑在扇形展开的主线程上（`BubbleDockController.buildPages`），以前每次都现问
+     * `activeNetwork` + `getNetworkCapabilities` —— 两次 binder。null = 回调还没送达（或进程没有
+     * ACCESS_NETWORK_STATE，注册失败），这时退回同步查询，行为与以前一样。
+     */
+    @Volatile
+    private var networkType: String? = null
+
+    private val networkWatched = AtomicBoolean(false)
+
     // System packages to ignore during training
     private val SYSTEM_IGNORED_PKGS = setOf(
         "com.android.systemui",
@@ -58,6 +71,7 @@ object AppPredictor {
     fun initIfNeeded(context: Context) {
         if (!initialized.compareAndSet(false, true)) return
 
+        watchNetworkType(context.applicationContext ?: context)
         scope.launch {
             try {
                 loadHistoryFromUsageStats(context.applicationContext)
@@ -255,16 +269,41 @@ object AppPredictor {
     }
 
     private fun getNetworkType(context: Context): String {
+        networkType?.let { return it }
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return "OFFLINE"
         return runCatching {
             val active = cm.activeNetwork ?: return "OFFLINE"
             val caps = cm.getNetworkCapabilities(active) ?: return "OFFLINE"
-            when {
-                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
-                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "MOBILE"
-                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
-                else -> "OTHER"
-            }
+            networkTypeOf(caps)
         }.getOrDefault("WIFI")
+    }
+
+    /**
+     * 注册一次默认网络回调（在 ConnectivityThread 上回调），之后 [getNetworkType] 只读字段。
+     *
+     * 幂等。与 [initIfNeeded] 分开：宿主可以在启动时（后台线程）就先把它挂上，而训练必须等到用户
+     * 解锁之后（锁定状态下 UsageStats 读不到东西，而训练只跑一次）。
+     */
+    fun watchNetworkType(context: Context) {
+        if (!networkWatched.compareAndSet(false, true)) return
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        runCatching {
+            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                    networkType = networkTypeOf(caps)
+                }
+
+                override fun onLost(network: Network) {
+                    networkType = "OFFLINE"
+                }
+            })
+        }.onFailure { Log.d(TAG, "default network callback unavailable: ${it.message}") }
+    }
+
+    private fun networkTypeOf(caps: NetworkCapabilities): String = when {
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "MOBILE"
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
+        else -> "OTHER"
     }
 }

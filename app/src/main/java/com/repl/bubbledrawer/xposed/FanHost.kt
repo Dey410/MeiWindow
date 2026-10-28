@@ -500,6 +500,9 @@ class FanHost(
             }
         }
         scope.launch {
+            // 推荐用的网络回调在这里（后台）挂上，不留到第一次展开的主线程上。训练不在这里起：
+            // 开机时这里早于解锁，UsageStats 还读不到（见 AppPredictor.watchNetworkType）。
+            runCatching { com.repl.bubbledrawer.data.predict.AppPredictor.watchNetworkType(context) }
             runCatching { repo.loadAll() }
             mainHandler.post {
                 if (dock.isBusy) {
@@ -509,6 +512,8 @@ class FanHost(
                         snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
                         snap.recommendEnabled, outerRadiusDpOf(snap),
                     )
+                } else {
+                    scheduleIconPrewarm("APP_LIST_LOADED", delayMs = 0L)
                 }
             }
         }
@@ -541,6 +546,7 @@ class FanHost(
                     null,
                 )
                 rebindFanIfBusy()
+                scheduleIconPrewarm("PINS_CHANGED")
             } else if (key == FunctionPinDetails.KEY) {
                 // 已选功能的详情到了：面板开着就重画已选区 —— 这一刻它可能刚从「认不出来」变成
                 // 「认得出来」（用户 2026-10-13：设置页选好了、面板里没有）。
@@ -571,12 +577,18 @@ class FanHost(
                 )
                 // 面板开着就顺手刷新（回调线程不保证是主线程，而这里是 Compose 状态）。
                 mainHandler.post { if (moreUp) moreContent?.refreshFunctionPins() }
+                scheduleIconPrewarm("FUNCTIONS_CHANGED")
             } else if (key == RemotePrefs.KEY_FAN_ICON_COUNT || key == RemotePrefs.KEY_FAN_RADIUS_DP ||
                 key == RemotePrefs.KEY_FAN_AUTO_FILL_RECOMMEND || key == RemotePrefs.KEY_FAN_ICON_DP ||
                 key == RemotePrefs.KEY_FAN_ICON_SHAPE || key == RemotePrefs.KEY_FAN_LAYERS ||
                 key == RemotePrefs.KEY_FAN_OUTER_RADIUS_ENABLED || key == RemotePrefs.KEY_FAN_OUTER_RADIUS_DP
             ) {
                 rebindFanIfBusy()
+                // 图标数 / 层数 / 自动补满会改变每页放哪些应用。
+                scheduleIconPrewarm("FAN_LAYOUT_CHANGED")
+            } else if (key == RemotePrefs.KEY_CLONE_BADGE) {
+                // 分身角标是图标缓存键的一部分：换了开关，缓存里那批就都不是扇形要的了。
+                scheduleIconPrewarm("CLONE_BADGE_CHANGED")
             } else if (key == RemotePrefs.KEY_FAN_PRESSURE_CALIBRATION_ACTIVE) {
                 // App 点「开始/取消校准」→ 远程组这一个键变了：开一个会话 / 关掉会话。
                 //
@@ -798,6 +810,7 @@ class FanHost(
                         snap.recommendEnabled, outerRadiusDpOf(snap),
                     )
                 }
+                scheduleIconPrewarm("APP_LIST_RELOAD")
             }
             scanShortcuts("APP_LIST_RELOAD")
         }
@@ -837,13 +850,15 @@ class FanHost(
     private var pendingSwipeSide: SpySide? = null
     /** Corner claim: raise windows, bind fresh pins, seed the launcher with the
      *  synthetic DOWN at the press point (the real DOWN stayed with the app under
-     *  the corner — the spy was only observing until pilfer), then arm the timeout. */
+     *  the corner — the spy was only observing until pilfer), then arm the timeout.
+     *
+     *  锁屏/灭屏由调用方挡：`CornerInputMonitor.openFan` 在输入线程和主线程各查一次它缓存的
+     *  电源/锁屏状态（亮屏看门狗 250ms + 锁屏监听）。这里以前再同步问一遍 `isKeyguardLocked` /
+     *  `isInteractive`，是展开路径上白白多出的两次 binder（耗时见 `FAN_SHOW_TIMING` 日志）。 */
     fun show(side: SpySide, downX: Float, downY: Float, screenW: Int, screenH: Int) {
         if (moduleContext == null) return // no module resources → no fan (fail closed)
-        val km = host.getSystemService(KeyguardManager::class.java)
-        if (km?.isKeyguardLocked == true) return
-        val pm = host.getSystemService(PowerManager::class.java)
-        if (pm?.isInteractive == false) return
+        val t0 = SystemClock.elapsedRealtimeNanos()
+        val iconLoads0 = AppRepository.mainThreadIconLoads.get()
         hideMorePanel(animated = false) // a fresh stroke always starts from the fan
         // The fan renders tiles from the cached list; if that list is the boot's locked-user
         // subset, refresh in the background so the NEXT stroke (and the 更多 panel) is whole.
@@ -859,22 +874,66 @@ class FanHost(
         }
         fanSuppressed = false
         activeCorner = if (side == SpySide.LEFT) Corner.BOTTOM_LEFT else Corner.BOTTOM_RIGHT
+        val t1 = SystemClock.elapsedRealtimeNanos()
+        val freshWindows = !fanWindowsUp
         raiseFanWindows()
+        val t2 = SystemClock.elapsedRealtimeNanos()
         dock.previewMode = false
         dock.show(
             activeCorner, screenW, screenH,
             snap.fanIconCount, snap.fanRadiusDp, snap.fanAutoFillRecommend, snap.fanLayers,
             snap.recommendEnabled, outerRadiusDpOf(snap),
         )
+        val t3 = SystemClock.elapsedRealtimeNanos()
         lastTouchX = downX
         lastTouchY = downY
-        pressureDetector.startListening(settleMs = 280L)
+        // 气压计只有两种用途：重按翻页、校准会话。都不需要时不注册 —— 注册本身是一次到传感器服务的
+        // binder，而它排在第一帧之前；关着重按翻页时收到的读数也只会被丢掉（见 FanPressureDetector
+        // 回调里的 isEnabled 判断）。
+        if (snap.fanPressurePageTurn || calibrating) pressureDetector.startListening(settleMs = 280L)
         val t = SystemClock.uptimeMillis()
         val down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, downX, downY, 0)
         dock.forward(down, 0)
         down.recycle()
         armTimeout() // reference :186-187 (beginGesture → postDelayed(timeout, …))
+        reportShowTiming(t0, t1, t2, t3, freshWindows, iconLoads0)
     }
+
+    /**
+     * 「认定手势 → 扇形第一帧」的耗时分段，一笔一行 `FAN_SHOW_TIMING`：
+     *
+     *  - `gate`：收起面板、读设置、黑名单 / 横屏两次判定；
+     *  - `windows`：[raiseFanWindows]（两次 `addView`；`fresh=false` 说明窗口还在，没有新建）；
+     *  - `build`：取数（收藏 / 已选功能 / 推荐）+ 建 tile + 取图标；`iconLoads` 是这一笔在主线程上
+     *    **现场解码**的图标数（预热命中时应为 0，见 [scheduleIconPrewarm]）；
+     *  - `tail`：气压计、种 DOWN、计时；
+     *  - `sync`：以上之和，即 show() 在主线程上占用的时间；
+     *  - `firstFrame`：从 show() 开始到画布第一次 pre-draw（布局完成、即将绘制）。
+     *
+     * 日志在第一帧之后才写（post 出去），不把写日志本身算进被测的那一帧。
+     */
+    private fun reportShowTiming(t0: Long, t1: Long, t2: Long, t3: Long, freshWindows: Boolean, iconLoads0: Int) {
+        val t4 = SystemClock.elapsedRealtimeNanos()
+        val iconLoads = AppRepository.mainThreadIconLoads.get() - iconLoads0
+        val tiles = dock.launcher.childCount
+        val summary = "gate=${ms(t1 - t0)} windows=${ms(t2 - t1)} fresh=$freshWindows " +
+            "build=${ms(t3 - t2)} tiles=$tiles iconLoads=$iconLoads tail=${ms(t4 - t3)} sync=${ms(t4 - t0)}"
+        val c = canvas
+        if (c == null) {
+            logger(Log.INFO, "FAN_SHOW_TIMING $summary firstFrame=-1", null)
+            return
+        }
+        c.viewTreeObserver.addOnPreDrawListener(object : android.view.ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                c.viewTreeObserver.removeOnPreDrawListener(this)
+                val frame = SystemClock.elapsedRealtimeNanos() - t0
+                mainHandler.post { logger(Log.INFO, "FAN_SHOW_TIMING $summary firstFrame=${ms(frame)}", null) }
+                return true
+            }
+        })
+    }
+
+    private fun ms(nanos: Long): String = String.format(java.util.Locale.ROOT, "%.1f", nanos / 1_000_000.0)
 
     /**
      * 这一笔该不该被拦掉，返回原因（null = 正常弹扇形）。顺序：黑名单优先于"横屏两次"。
@@ -889,8 +948,11 @@ class FanHost(
         screenH: Int,
         snap: RemotePrefs.Snapshot,
     ): String? {
-        val pkg = foregroundPackage()
-        if (pkg != null && snap.fanBlacklist.contains(pkg)) return "BLACKLIST"
+        // 前台包名是一次 getRunningTasks binder：黑名单是空的（默认）就没必要问。
+        if (snap.fanBlacklist.isNotEmpty()) {
+            val pkg = foregroundPackage()
+            if (pkg != null && snap.fanBlacklist.contains(pkg)) return "BLACKLIST"
+        }
         if (!snap.fanLandscapeTwoSwipes) return null
         if (!com.repl.bubbledrawer.launch.isWideScreen(screenW, screenH)) return null
         val now = SystemClock.uptimeMillis()
@@ -1471,6 +1533,57 @@ class FanHost(
         // 提示随 canvas 一起被移除了，只留引用没有意义（下次划出时 ensureCalibrationHint 会重建）。
         calibrationHint = null
         fanWindowsUp = false
+        // 刚启动过应用，推荐顺序变了：为下一笔把新出现的图标提前解码好。
+        scheduleIconPrewarm("FAN_CLOSED")
+    }
+
+    // ---------------- 图标预热 ----------------
+
+    /**
+     * 把下一次展开会画的图标（每一页的收藏、已选功能的宿主图标、推荐）提前解码进 [AppRepository]
+     * 的图标缓存。取数（[BubbleDockController.buildPages]）在主线程上做 —— 与展开时同一套代码、
+     * 同一个线程，不引入新的并发；只把真正贵的解码挪到 [scope]。
+     *
+     * 去抖：短时间内多次请求只跑最后一次（按 [ICON_PREWARM_TOKEN] 撤掉前一个）。可以从任意线程调
+     * （prefs 回调不保证在主线程），真正的工作总在主线程上开始。
+     */
+    private fun scheduleIconPrewarm(reason: String, delayMs: Long = ICON_PREWARM_DELAY_MS) {
+        mainHandler.removeCallbacksAndMessages(ICON_PREWARM_TOKEN)
+        mainHandler.postDelayed({ prewarmIcons(reason) }, ICON_PREWARM_TOKEN, delayMs)
+    }
+
+    private fun prewarmIcons(reason: String) {
+        // 扇形或「更多」面板开着时不跑：不跟手势/滚动抢主线程，它们收起时还会再排一次。
+        if (dock.isBusy || fanWindowsUp || moreUp || moduleContext == null) return
+        // 开机时应用列表先在锁定状态下枚举一次（只有几个应用）：这时取数会让推荐在解锁前就开始训练
+        // （AppPredictor 只训练一次），也只会预热一份残缺的列表。解锁后 reloadApps 会再排一次。
+        if (!AppRepository.userUnlocked(context)) return
+        val snap = RemotePrefs.read(prefs)
+        val pages = runCatching {
+            dock.buildPages(snap.fanIconCount, snap.fanAutoFillRecommend, snap.fanLayers, snap.recommendEnabled)
+        }.onFailure { logger(Log.WARN, "FAN_ICON_PREWARM_FAILED reason=$reason", it) }
+            .getOrNull() ?: return
+        // 与 buildTile 取图标的分支一一对应：应用 tile 用应用图标；功能 tile 只有在既没有快捷方式
+        // 位图、也没有内建 drawable 时才退回宿主应用图标。
+        val apps = pages.flatten().mapNotNull { item ->
+            when (item) {
+                is GestureAppLauncher.AdapterItem.AppItem -> item.app
+                is GestureAppLauncher.AdapterItem.FunctionItem -> {
+                    val s = item.shortcut
+                    val hasOwn = (s.iconBitmap?.isRecycled == false) || s.iconDrawable != null
+                    if (hasOwn) null else com.repl.bubbledrawer.pinyin.BubbleApp(s.packageName, s.label)
+                }
+                GestureAppLauncher.AdapterItem.More -> null
+            }
+        }
+        val badge = snap.cloneBadge
+        scope.launch {
+            var loaded = 0
+            for (app in apps) {
+                if (runCatching { repo.prewarmIcon(app, badge) }.getOrDefault(false)) loaded++
+            }
+            logger(Log.INFO, "FAN_ICON_PREWARM reason=$reason icons=${apps.size} loaded=$loaded", null)
+        }
     }
 
     /**
@@ -1724,6 +1837,8 @@ class FanHost(
     private fun hideMorePanel(animated: Boolean = true) {
         if (!moreUp) return
         moreUp = false
+        // 面板里可能刚改过收藏；面板开着时预热是跳过的，这里补一次。
+        scheduleIconPrewarm("MORE_CLOSED")
         moreContent?.cancelSearch()
         moreContent?.release()
         moreContent = null
@@ -1874,6 +1989,8 @@ class FanHost(
         pressureDetector.destroy()
         hideMorePanel(animated = false)
         tearFanWindowsNow()
+        // tearFanWindowsNow 会排一次预热；拆掉的实例不该再去取数。
+        mainHandler.removeCallbacksAndMessages(ICON_PREWARM_TOKEN)
         dock.destroy()
     }
 
@@ -1889,6 +2006,15 @@ class FanHost(
 
         /** 见 [logPinRead]：同一个读结果最多这么久记一行。 */
         const val PIN_READ_LOG_INTERVAL_MS = 1000L
+
+        /**
+         * 扇形收起 / 设置变化后多久再预热图标（[scheduleIconPrewarm]）。收起时多半刚启动了应用，
+         * 小窗动画还在跑：等它跑完再在主线程上取数，别抢那几帧。
+         */
+        const val ICON_PREWARM_DELAY_MS = 1500L
+
+        /** [scheduleIconPrewarm] 的去抖令牌。 */
+        val ICON_PREWARM_TOKEN = Any()
 
         /**
          * 终局事件发出后多久检查回执（App 把 active 写成 false 就是对「收到了」的确认）。

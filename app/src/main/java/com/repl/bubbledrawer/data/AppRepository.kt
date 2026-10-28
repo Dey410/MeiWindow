@@ -342,9 +342,25 @@ class AppRepository(
     suspend fun all(): ImmutableList<BubbleApp> =
         if (cacheNeedsRefresh()) loadAll() else cache
 
+    /**
+     * [findApp] 在缓存外查到（或没查到）的结果，带时间戳。
+     *
+     * 扇形每次展开都要为每个收藏找对应的应用；不在 [cache] 里的收藏（启动后才装的、已经卸载但还留在
+     * 收藏里的）以前每一笔都现查 `getActivityList` + `getApplicationInfo` —— 主线程上、手势中间的
+     * binder。这里记 [LOOKUP_TTL_MS]：新装的应用最多晚这么久出现，[loadAll] 会整个清掉。
+     */
+    private val lookups = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, BubbleApp?>>()
+
     /** Synchronous lookup for a single app; resolves from LauncherApps/PackageManager if cache is cold. */
     fun findApp(packageName: String, userId: Int = 0): BubbleApp? {
         cache.firstOrNull { it.packageName == packageName && it.userId == userId }?.let { return it }
+        val key = "$packageName#$userId"
+        val now = android.os.SystemClock.uptimeMillis()
+        lookups[key]?.let { (at, app) -> if (now - at < LOOKUP_TTL_MS) return app }
+        return lookupApp(packageName, userId).also { lookups[key] = now to it }
+    }
+
+    private fun lookupApp(packageName: String, userId: Int): BubbleApp? {
         return runCatching {
             val userHandle = MultiUserHelper.getUserHandle(userId)
             val launcherApps = context.getSystemService(Context.LAUNCHER_APPS_SERVICE) as? LauncherApps
@@ -451,6 +467,7 @@ class AppRepository(
 
         val sorted = allApps.sortedWith(AppSortKey.DEFAULT).toImmutableList()
         cache = sorted
+        lookups.clear()
         // Remember HOW this list was obtained: a query made while the user is still locked
         // answers with a tiny subset (see the class doc), and that answer must not outlive
         // the unlock. [cacheNeedsRefresh] is what every reader checks.
@@ -480,12 +497,37 @@ class AppRepository(
         cloneBadge: Boolean = RemotePrefs.DEFAULT_CLONE_BADGE,
     ): Drawable? = getIcon(context, app, cloneBadge)
 
+    /**
+     * 预热：图标不在缓存里就**在调用线程上**加载进去（给后台线程用）。返回这次是否真的加载了。
+     *
+     * 扇形的 tile 走 [icon] → 同一个 [iconCache]，所以预热过的图标展开时直接命中；没预热的仍会在
+     * 主线程现场解码（计入 [mainThreadIconLoads]）。
+     */
+    fun prewarmIcon(app: BubbleApp, cloneBadge: Boolean): Boolean {
+        if (iconCache.get(iconKey(app, cloneBadge)) != null) return false
+        return getIcon(context, app, cloneBadge) != null
+    }
+
     fun launchIntent(pkg: String): Intent? =
         context.packageManager.getLaunchIntentForPackage(pkg)
 
     companion object {
         private const val TAG = "MeiWindow_AppRepo"
         private val iconCache = LruCache<String, Drawable>(128)
+
+        /** 见 [lookups]。 */
+        private const val LOOKUP_TTL_MS = 60_000L
+
+        /**
+         * 在主线程上未命中缓存、现场加载的图标数（单调递增）。`FanHost` 记录展开前后的差值，
+         * 写进 `FAN_SHOW_TIMING` 的 `iconLoads=`，用来确认预热有没有生效。
+         */
+        val mainThreadIconLoads = java.util.concurrent.atomic.AtomicInteger()
+
+        // The switch is part of the key: the same app#user renders two different images
+        // depending on it, and both hosts (app process, SystemUI) cache per process.
+        private fun iconKey(app: BubbleApp, cloneBadge: Boolean) =
+            "${app.packageName}#${app.userId}#badge=$cloneBadge"
 
         /**
          * Is the current user's credential-encrypted storage available?
@@ -517,11 +559,12 @@ class AppRepository(
             app: BubbleApp,
             cloneBadge: Boolean = RemotePrefs.DEFAULT_CLONE_BADGE,
         ): Drawable? {
-            // The switch is part of the key: the same app#user renders two different images
-            // depending on it, and both hosts (app process, SystemUI) cache per process.
-            val key = "${app.packageName}#${app.userId}#badge=$cloneBadge"
+            val key = iconKey(app, cloneBadge)
             iconCache.get(key)?.let { return it }
 
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                mainThreadIconLoads.incrementAndGet()
+            }
             val d = loadIcon(context, app, cloneBadge) ?: return null
             iconCache.put(key, d)
             return d

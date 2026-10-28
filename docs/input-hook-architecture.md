@@ -198,6 +198,8 @@ MON_INPUT_READY name=BubbleDrawer-corner-MultiTaskSwitch …
 | `MON_TAP_PASSTHROUGH_DELEGATED` / `_INJECTED` | 轻点交还：桌面补了 / 我们补了 |
 | `MON_SYSTEM_CANCEL` | 外力取消；**带 `owned=true` 就是"抢下的笔被系统夺回"**（扇面+回桌面同时发生的签名） |
 | `MON_IME_PROBE_MISSING` | 键盘高度探针窗口没建起来（降级：键盘上的角落按下也会被抢下） |
+| `FAN_SHOW_TIMING` | 一笔扇形展开的耗时分段（ms）：`gate`（判定）/ `windows`（两次 `addView`，`fresh=false` = 窗口还在）/ `build`（取数 + 建 tile，`iconLoads` = 主线程现场解码的图标数）/ `tail` / `sync`（主线程合计）/ `firstFrame`（到首次 pre-draw） |
+| `FAN_ICON_PREWARM` | 后台预热扇形图标：`icons` = 下次展开要画的图标数，`loaded` = 这次真正新解码的数量（`reason=` 触发原因） |
 | `ARBITER_*` | system_server 侧（当前禁用） |
 | `HOT_RELOAD*` / `MON_DISPOSED_FOR_HOT_RELOAD` | 热重载生命周期 |
 
