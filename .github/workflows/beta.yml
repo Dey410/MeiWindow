@@ -5,6 +5,9 @@ name: Beta
 #  - 也可以在 Actions 页面手动 Run workflow，在「Use workflow from」里选分支即可
 #    （GitHub 只在默认分支上有这个文件之后才显示这个按钮）。
 # 产物挂在这次运行的 Artifacts 里：不打 tag、不发 Release。
+#
+# 签名：仓库配了 SIGNING_* secrets 就用正式密钥（能直接覆盖安装正式版）；没配也照样出包，用缓存下来的
+# debug 密钥签（文件名带 -debugkey；装之前要先卸载正式版，之后同一分支的测试版之间可以互相覆盖）。
 on:
   workflow_dispatch:
   push:
@@ -28,7 +31,7 @@ jobs:
   beta:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Compute beta version
         id: v
@@ -54,30 +57,47 @@ jobs:
           echo "Beta $name (versionCode $code)"
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
-      # 与正式版同一把密钥：签名不同的话，测试版装不上已装正式版的手机。
+      # 有正式密钥就用它：签名与正式版一致，测试版才能直接覆盖安装。
       - name: Restore signing key
+        id: sign
         env:
           KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
         run: |
           set -euo pipefail
-          if [ -z "${KEYSTORE_BASE64:-}" ]; then
-            echo "::error::SIGNING_KEYSTORE_BASE64 is not set."
-            exit 1
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$GITHUB_WORKSPACE/release.jks"
+            # 绝对路径：同 release.yml，Gradle 在 app/ 下解析相对路径会找不到。
+            echo "store=$GITHUB_WORKSPACE/release.jks" >> "$GITHUB_OUTPUT"
+            echo "kind=release" >> "$GITHUB_OUTPUT"
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::没有配置 SIGNING_KEYSTORE_BASE64，测试版改用 debug 密钥签名：已装正式版的手机要先卸载才能装。"
+            echo "store=" >> "$GITHUB_OUTPUT"
+            echo "kind=debug" >> "$GITHUB_OUTPUT"
+            echo "suffix=-debugkey" >> "$GITHUB_OUTPUT"
           fi
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$GITHUB_WORKSPACE/release.jks"
+
+      # 没有正式密钥时，AGP 会在 ~/.android 现生成一把 debug 密钥 —— 每台 runner 都不一样。缓存下来，
+      # 同一分支的测试版之间签名就一致，可以互相覆盖安装。
+      - name: Cache debug keystore
+        if: steps.sign.outputs.kind == 'debug'
+        uses: actions/cache@v6
+        with:
+          path: ~/.android/debug.keystore
+          key: beta-debug-keystore-v1
 
       - name: Unit tests and release APK
         env:
-          # 绝对路径：同 release.yml，Gradle 在 app/ 下解析相对路径会找不到。
-          SIGNING_STORE_FILE: ${{ github.workspace }}/release.jks
+          # 为空 = 不要正式签名：app/build.gradle.kts 把空值当成没设，release 回落到 debug 签名。
+          SIGNING_STORE_FILE: ${{ steps.sign.outputs.store }}
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
           SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
@@ -89,7 +109,7 @@ jobs:
             "-PversionCode=${{ steps.v.outputs.code }}"
           mkdir -p dist
           cp app/build/outputs/apk/release/app-release.apk \
-             "dist/MeiWindow-${{ steps.v.outputs.name }}.apk"
+             "dist/MeiWindow-${{ steps.v.outputs.name }}${{ steps.sign.outputs.suffix }}.apk"
 
       - name: Verify LSPosed Metadata
         run: |
@@ -100,19 +120,26 @@ jobs:
           echo "LSPosed entry point and scope verified."
 
       - name: Upload APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: MeiWindow-${{ steps.v.outputs.name }}
+          name: MeiWindow-${{ steps.v.outputs.name }}${{ steps.sign.outputs.suffix }}
           path: dist/*.apk
           if-no-files-found: error
           retention-days: 30
 
       - name: Summary
         run: |
+          base=$(sed -n 's/^versionName=//p' gradle.properties)
+          if [ "${{ steps.sign.outputs.kind }}" = "release" ]; then
+            install="正式密钥签名，可直接覆盖安装 $base 正式版"
+          else
+            install="debug 密钥签名（仓库没配 SIGNING_* secrets）：已装正式版要先卸载；同一分支的测试版之间可以互相覆盖"
+          fi
           {
             echo "### 魅窗测试版 ${{ steps.v.outputs.name }}"
             echo
-            echo "- versionCode：${{ steps.v.outputs.code }}（可直接覆盖安装 $(sed -n 's/^versionName=//p' gradle.properties) 正式版）"
+            echo "- versionCode：${{ steps.v.outputs.code }}"
+            echo "- 签名：$install"
             echo "- 提交：${{ github.sha }}（${{ github.ref_name }}）"
-            echo "- 下载：本页底部 Artifacts → MeiWindow-${{ steps.v.outputs.name }}（zip 里是 APK）"
+            echo "- 下载：本页底部 Artifacts → MeiWindow-${{ steps.v.outputs.name }}${{ steps.sign.outputs.suffix }}（zip 里是 APK）"
           } >> "$GITHUB_STEP_SUMMARY"
