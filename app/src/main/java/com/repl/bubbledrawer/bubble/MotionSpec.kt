@@ -77,4 +77,11 @@ object MotionSpec {
 
     // radius dimens are resources: slide_gesture_launcher_item_radius 277dp
     // (no-nav 242dp), applied per launch via setRadius (:878).
+
+    // ---- 多开实例选择（不是移植版的东西，见 InstanceChooser） ----
+    /** 手指在多开 tile 上停多久弹出 1 / 2。比系统长按（400ms）短：划扇形本来就是一口气的动作。 */
+    const val INSTANCE_DWELL_MS = 300L
+    const val INSTANCE_OPEN_MS = 140L
+    /** 弹出时其它 tile 压暗到多少（选择期间只有气泡和这枚 tile 响应手指）。 */
+    const val INSTANCE_DIM_ALPHA = 0.35f
 }

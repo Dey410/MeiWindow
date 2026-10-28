@@ -511,6 +511,14 @@ fun FanSettingsScreen(
                             onCheckedChange = actions::setCloneBadge,
                         )
                     })
+                    add(CardItem("merge_instances") {
+                        SwitchRow(
+                            title = stringResource(R.string.fan_merge_instances),
+                            summary = stringResource(R.string.fan_merge_instances_summary),
+                            checked = snap.fanMergeInstances,
+                            onCheckedChange = actions::setFanMergeInstances,
+                        )
+                    })
                     add(CardItem("auto_fill") {
                         SwitchRow(
                             title = stringResource(R.string.fan_auto_fill_recommend),

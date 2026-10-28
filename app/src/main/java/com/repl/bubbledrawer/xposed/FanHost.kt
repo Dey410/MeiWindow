@@ -499,6 +499,24 @@ class FanHost(
                 }
             }
         }
+        // 多开应用（用户 2026-10-28）：合成一枚 tile、再选 1 / 2。开关只读一个键 —— buildPages 在手势中间。
+        dock.mergeInstances = {
+            runCatching {
+                prefs.getBoolean(RemotePrefs.KEY_FAN_MERGE_INSTANCES, RemotePrefs.DEFAULT_FAN_MERGE_INSTANCES)
+            }.getOrDefault(RemotePrefs.DEFAULT_FAN_MERGE_INSTANCES)
+        }
+        dock.launcher.instanceIcon = { app -> instanceIcon(app) }
+        dock.launcher.onChooserShown = { item, reason ->
+            logger(
+                Log.INFO,
+                "FAN_INSTANCE_CHOOSER reason=$reason pkg=${item.app.packageName} " +
+                    "users=${item.instances.map { it.userId }} default=${item.app.userId}",
+                null,
+            )
+        }
+        dock.launcher.onInstanceChosen = { item, via ->
+            logger(Log.INFO, "FAN_INSTANCE_CHOSEN via=$via pkg=${item.app.packageName} user=${item.app.userId}", null)
+        }
         scope.launch {
             // 推荐用的网络回调在这里（后台）挂上，不留到第一次展开的主线程上。训练不在这里起：
             // 开机时这里早于解锁，UsageStats 还读不到（见 AppPredictor.watchNetworkType）。
@@ -581,7 +599,8 @@ class FanHost(
             } else if (key == RemotePrefs.KEY_FAN_ICON_COUNT || key == RemotePrefs.KEY_FAN_RADIUS_DP ||
                 key == RemotePrefs.KEY_FAN_AUTO_FILL_RECOMMEND || key == RemotePrefs.KEY_FAN_ICON_DP ||
                 key == RemotePrefs.KEY_FAN_ICON_SHAPE || key == RemotePrefs.KEY_FAN_LAYERS ||
-                key == RemotePrefs.KEY_FAN_OUTER_RADIUS_ENABLED || key == RemotePrefs.KEY_FAN_OUTER_RADIUS_DP
+                key == RemotePrefs.KEY_FAN_OUTER_RADIUS_ENABLED || key == RemotePrefs.KEY_FAN_OUTER_RADIUS_DP ||
+                key == RemotePrefs.KEY_FAN_MERGE_INSTANCES
             ) {
                 rebindFanIfBusy()
                 // 图标数 / 层数 / 自动补满会改变每页放哪些应用。
@@ -1347,6 +1366,8 @@ class FanHost(
         if (!pressureDetector.isTouchActive) return
         // 需注意手指停在app图标或更多上不能触发翻页
         if (dock.launcher.isHoveringItem) {
+            // 停在多开 tile 上重按 = 不等停留计时，立刻弹出 1 / 2（这个位置上的重按以前什么都不做）。
+            if (dock.launcher.openChooserForHovered()) return
             logger(Log.DEBUG, "FAN_PRESSURE_IGNORED_HOVER index=${dock.launcher.currentHoveredIndex}", null)
             return
         }
@@ -1447,8 +1468,16 @@ class FanHost(
             shape = snap.fanIconShape
             layoutParams = FrameLayout.LayoutParams(iconPx, iconPx)
         }
+        var countBadge: View? = null
         when (item) {
-            is GestureAppLauncher.AdapterItem.AppItem -> icon.setImageDrawable(repo.icon(item.app, snap.cloneBadge))
+            is GestureAppLauncher.AdapterItem.AppItem -> {
+                icon.setImageDrawable(repo.icon(item.app, tileCloneBadge(item, snap)))
+                if (item.isMulti) {
+                    countBadge = instanceCountBadge(item.instances.size, iconPx)
+                    // 扇形已经松手、靠点选时：长按弹出 1 / 2（划动中走的是停留 / 重按，见 GestureAppLauncher）。
+                    tile.setOnLongClickListener { dock.launcher.openChooserForTile(tile) }
+                }
+            }
             is GestureAppLauncher.AdapterItem.FunctionItem -> {
                 // 扇形的 tile 没有文字，所以图标就是全部信息：优先用快捷方式自己的图标
                 // （最近一次枚举结果带回来的那张），其次内建条目自带的 drawable（聚合支付），
@@ -1471,12 +1500,42 @@ class FanHost(
                 runCatching { icon.setImageResource(R.drawable.icon_gesture_more_app) }
         }
         inner.addView(icon)
+        countBadge?.let { inner.addView(it) }
         tile.addView(inner)
         // ORIGINAL: the adapter sets a click listener on every tile (C2937F.m9712g :142 →
         // C2937F$a.onClick :56-69 → mo9283j(item, view, reason=1)) — same timing as the
         // factory itself, so taps work even while the fan is still expanding.
         tile.setOnClickListener { dock.launcher.clickSelect(item, tile) }
         return tile
+    }
+
+    /**
+     * tile 上要不要叠分身角标。多开合并后，默认实例是分身时（只收藏了分身 / 分身排在前面）**一定**叠：
+     * 不然直接松手打开的是哪一个就看不出来了。其余情况照用户的「分身角标」开关。
+     */
+    private fun tileCloneBadge(item: GestureAppLauncher.AdapterItem.AppItem, snap: RemotePrefs.Snapshot): Boolean =
+        snap.cloneBadge || (item.isMulti && item.app.userId != 0)
+
+    /** 气泡里的实例图标：分身一律带角标（两个气泡长得一样就没法选了）。 */
+    private fun instanceIcon(app: com.repl.bubbledrawer.pinyin.BubbleApp) =
+        repo.icon(app, cloneBadge = app.userId != 0)
+
+    /** 多开 tile 右上角的「2」（分身角标在右下，两个不打架）。 */
+    private fun instanceCountBadge(count: Int, iconPx: Int): View {
+        val size = (iconPx * 0.36f).toInt().coerceAtLeast(1)
+        return TextView(context).apply {
+            text = count.toString()
+            gravity = Gravity.CENTER
+            setTextColor(Color.argb(0xFF, 0x1F, 0x1F, 0x1F))
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, size * 0.62f)
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            includeFontPadding = false
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.argb(0xEE, 0xFF, 0xFF, 0xFF))
+            }
+            layoutParams = FrameLayout.LayoutParams(size, size, Gravity.TOP or Gravity.END)
+        }
     }
 
     // ---------------- windows (same pair as the legacy OverlayHost) ----------------
@@ -1563,23 +1622,28 @@ class FanHost(
             dock.buildPages(snap.fanIconCount, snap.fanAutoFillRecommend, snap.fanLayers, snap.recommendEnabled)
         }.onFailure { logger(Log.WARN, "FAN_ICON_PREWARM_FAILED reason=$reason", it) }
             .getOrNull() ?: return
-        // 与 buildTile 取图标的分支一一对应：应用 tile 用应用图标；功能 tile 只有在既没有快捷方式
-        // 位图、也没有内建 drawable 时才退回宿主应用图标。
-        val apps = pages.flatten().mapNotNull { item ->
+        // 与 buildTile 取图标的分支一一对应（图标 + 用哪种角标，两者合起来才是缓存键）：应用 tile 用应用
+        // 图标；多开 tile 再加上 1 / 2 气泡里那几张；功能 tile 只有在既没有快捷方式位图、也没有内建
+        // drawable 时才退回宿主应用图标。
+        val icons = ArrayList<Pair<com.repl.bubbledrawer.pinyin.BubbleApp, Boolean>>()
+        for (item in pages.flatten()) {
             when (item) {
-                is GestureAppLauncher.AdapterItem.AppItem -> item.app
+                is GestureAppLauncher.AdapterItem.AppItem -> {
+                    icons.add(item.app to tileCloneBadge(item, snap))
+                    item.instances.forEach { icons.add(it to (it.userId != 0)) }
+                }
                 is GestureAppLauncher.AdapterItem.FunctionItem -> {
                     val s = item.shortcut
                     val hasOwn = (s.iconBitmap?.isRecycled == false) || s.iconDrawable != null
-                    if (hasOwn) null else com.repl.bubbledrawer.pinyin.BubbleApp(s.packageName, s.label)
+                    if (!hasOwn) icons.add(com.repl.bubbledrawer.pinyin.BubbleApp(s.packageName, s.label) to snap.cloneBadge)
                 }
-                GestureAppLauncher.AdapterItem.More -> null
+                GestureAppLauncher.AdapterItem.More -> Unit
             }
         }
-        val badge = snap.cloneBadge
+        val apps = icons.distinct()
         scope.launch {
             var loaded = 0
-            for (app in apps) {
+            for ((app, badge) in apps) {
                 if (runCatching { repo.prewarmIcon(app, badge) }.getOrDefault(false)) loaded++
             }
             logger(Log.INFO, "FAN_ICON_PREWARM reason=$reason icons=${apps.size} loaded=$loaded", null)

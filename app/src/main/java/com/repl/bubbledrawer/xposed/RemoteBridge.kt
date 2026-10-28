@@ -185,6 +185,7 @@ object RemoteBridge {
             .putInt(RemotePrefs.KEY_FAN_ICON_DP, snap.fanIconDp)
             .putInt(RemotePrefs.KEY_FAN_ICON_SHAPE, snap.fanIconShape)
             .putBoolean(RemotePrefs.KEY_FAN_AUTO_FILL_RECOMMEND, snap.fanAutoFillRecommend)
+            .putBoolean(RemotePrefs.KEY_FAN_MERGE_INSTANCES, snap.fanMergeInstances)
             .putBoolean(RemotePrefs.KEY_FAN_PRESSURE_PAGE_TURN, snap.fanPressurePageTurn)
             .putInt(RemotePrefs.KEY_FAN_PRESSURE_SENSITIVITY, snap.fanPressureSensitivity)
             // 校准状态一起镜像：这些值平时由 SystemUI 广播回 App 落盘，但 App 的本地文件才是

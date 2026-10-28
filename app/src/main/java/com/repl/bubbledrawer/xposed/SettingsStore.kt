@@ -199,6 +199,10 @@ object SettingsStore {
     fun setCloneBadge(context: Context, enabled: Boolean) =
         putBoolean(context, RemotePrefs.KEY_CLONE_BADGE, enabled)
 
+    /** 多开应用在扇形里合成一枚图标、再选 1 / 2（用户 2026-10-28）。 */
+    fun setFanMergeInstances(context: Context, enabled: Boolean) =
+        putBoolean(context, RemotePrefs.KEY_FAN_MERGE_INSTANCES, enabled)
+
     /** 扇形未摆满时用推荐应用填满开关。 */
     fun setFanAutoFillRecommend(context: Context, enabled: Boolean) {
         RemoteBridge.local(context).edit().putBoolean(RemotePrefs.KEY_FAN_AUTO_FILL_RECOMMEND, enabled).apply()

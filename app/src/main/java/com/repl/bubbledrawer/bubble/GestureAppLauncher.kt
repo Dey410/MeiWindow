@@ -100,10 +100,40 @@ class GestureAppLauncher @JvmOverloads constructor(
      */
     private var outerRadius = 0f
 
+    // ---------------- 多开实例选择（见 InstanceChooser；移植版没有这一块） ----------------
+
+    private val chooser = InstanceChooser(resources) { invalidate() }
+
+    /** 气泡里画的图标（宿主给：SystemUI 侧走 AppRepository 的缓存）。不给就只有编号。 */
+    var instanceIcon: ((BubbleApp) -> android.graphics.drawable.Drawable?)? = null
+
+    /** 弹出了选择（reason = dwell / pressure / long_press），给宿主记日志。 */
+    var onChooserShown: ((AdapterItem.AppItem, String) -> Unit)? = null
+
+    /** 选中了某个实例（不是直接松手的默认实例），给宿主记日志。 */
+    var onInstanceChosen: ((AdapterItem.AppItem, String) -> Unit)? = null
+
+    val isChoosingInstance: Boolean get() = chooser.isOpen
+
+    private val instanceDwell = Runnable {
+        val idx = hoveredIndex
+        if (idx != -1 && !chooser.isOpen) openChooser(idx, "dwell", byTap = false)
+    }
+
     // ---------------- adapter (C2937F "SlideGestureAdapter" analog) ----------------
 
     sealed class AdapterItem {
-        data class AppItem(val app: BubbleApp) : AdapterItem()
+        /**
+         * @param app 这枚 tile 直接松手打开的那个实例（多开时 = 默认实例，见 [FanInstances.merge]）。
+         * @param instances 多开应用的**全部**实例（按 1 / 2 / … 的编号顺序，含 [app]）；单开应用为空。
+         *   非空时 tile 带角标，停留 / 重按 / 长按会弹出实例选择（见 [InstanceChooser]）。
+         */
+        data class AppItem(
+            val app: BubbleApp,
+            val instances: List<BubbleApp> = emptyList(),
+        ) : AdapterItem() {
+            val isMulti: Boolean get() = instances.size >= 2
+        }
 
         /**
          * 「已选功能」（快捷方式）也能进扇形 —— 一枚 tile 就是一条快捷方式，不是宿主应用。
@@ -175,6 +205,7 @@ class GestureAppLauncher @JvmOverloads constructor(
 
     /** setAdapter (:829-845): rebuild children, assign angles. */
     fun setAdapter(a: SlideAdapter?) {
+        closeChooser()
         if (adapter !== a) removeAllViews()
         adapter = a ?: return
         val n = a.count
@@ -272,6 +303,7 @@ class GestureAppLauncher @JvmOverloads constructor(
 
     /** Switches to a new adapter (e.g. for page flipping) and smoothly animates children in. */
     fun switchToAdapter(a: SlideAdapter, animated: Boolean = true) {
+        closeChooser()
         if (hoveredIndex != -1) {
             unhover(hoveredIndex)
             hoveredIndex = -1
@@ -415,6 +447,7 @@ class GestureAppLauncher @JvmOverloads constructor(
     override fun dispatchDraw(canvas: Canvas) {   // :672-677 — nothing paints while state==0
         if (state == 0) return
         super.dispatchDraw(canvas)
+        chooser.draw(canvas)                      // 多开选择气泡画在所有 tile 之上
     }
 
     // ---------------- expand (m9714B :460-504) ----------------
@@ -609,6 +642,7 @@ class GestureAppLauncher @JvmOverloads constructor(
 
     /** m9731s (:592-605). */
     private fun collapseFinished(animation: Animator) {
+        closeChooser()
         retractListener?.onAnimationEnd(animation)
         retractListener = null
         centerY = -1f
@@ -629,6 +663,8 @@ class GestureAppLauncher @JvmOverloads constructor(
             return
         }
         retractListener = listener
+        removeCallbacks(instanceDwell)
+        closeChooser()
         when (state) {
             1 -> pendingRetract = true
             3 -> { /* ignore while collapsing :718-720 */ }
@@ -660,9 +696,15 @@ class GestureAppLauncher @JvmOverloads constructor(
                 hoverDistance = distanceOf(x, y)
                 lastY = y
                 lastX = x
-                if (centerY != -1f) aimAt(x, y)
+                if (centerY != -1f) {
+                    if (chooser.isOpen) trackChooser(x, y) else aimAt(x, y)
+                }
             }
-            MotionEvent.ACTION_CANCEL -> return false          // :923-925
+            MotionEvent.ACTION_CANCEL -> {                     // :923-925
+                removeCallbacks(instanceDwell)
+                closeChooser()
+                return false
+            }
         }
         return true
     }
@@ -686,22 +728,8 @@ class GestureAppLauncher @JvmOverloads constructor(
     /** m9730q (:559-590). */
     private fun aimAt(x: Float, y: Float): Boolean {
         if (!laidOut || centerY == -1f) return false
-        val angle = angleOf(x, y)
-        val dist = hoverDistance
-        val n = childCount
-        if (n == 0) return false
-        // 移植版是 `val half = 90.0f / n * 0.5f`（整页共用一个半宽）。双层时两圈 tile 数不同，
-        // 半宽改由 assignAngles() 逐 child 写进 LayoutParams.angleHalf —— 单层时两者恒等。
-        val fallbackHalf = 90.0f / n * 0.5f
-        var hit = -1
-        for (i in 0 until n) {
-            val lp = getChildAt(i).layoutParams as LayoutParams
-            val half = if (lp.angleHalf > 0f) lp.angleHalf else fallbackHalf
-            if (angle >= lp.angle - half && angle < lp.angle + half && dist >= lp.radiusMin && dist <= lp.radiusMax) {
-                hit = i
-                break
-            }
-        }
+        if (childCount == 0) return false
+        val hit = hitIndex(x, y, hoverDistance, angleOf(x, y))
         if (hoveredIndex != hit) {           // :580-584
             unhover(hoveredIndex)
             hover(hit)
@@ -709,24 +737,62 @@ class GestureAppLauncher @JvmOverloads constructor(
         return hit != -1                      // :585-587
     }
 
+    /**
+     * 手指下是哪枚 tile（-1 = 没有）—— [aimAt] 的命中循环原样搬出来，供实例选择复用。
+     *
+     * [aimAt] 传进来的是移植版自己存的 `hoverDistance` / [angleOf]；点选（实例选择的长按模式）没有
+     * 这两个状态，用 [hitIndexAt] 现算。
+     */
+    private fun hitIndex(x: Float, y: Float, dist: Double, angle: Double): Int {
+        val n = childCount
+        if (n == 0 || angle < 0.0) return -1
+        // 移植版是 `val half = 90.0f / n * 0.5f`（整页共用一个半宽）。双层时两圈 tile 数不同，
+        // 半宽改由 assignAngles() 逐 child 写进 LayoutParams.angleHalf —— 单层时两者恒等。
+        val fallbackHalf = 90.0f / n * 0.5f
+        for (i in 0 until n) {
+            val lp = getChildAt(i).layoutParams as LayoutParams
+            val half = if (lp.angleHalf > 0f) lp.angleHalf else fallbackHalf
+            if (angle >= lp.angle - half && angle < lp.angle + half && dist >= lp.radiusMin && dist <= lp.radiusMax) {
+                return i
+            }
+        }
+        return -1
+    }
+
+    private fun hitIndexAt(x: Float, y: Float): Int {
+        if (!laidOut || centerY == -1f) return -1
+        val dist = distanceOf(x, y)
+        if (dist < 1.0) return -1
+        val angle = Math.toDegrees(acos(((centerY - y) / dist).coerceIn(-1.0, 1.0)))
+        return hitIndex(x, y, dist, angle)
+    }
+
     /** m9735x (:643-651). */
     private fun hover(index: Int) {
+        removeCallbacks(instanceDwell)
         if (index == -1) { hoveredIndex = -1; return }
         val child = getChildAt(index) ?: return
         child.isPressed = true
         hoveredIndex = index
         // original: AbstractC2797j.m9042a(child) flyme haptic → public API equivalent
         child.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+        // 多开应用：停住不动 [MotionSpec.INSTANCE_DWELL_MS] 就弹出 1 / 2（换到别的 tile 会撤掉这个计时）。
+        if ((adapter?.items?.getOrNull(index) as? AdapterItem.AppItem)?.isMulti == true) {
+            postDelayed(instanceDwell, MotionSpec.INSTANCE_DWELL_MS)
+        }
     }
 
     /** m9737z (:664-669). */
     private fun unhover(index: Int) {
+        removeCallbacks(instanceDwell)
         if (index == -1) return
         getChildAt(index)?.isPressed = false
     }
 
     /** m9729p (:531-556). */
     private fun onActionUp(): Boolean {
+        removeCallbacks(instanceDwell)
+        if (chooser.isOpen) return finishChooserOnUp()
         if (centerY == -1f) cancelFlag = true                  // :533-535
         val idx = hoveredIndex
         if (idx != -1 && getChildAt(idx) != null) {            // :536-543
@@ -757,6 +823,155 @@ class GestureAppLauncher @JvmOverloads constructor(
      *  plain TAP on an open tile launches it (reason 1 = click), no drag involved. */
     fun clickSelect(item: AdapterItem, view: View) {
         callback?.onItemSelected(item, view, 1)
+    }
+
+    // ---------------- 多开实例选择 ----------------
+
+    /** 重按（气压）时手指正停在多开 tile 上：不等停留计时，立刻弹出。 */
+    fun openChooserForHovered(): Boolean {
+        val idx = hoveredIndex
+        if (idx == -1 || chooser.isOpen) return false
+        removeCallbacks(instanceDwell)
+        return openChooser(idx, "pressure", byTap = false)
+    }
+
+    /** 扇形已松手、靠点选时，长按多开 tile 弹出（之后点气泡，或长按后直接滑到气泡上抬手）。 */
+    fun openChooserForTile(tile: View): Boolean {
+        if (chooser.isOpen) return false
+        val idx = indexOfChild(tile)
+        return idx != -1 && openChooser(idx, "long_press", byTap = true)
+    }
+
+    private fun openChooser(index: Int, reason: String, byTap: Boolean): Boolean {
+        if (state != 1 && state != 2) return false
+        val item = adapter?.items?.getOrNull(index) as? AdapterItem.AppItem ?: return false
+        if (!item.isMulti) return false
+        val tile = getChildAt(index) ?: return false
+        val lp = tile.layoutParams as LayoutParams
+        val ring = if (lp.ringRadius > 0f) lp.ringRadius else radius
+        val tileHalf = tile.measuredWidth / 2f
+        val bubble = tile.measuredWidth * 0.38f
+        val gap = touchSlop.toFloat()
+        val margin = touchSlop.toFloat()
+        // 优先摆在 tile 外侧（顺着划出来的方向继续往外）；外侧放不下（外圈已经贴近屏幕边）就摆到内侧。
+        val outward = ring + tileHalf + gap + bubble
+        val rad = Math.toRadians(lp.angle.toDouble())
+        val maxAtAngle = minOf(
+            ((measuredWidth - bubble - margin) / sin(rad).coerceAtLeast(1e-3)).toFloat(),
+            ((centerY - bubble - margin) / cos(rad).coerceAtLeast(1e-3)).toFloat(),
+        )
+        val r = when {
+            outward <= maxAtAngle -> outward
+            ring - tileHalf - gap - bubble > tileHalf * 2f -> ring - tileHalf - gap - bubble
+            else -> maxAtAngle
+        }
+        val angles = FanInstances.bubbleAngles(lp.angle, item.instances.size, r, bubble, gap, margin)
+        val xs = FloatArray(angles.size)
+        val ys = FloatArray(angles.size)
+        for (i in angles.indices) {
+            val a = Math.toRadians(angles[i].toDouble())
+            val dx = (sin(a) * r).toFloat()
+            xs[i] = if (side == 0) dx else measuredWidth - dx
+            ys[i] = (centerY - cos(a) * r).toFloat()
+        }
+        chooser.open(
+            index, item,
+            anchorCenterX = tile.x + tile.width / 2f,
+            anchorCenterY = tile.y + tile.height / 2f,
+            centersX = xs, centersY = ys, radiusPx = bubble,
+            iconOf = { app -> instanceIcon?.invoke(app) },
+            byTap = byTap,
+        )
+        forEachChildIndexed { i, c ->
+            if (i != index) c.animate().alpha(MotionSpec.INSTANCE_DIM_ALPHA).setDuration(MotionSpec.INSTANCE_OPEN_MS).start()
+        }
+        performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+        onChooserShown?.invoke(item, reason)
+        return true
+    }
+
+    private fun closeChooser() {
+        if (!chooser.isOpen) return
+        chooser.close()
+        forEachChild { it.animate().alpha(1f).setDuration(MotionSpec.INSTANCE_OPEN_MS).start() }
+    }
+
+    /** 选择开着时的 MOVE：气泡 > 原 tile > 过道；三者都不是就收起选择、回到普通瞄准。 */
+    private fun trackChooser(x: Float, y: Float) {
+        val bubble = chooser.hit(x, y)
+        val anchor = getChildAt(chooser.anchorIndex)
+        when {
+            bubble != -1 -> {
+                chooser.zone = InstanceChooser.Zone.BUBBLE
+                anchor?.isPressed = false
+                if (chooser.select(bubble)) performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+            }
+            hitIndexAt(x, y) == chooser.anchorIndex -> {
+                chooser.zone = InstanceChooser.Zone.ANCHOR
+                anchor?.isPressed = true
+                chooser.select(-1)
+            }
+            chooser.inCorridor(x, y) -> {
+                chooser.zone = InstanceChooser.Zone.GAP
+                anchor?.isPressed = false
+                chooser.select(-1)
+            }
+            else -> {
+                closeChooser()
+                aimAt(x, y)
+            }
+        }
+    }
+
+    /** 划扇形的那一笔在选择开着时抬手。返回值与 [onActionUp] 同义（true = 扇形留着）。 */
+    private fun finishChooserOnUp(): Boolean = when (chooser.zone) {
+        InstanceChooser.Zone.BUBBLE -> {
+            chooseInstance(chooser.selected, "drag")
+            false
+        }
+        InstanceChooser.Zone.ANCHOR -> {
+            closeChooser()
+            selectHovered()                    // 回到原 tile 上抬手 = 默认实例
+            false
+        }
+        InstanceChooser.Zone.GAP -> {
+            // 停在 tile 与气泡之间抬手：意图不明，什么都不开，扇形留着（与在空白处抬手一样）。
+            closeChooser()
+            unhover(hoveredIndex)
+            hoveredIndex = -1
+            true
+        }
+    }
+
+    private fun chooseInstance(bubble: Int, via: String) {
+        val item = chooser.item ?: return closeChooser()
+        val app = item.instances.getOrNull(bubble) ?: return closeChooser()
+        val anchor = getChildAt(chooser.anchorIndex) ?: this
+        closeChooser()
+        val chosen = AdapterItem.AppItem(app, item.instances)
+        onInstanceChosen?.invoke(chosen, via)
+        callback?.onItemSelected(chosen, anchor, if (via == "long_press") 1 else 0)
+    }
+
+    // 长按弹出（点选模式）时，触摸直接落在 launcher 上：先于 tile 拦下，免得落到画布上把扇形收了。
+    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean = chooser.isOpen && chooser.tapMode
+
+    @android.annotation.SuppressLint("ClickableViewAccessibility")
+    override fun onTouchEvent(ev: MotionEvent): Boolean {
+        if (!chooser.isOpen || !chooser.tapMode) return super.onTouchEvent(ev)
+        val bubble = chooser.hit(ev.x, ev.y)
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE ->
+                if (chooser.select(bubble)) performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+            MotionEvent.ACTION_UP -> when {
+                bubble != -1 -> chooseInstance(bubble, "long_press")
+                // 长按之后原地抬手：选择留着，等用户点气泡。
+                hitIndexAt(ev.x, ev.y) == chooser.anchorIndex -> chooser.select(-1)
+                else -> closeChooser()
+            }
+            MotionEvent.ACTION_CANCEL -> closeChooser()
+        }
+        return true
     }
 
     // ---------------- GestureDetector (:729-838) ----------------

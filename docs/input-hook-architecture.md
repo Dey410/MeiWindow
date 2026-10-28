@@ -200,6 +200,7 @@ MON_INPUT_READY name=BubbleDrawer-corner-MultiTaskSwitch …
 | `MON_IME_PROBE_MISSING` | 键盘高度探针窗口没建起来（降级：键盘上的角落按下也会被抢下） |
 | `FAN_SHOW_TIMING` | 一笔扇形展开的耗时分段（ms）：`gate`（判定）/ `windows`（两次 `addView`，`fresh=false` = 窗口还在）/ `build`（取数 + 建 tile，`iconLoads` = 主线程现场解码的图标数）/ `tail` / `sync`（主线程合计）/ `firstFrame`（到首次 pre-draw） |
 | `FAN_ICON_PREWARM` | 后台预热扇形图标：`icons` = 下次展开要画的图标数，`loaded` = 这次真正新解码的数量（`reason=` 触发原因） |
+| `FAN_INSTANCE_CHOOSER` / `FAN_INSTANCE_CHOSEN` | 多开应用弹出 1 / 2（`reason=dwell\|pressure\|long_press`、`users=` 全部实例、`default=` 默认实例）/ 选中了某个实例（`via=drag\|long_press`、`user=`）；直接松手开默认实例不打这行 |
 | `ARBITER_*` | system_server 侧（当前禁用） |
 | `HOT_RELOAD*` / `MON_DISPOSED_FOR_HOT_RELOAD` | 热重载生命周期 |
 

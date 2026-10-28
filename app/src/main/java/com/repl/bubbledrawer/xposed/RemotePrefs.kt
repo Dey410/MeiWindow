@@ -227,6 +227,13 @@ object RemotePrefs {
     const val KEY_CLONE_BADGE = "clone_badge_enabled"
     const val DEFAULT_CLONE_BADGE = true
 
+    /**
+     * 多开应用在扇形里合成一枚图标（用户 2026-10-28，默认开）：直接松手打开默认实例（跟收藏顺序走），
+     * 停留 / 重按 / 长按弹出 1 / 2 再选。关掉 = 以前的样子，每个实例各占一个位。见 `FanInstances`。
+     */
+    const val KEY_FAN_MERGE_INSTANCES = "fan_merge_instances"
+    const val DEFAULT_FAN_MERGE_INSTANCES = true
+
     /** 扇形应用未摆满时用推荐应用填满（默认关闭） */
     const val KEY_FAN_AUTO_FILL_RECOMMEND = "fan_auto_fill_recommend"
     const val DEFAULT_FAN_AUTO_FILL_RECOMMEND = false
@@ -497,6 +504,8 @@ object RemotePrefs {
         val fanIconShape: Int = DEFAULT_FAN_ICON_SHAPE,
         /** 分身应用图标上的角标（图始终取主空间那张，这一项只管角标） */
         val cloneBadge: Boolean = DEFAULT_CLONE_BADGE,
+        /** 多开应用在扇形里合成一枚图标、再选 1 / 2（见 [KEY_FAN_MERGE_INSTANCES]） */
+        val fanMergeInstances: Boolean = DEFAULT_FAN_MERGE_INSTANCES,
         /** 扇形未摆满时用推荐应用填满 */
         val fanAutoFillRecommend: Boolean = DEFAULT_FAN_AUTO_FILL_RECOMMEND,
         /** 扇形重按翻页开关与灵敏度 */
@@ -631,6 +640,7 @@ object RemotePrefs {
             fanIconDp = sp.getInt(KEY_FAN_ICON_DP, DEFAULT_FAN_ICON_DP).let { if (it <= 0) DEFAULT_FAN_ICON_DP else it.coerceIn(FAN_ICON_MIN, FAN_ICON_MAX) },
             fanIconShape = sp.getInt(KEY_FAN_ICON_SHAPE, DEFAULT_FAN_ICON_SHAPE).coerceIn(0, 1),
             cloneBadge = sp.getBoolean(KEY_CLONE_BADGE, DEFAULT_CLONE_BADGE),
+            fanMergeInstances = sp.getBoolean(KEY_FAN_MERGE_INSTANCES, DEFAULT_FAN_MERGE_INSTANCES),
             fanAutoFillRecommend = sp.getBoolean(KEY_FAN_AUTO_FILL_RECOMMEND, DEFAULT_FAN_AUTO_FILL_RECOMMEND),
             fanPressurePageTurn = sp.getBoolean(KEY_FAN_PRESSURE_PAGE_TURN, DEFAULT_FAN_PRESSURE_PAGE_TURN),
             fanPressureSensitivity = sp.getInt(KEY_FAN_PRESSURE_SENSITIVITY, DEFAULT_FAN_PRESSURE_SENSITIVITY).coerceIn(0, 2),

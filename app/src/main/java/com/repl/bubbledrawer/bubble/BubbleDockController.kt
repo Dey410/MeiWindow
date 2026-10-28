@@ -71,6 +71,24 @@ class BubbleDockController(
      */
     var onFunctionSelected: ((com.repl.bubbledrawer.shortcut.ShortcutItem) -> Unit)? = null
 
+    /**
+     * 「多开应用合成一枚图标」开关（见 [FanInstances]）。由宿主给，每次 [buildPages] 现读 —— 它在手势
+     * 中间的主线程上，宿主应当只读一个键，别整份读设置。
+     */
+    var mergeInstances: () -> Boolean = { false }
+
+    /** [FanInstances.instancesByPackage] 的结果，跟着应用列表那份不可变列表的身份走（列表重载才重算）。 */
+    private var instancesSource: List<com.repl.bubbledrawer.pinyin.BubbleApp>? = null
+    private var instancesCache: Map<String, List<com.repl.bubbledrawer.pinyin.BubbleApp>> = emptyMap()
+
+    private fun instancesOf(all: List<com.repl.bubbledrawer.pinyin.BubbleApp>): Map<String, List<com.repl.bubbledrawer.pinyin.BubbleApp>> {
+        if (all !== instancesSource) {
+            instancesSource = all
+            instancesCache = FanInstances.instancesByPackage(all)
+        }
+        return instancesCache
+    }
+
     init {
         launcher.setCallback(object : GestureAppLauncher.Callback {
             override fun onItemSelected(item: GestureAppLauncher.AdapterItem, view: View, index: Int) {
@@ -267,9 +285,20 @@ class BubbleDockController(
 
         // 「已选功能」排在收藏应用之后（顺序由用户点选决定，见 FunctionFanItems）。
         val pinnedFunctions = runCatching { functionItems?.invoke() }.getOrNull().orEmpty()
-        val pinned = ArrayList<GestureAppLauncher.AdapterItem>(pinnedApps.size + pinnedFunctions.size)
-        pinnedApps.forEach { pinned.add(GestureAppLauncher.AdapterItem.AppItem(it)) }
-        pinnedFunctions.forEach { pinned.add(GestureAppLauncher.AdapterItem.FunctionItem(it)) }
+        val rawPinned = ArrayList<GestureAppLauncher.AdapterItem>(pinnedApps.size + pinnedFunctions.size)
+        pinnedApps.forEach { rawPinned.add(GestureAppLauncher.AdapterItem.AppItem(it)) }
+        pinnedFunctions.forEach { rawPinned.add(GestureAppLauncher.AdapterItem.FunctionItem(it)) }
+
+        // 多开应用合成一枚 tile（默认实例跟收藏顺序走，见 FanInstances.merge）。先合收藏：两个实例都收藏了
+        // 只占一个位，下面按合并后的条数算推荐要补多少。
+        val instances = if (mergeInstances()) instancesOf(all) else emptyMap()
+        val pinned = FanInstances.merge(rawPinned, emptyList(), instances).pinned
+        if (instances.isNotEmpty()) {
+            // 收藏里已经有这个包了：它的其它实例在那枚 tile 里就能选到，别再占推荐位。
+            for (app in pinnedApps) {
+                instances[app.packageName]?.forEach { pinnedKeys.add("${it.packageName}#${it.userId}") }
+            }
+        }
 
         val capacity = FanLayout.tilesPerPage(maxApps, layers)
         // 取数上限 = 「够铺满前几页」的基数（容量 ×3）再按 [FanPagination.topUpRequest] 往上补整页 ——
@@ -281,15 +310,22 @@ class BubbleDockController(
             perPage = capacity - 1,
             autoFillRecommend = autoFillRecommend,
         )
+        // 推荐里同包的两个实例会合成一个，所以多要几条，合完再截回 request，页数照旧铺满。
+        val extra = if (instances.isEmpty()) 0 else minOf(instances.size, request)
         val recommendations = if (recommendEnabled) {
-            com.repl.bubbledrawer.data.predict.AppPredictor.getRecommendations(context, all, pinnedKeys, request)
+            com.repl.bubbledrawer.data.predict.AppPredictor.getRecommendations(context, all, pinnedKeys, request + extra)
         } else {
             emptyList()
         }
+        val merged = FanInstances.merge(
+            pinned,
+            recommendations.map { GestureAppLauncher.AdapterItem.AppItem(it) },
+            instances,
+        )
 
         return FanPagination.pages(
-            pinned = pinned,
-            recommended = recommendations.map { GestureAppLauncher.AdapterItem.AppItem(it) },
+            pinned = merged.pinned,
+            recommended = merged.recommended.take(request),
             capacity = capacity,
             autoFillRecommend = autoFillRecommend,
             more = { GestureAppLauncher.AdapterItem.More },
