@@ -15,3 +15,6 @@ work_tables/*.png
 work_tables/*.log
 work_tables/*.txt
 work_tables/*.tgz
+
+# stray root-level build output (build1.log … were committed by accident once)
+/build*.log

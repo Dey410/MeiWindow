@@ -10,16 +10,20 @@ import io.github.libxposed.api.XposedModuleInterface
  * (ModuleMain.kt:15-110): remote preferences at load time, per-package hook
  * install at package ready, hot reload accepted.
  *
- * Scope (META-INF/xposed/scope.list): com.android.systemui only.
+ * Scope (META-INF/xposed/scope.list): com.android.systemui and system (system_server).
  *
- * The launcher-side work was tried and removed (commit "chore: remove the launcher-side
- * hooks and the system_server region experiment"): Android 17 MiuiHome is forked by Xiaomi's
- * own /system_ext/bin/hyos_spawner instead of the ART zygote, so no LSPosed Java hook can
- * enter it (see docs/input-hook-architecture.md §1 and §3.4), and the system_server variant
- * of "cooperate with the launcher" (giving its swipe-up monitor a corner-cut touchable
- * region) broke MiuiHome's HOME gesture everywhere. What is left is the SystemUI half, which
- * is the part that actually works: a DO_NOT_PILFER gesture monitor, DOWN-time ownership
- * inside the bottom strip, and a sector-shaped corner trigger.
+ *  - SystemUI: the corner gesture (a DO_NOT_PILFER gesture monitor + a sector-shaped corner
+ *    trigger), the fan windows, and the SystemUI half of 轻量打开 ([LightOpenSystemUi]).
+ *  - system_server: the 轻量打开 gate ([LightOpenGate]) and the launcher arbiter
+ *    ([LauncherMonitorRegion]), which crops the corner columns off MiuiHome's `swipe-up`
+ *    monitor surface so a corner DOWN never reaches the launcher. While that crop is not
+ *    active, SystemUI falls back to owning the DOWN itself (pilfer inside the bottom strip).
+ *
+ * MiuiHome itself stays out of scope: on Android 17 it is forked by Xiaomi's own
+ * /system_ext/bin/hyos_spawner instead of the ART zygote, so no LSPosed Java hook can enter it
+ * (see docs/input-hook-architecture.md §1 and §3.4). An earlier system_server attempt that
+ * replaced the launcher monitor's touchableRegion broke the HOME gesture everywhere (commit
+ * 9541170); the current arbiter keeps replaceTouchableRegionWithCrop and only sets a crop.
  */
 class ModuleMain : XposedModule() {
 
